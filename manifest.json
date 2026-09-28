@@ -1,0 +1,34 @@
+{
+  "schemaVersion": 1,
+  "id": "supercleanse.spitball",
+  "name": "Spitball",
+  "version": "0.1.0",
+  "author": "supercleanse",
+  "license": "MIT",
+  "description": "Records, transcribes and summarizes your calls. Spitball notices when Zoom, Meet, Slack, Teams or another call app starts using your mic, shows a record button in the bar, and saves audio, a two-sided transcript (Deepgram) and a summary (any OpenAI-compatible model, local Ollama by default) for every call.",
+  "kinds": [
+    "service",
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "service": "SpitballService.qml",
+    "barWidget": "Widget.qml"
+  },
+  "barWidget": {
+    "displayName": "Spitball",
+    "description": "Record button that appears when a call starts: amber when a call is detected, red with a timer while recording. Right-click for the full menu.",
+    "category": "Productivity",
+    "aliases": [
+      "spitball",
+      "call-recorder",
+      "meeting-notes",
+      "transcription",
+      "recorder",
+      "granola"
+    ],
+    "allowMultiple": false,
+    "defaultSection": "center"
+  },
+  "keepLoaded": true,
+  "homepage": "https://github.com/supercleanse/spitball"
+}

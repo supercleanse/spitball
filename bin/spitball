@@ -1,0 +1,11 @@
+#!/usr/bin/python3 -I
+"""Spitball CLI entry point. Resolves its own location, so it works from the plugin
+folder, a symlink in ~/.local/bin, or `python3 -I bin/spitball` (isolated mode
+doesn't put the script's folder on sys.path, so add the repo root by hand)."""
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+from spitball.__main__ import main  # noqa: E402
+
+sys.exit(main())

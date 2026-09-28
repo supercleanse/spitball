@@ -1,0 +1,22 @@
+{
+  "metadata": {"model_info": {"name": "nova-3"}},
+  "results": {
+    "channels": [],
+    "utterances": [
+      {"channel": 1, "start": 0.0, "end": 2.0, "speaker": 0,
+       "transcript": "Hey how's it going today"},
+      {"channel": 0, "start": 0.3, "end": 1.8, "speaker": 0,
+       "transcript": "hey how's it going today"},
+      {"channel": 0, "start": 2.5, "end": 3.5, "speaker": 0,
+       "transcript": "I'm doing great thanks"},
+      {"channel": 0, "start": 3.6, "end": 4.0, "speaker": 0,
+       "transcript": "and glad to be here"},
+      {"channel": 1, "start": 20.0, "end": 21.0, "speaker": 0,
+       "transcript": "Quick question for you"},
+      {"channel": 1, "start": 21.5, "end": 22.5, "speaker": 0,
+       "transcript": "about the deadline"},
+      {"channel": 0, "start": 40.0, "end": 41.0, "speaker": 0,
+       "transcript": "Sure, let's talk about it"}
+    ]
+  }
+}
