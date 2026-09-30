@@ -164,6 +164,27 @@ class TestConfigSetSecret(ConfigCliTestCase):
         raw = json.loads(self.config.CONFIG_FILE.read_text())
         self.assertEqual(raw["deepgram_api_key"], "")
 
+    def test_does_not_wait_for_eof(self):
+        # The QML settings UI writes one line and leaves the pipe open; the CLI
+        # must finish on the newline instead of blocking until EOF.
+        import os, subprocess, sys, tempfile
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with tempfile.TemporaryDirectory() as home:
+            env = dict(os.environ, HOME=home, XDG_CONFIG_HOME=home + "/c", XDG_RUNTIME_DIR=home)
+            p = subprocess.Popen([sys.executable, "-I", os.path.join(root, "bin", "spitball"),
+                                  "config", "set-secret", "calendar_ics_url"],
+                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                 stderr=subprocess.PIPE, env=env)
+            p.stdin.write(b"https://calendar.google.com/calendar/ical/a%40b.com/private-abc123/basic.ics\n")
+            p.stdin.flush()  # stdin deliberately left open
+            try:
+                p.wait(timeout=10)
+            finally:
+                if p.poll() is None:
+                    p.kill()
+                    self.fail("set-secret blocked waiting for EOF")
+            self.assertEqual(p.returncode, 0, p.stderr.read())
+
     def test_only_a_secret_key_allowed(self):
         code, _, err = self.run_main(["config", "set-secret", "my_name"], stdin_text="x")
         self.assertEqual(code, 1)

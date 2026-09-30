@@ -324,7 +324,7 @@ QtObject {
       stdinEnabled: true
       stdout: StdioCollector { waitForEnd: true }
       stderr: StdioCollector { id: serr; waitForEnd: true }
-      onStarted: { write(sproc.secret + "\n"); sproc.secret = "" }
+      onStarted: { write(sproc.secret + "\n"); sproc.secret = ""; sproc.stdinEnabled = false }
       onExited: function(code) {
         var k = sproc.key
         var msg = serr.text

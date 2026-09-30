@@ -126,7 +126,7 @@ def _config_cmd(rest: list) -> int:
             print(f"not a secret key: {key!r} (expected one of {', '.join(config.SECRET_KEYS)})",
                   file=sys.stderr)
             return 1
-        value = sys.stdin.read().strip()  # never argv -- empty stdin clears it
+        value = sys.stdin.readline().strip()  # never argv; ONE line so a caller that never closes the pipe (the QML settings UI) cannot hang us. Empty line/EOF clears it
         config.set_key(key, value)
         send("reload")
         return 0
