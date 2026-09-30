@@ -563,3 +563,201 @@ test("liveBubbles: partial flag passes through, absent means final", () => {
   assert.equal(out[0].partial, false);
   assert.equal(out[1].partial, true);
 });
+
+// ---------------------------------------------------------------- settings overlay: sections
+
+const SECTION_IDS = ["general", "recording", "transcription", "live", "audio",
+  "speakers", "summary", "calendar", "storage", "about"];
+
+test("settingsSections: the ten sections, in the spec's order, each with a label and page", () => {
+  const s = Model.settingsSections();
+  assert.equal(JSON.stringify(s.map(x => x.id)), JSON.stringify(SECTION_IDS));
+  assert.equal(JSON.stringify(s.map(x => x.label)), JSON.stringify(["General", "Recording",
+    "Transcription", "Live", "Audio", "Speakers", "Summary", "Calendar", "Storage", "About"]));
+  for (const entry of s) {
+    assert.ok(/^[A-Z][A-Za-z]+Page\.qml$/.test(entry.page), entry.page);
+    assert.equal(typeof entry.placeholder, "boolean");
+  }
+});
+
+test("settingsSections: Audio, Speakers and Calendar are the placeholders (later phases fill them)", () => {
+  const placeholders = Model.settingsSections().filter(x => x.placeholder).map(x => x.id);
+  assert.equal(JSON.stringify(placeholders), JSON.stringify(["audio", "speakers", "calendar"]));
+});
+
+test("settingsSections: every page file exists under settings/", () => {
+  const fs = require("node:fs");
+  const path = require("node:path");
+  for (const entry of Model.settingsSections()) {
+    const file = path.join(__dirname, "..", "..", "settings", entry.page);
+    assert.ok(fs.existsSync(file), "missing " + file);
+  }
+});
+
+test("settingsSections: returns a fresh copy each call", () => {
+  const a = Model.settingsSections();
+  a.push({ id: "x" });
+  a[0].label = "Mutated";
+  assert.equal(Model.settingsSections().length, 10);
+  assert.equal(Model.settingsSections()[0].label, "General");
+});
+
+test("settingsDefaultSection is General", () => {
+  assert.equal(Model.settingsDefaultSection(), "general");
+});
+
+test("settingsSectionIndex: known ids map to their position, anything else is -1", () => {
+  assert.equal(Model.settingsSectionIndex("general"), 0);
+  assert.equal(Model.settingsSectionIndex("transcription"), 2);
+  assert.equal(Model.settingsSectionIndex("about"), 9);
+  assert.equal(Model.settingsSectionIndex("nope"), -1);
+  assert.equal(Model.settingsSectionIndex(""), -1);
+  assert.equal(Model.settingsSectionIndex(undefined), -1);
+  assert.equal(Model.settingsSectionIndex(null), -1);
+});
+
+test("settingsSectionAt: in-range index gives the entry, out of range gives null", () => {
+  assert.equal(Model.settingsSectionAt(0).id, "general");
+  assert.equal(Model.settingsSectionAt(9).id, "about");
+  assert.equal(Model.settingsSectionAt(2.7).id, "transcription");
+  assert.equal(Model.settingsSectionAt(10), null);
+  assert.equal(Model.settingsSectionAt(-1), null);
+  assert.equal(Model.settingsSectionAt("x"), null);
+  assert.equal(Model.settingsSectionAt(undefined), null);
+});
+
+test("settingsNavStep: j/k move one and clamp at both ends, never wrapping", () => {
+  assert.equal(Model.settingsNavStep(0, 1), 1);
+  assert.equal(Model.settingsNavStep(3, -1), 2);
+  assert.equal(Model.settingsNavStep(0, -1), 0);
+  assert.equal(Model.settingsNavStep(9, 1), 9);
+  assert.equal(Model.settingsNavStep(5, 100), 9);
+  assert.equal(Model.settingsNavStep(5, -100), 0);
+});
+
+test("settingsNavStep: a bad starting index reads as the first section", () => {
+  assert.equal(Model.settingsNavStep(-4, 0), 0);
+  assert.equal(Model.settingsNavStep(42, 0), 0);
+  assert.equal(Model.settingsNavStep(undefined, 1), 1);
+  assert.equal(Model.settingsNavStep("garbage", 0), 0);
+});
+
+test("settingsSectionForKey: digits 1-9 jump to sections, everything else is -1", () => {
+  assert.equal(Model.settingsSectionForKey("1"), 0);
+  assert.equal(Model.settingsSectionForKey("9"), 8);
+  assert.equal(Model.settingsSectionForKey("0"), -1);
+  assert.equal(Model.settingsSectionForKey("j"), -1);
+  assert.equal(Model.settingsSectionForKey("12"), -1);
+  assert.equal(Model.settingsSectionForKey(""), -1);
+  assert.equal(Model.settingsSectionForKey(undefined), -1);
+});
+
+test("settingsSectionBadge: Transcription says Set up whenever the bar's gear would show", () => {
+  const needs = { state: "idle", setup_needed: "Add a Deepgram key" };
+  const fine = { state: "idle", setup_needed: "" };
+  assert.equal(Model.settingsSectionBadge("transcription", needs, null), "Set up");
+  assert.equal(Model.settingsSectionBadge("transcription", fine, { state: "error" }), "Set up");
+  assert.equal(Model.settingsSectionBadge("transcription", fine, { state: "downloading" }), "");
+  assert.equal(Model.settingsSectionBadge("transcription", fine, null), "");
+  assert.equal(Model.settingsSectionBadge("transcription", null, null), "");
+  // Only idle shows the gear -- offline/recording never do (same rule as needsSetup).
+  assert.equal(Model.settingsSectionBadge("transcription", { state: "recording", setup_needed: "x" }, null), "");
+});
+
+test("settingsSectionBadge: placeholders say Soon, everything else is blank", () => {
+  assert.equal(Model.settingsSectionBadge("audio", null, null), "Soon");
+  assert.equal(Model.settingsSectionBadge("speakers", null, null), "Soon");
+  assert.equal(Model.settingsSectionBadge("calendar", null, null), "Soon");
+  assert.equal(Model.settingsSectionBadge("general", null, null), "");
+  assert.equal(Model.settingsSectionBadge("nope", null, null), "");
+  assert.equal(Model.settingsSectionBadge(undefined, null, null), "");
+});
+
+// ---------------------------------------------------------------- settings overlay: call_apps
+
+test("callAppsList: sorted {key, label} rows; garbage reads as empty", () => {
+  const rows = Model.callAppsList({ zoom: "Zoom", brave: "Brave", chrome: "Chrome" });
+  assert.equal(JSON.stringify(rows), JSON.stringify([
+    { key: "brave", label: "Brave" }, { key: "chrome", label: "Chrome" }, { key: "zoom", label: "Zoom" }]));
+  assert.equal(Model.callAppsList(null).length, 0);
+  assert.equal(Model.callAppsList("zoom").length, 0);
+  assert.equal(Model.callAppsList(["zoom"]).length, 0);
+  assert.equal(Model.callAppsList({ x: "" })[0].label, "x");
+});
+
+test("callAppLabel: first letter upper-cased, rest kept", () => {
+  assert.equal(Model.callAppLabel("zoom"), "Zoom");
+  assert.equal(Model.callAppLabel("  jitsi "), "Jitsi");
+  assert.equal(Model.callAppLabel("WhatsApp"), "WhatsApp");
+  assert.equal(Model.callAppLabel(""), "");
+  assert.equal(Model.callAppLabel(undefined), "");
+});
+
+test("callAppsAdd: adds under the lower-cased key, keeps the rest, never mutates the input", () => {
+  const src = { zoom: "Zoom" };
+  const next = Model.callAppsAdd(src, "  Jitsi ");
+  assert.equal(JSON.stringify(next), JSON.stringify({ jitsi: "Jitsi", zoom: "Zoom" }));
+  assert.equal(JSON.stringify(src), JSON.stringify({ zoom: "Zoom" }));
+});
+
+test("callAppsAdd: blank or duplicate names leave the map as it was", () => {
+  assert.equal(JSON.stringify(Model.callAppsAdd({ zoom: "Zoom" }, "")), JSON.stringify({ zoom: "Zoom" }));
+  assert.equal(JSON.stringify(Model.callAppsAdd({ zoom: "Zoom" }, "ZOOM")), JSON.stringify({ zoom: "Zoom" }));
+  assert.equal(JSON.stringify(Model.callAppsAdd(null, "zoom")), JSON.stringify({ zoom: "Zoom" }));
+});
+
+test("callAppsRemove: drops one key, tolerates a missing one", () => {
+  assert.equal(JSON.stringify(Model.callAppsRemove({ zoom: "Zoom", slack: "Slack" }, "zoom")),
+    JSON.stringify({ slack: "Slack" }));
+  assert.equal(JSON.stringify(Model.callAppsRemove({ zoom: "Zoom" }, "nope")), JSON.stringify({ zoom: "Zoom" }));
+  assert.equal(JSON.stringify(Model.callAppsRemove(null, "zoom")), "{}");
+});
+
+test("callAppsSerialize: compact JSON the CLI parses back as an object", () => {
+  const text = Model.callAppsSerialize({ zoom: "Zoom", brave: "Brave" });
+  assert.equal(text, '{"brave":"Brave","zoom":"Zoom"}');
+  assert.equal(JSON.stringify(JSON.parse(text)), text);
+  assert.equal(Model.callAppsSerialize(null), "{}");
+});
+
+// ---------------------------------------------------------------- settings overlay: misc helpers
+
+test("opusBitrateOptions: the standard ladder, default marked, current kept even when nonstandard", () => {
+  const std = Model.opusBitrateOptions("32k");
+  assert.equal(JSON.stringify(std.map(o => o.value)), JSON.stringify(["16k", "24k", "32k", "48k", "64k", "96k", "128k"]));
+  assert.equal(std[2].label, "32k (default)");
+  const odd = Model.opusBitrateOptions("40k");
+  assert.equal(odd.length, 8);
+  assert.equal(odd[7].value, "40k");
+  assert.equal(Model.opusBitrateOptions("").length, 7);
+  assert.equal(Model.opusBitrateOptions(undefined).length, 7);
+});
+
+test("liveEngineStatusLine: mirrors the CLI's three wordings; null reads blank", () => {
+  assert.equal(Model.liveEngineStatusLine({ installed: true, model: "parakeet-unified-en-0.6b", fast: true }),
+    "Fast engine: on (parakeet-unified-en-0.6b)");
+  assert.equal(Model.liveEngineStatusLine({ installed: true, model: "", fast: true }), "Fast engine: on");
+  assert.equal(Model.liveEngineStatusLine({ installed: false, model: "", fast: false }), "Fast engine: not installed");
+  assert.equal(Model.liveEngineStatusLine({ installed: true, model: "", fast: false }),
+    "Fast engine: installed, but voxtype isn't on a Parakeet model");
+  assert.equal(Model.liveEngineStatusLine(null), "");
+  assert.equal(Model.liveEngineStatusLine("x"), "");
+});
+
+test("daemonStateLabel: one line per state, with the app/message when present", () => {
+  assert.equal(Model.daemonStateLabel({ state: "offline" }), "Daemon: not running");
+  assert.equal(Model.daemonStateLabel(null), "Daemon: not running");
+  assert.equal(Model.daemonStateLabel({ state: "idle" }), "Daemon: idle");
+  assert.equal(Model.daemonStateLabel({ state: "detected", app: "Zoom" }), "Daemon: call detected in Zoom");
+  assert.equal(Model.daemonStateLabel({ state: "recording", app: "Slack" }), "Daemon: recording Slack");
+  assert.equal(Model.daemonStateLabel({ state: "recording", app: "" }), "Daemon: recording");
+  assert.equal(Model.daemonStateLabel({ state: "processing" }), "Daemon: processing");
+  assert.equal(Model.daemonStateLabel({ state: "error", message: "boom" }), "Daemon: error — boom");
+});
+
+test("presentAppsLine: lists the apps on the mic, or says none", () => {
+  assert.equal(Model.presentAppsLine(["Zoom", "Chrome"]), "Using the microphone now: Zoom, Chrome");
+  assert.equal(Model.presentAppsLine([]), "No call app is using the microphone right now.");
+  assert.equal(Model.presentAppsLine(null), "No call app is using the microphone right now.");
+  assert.equal(Model.presentAppsLine([""]), "No call app is using the microphone right now.");
+});

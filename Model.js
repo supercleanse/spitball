@@ -426,3 +426,202 @@ function liveShouldAutoScroll(contentY, viewHeight, contentHeight, thresholdPx) 
   var distanceFromBottom = contentHeight - (contentY + viewHeight)
   return distanceFromBottom <= threshold
 }
+
+// ---------------------------------------------------------------- settings overlay
+// Helpers for SettingsWindow.qml / settings/SettingsCard.qml (docs/SPEC-v2.md
+// section 1). The section list is the one place the overlay's navigation is
+// defined: SettingsNav renders it, the digit keys index into it, and the page
+// Loader resolves `page` relative to settings/. Adding a section later means
+// one entry here plus one settings/<Page>.qml file.
+//
+// `placeholder: true` marks a page that ships as "Coming in this release"
+// (Audio, Speakers, Calendar -- filled by later phases); the nav shows it
+// with a "Soon" badge until the flag is dropped.
+
+var SETTINGS_SECTIONS = [
+  { id: "general",       label: "General",       page: "GeneralPage.qml" },
+  { id: "recording",     label: "Recording",     page: "RecordingPage.qml" },
+  { id: "transcription", label: "Transcription", page: "TranscriptionPage.qml" },
+  { id: "live",          label: "Live",          page: "LivePage.qml" },
+  { id: "audio",         label: "Audio",         page: "AudioPage.qml", placeholder: true },
+  { id: "speakers",      label: "Speakers",      page: "SpeakersPage.qml", placeholder: true },
+  { id: "summary",       label: "Summary",       page: "SummaryPage.qml" },
+  { id: "calendar",      label: "Calendar",      page: "CalendarPage.qml", placeholder: true },
+  { id: "storage",       label: "Storage",       page: "StoragePage.qml" },
+  { id: "about",         label: "About",         page: "AboutPage.qml" }
+]
+
+// A fresh copy each call (one new object per entry), so a caller can't
+// mutate the source list.
+function settingsSections() {
+  var out = []
+  for (var i = 0; i < SETTINGS_SECTIONS.length; i++) {
+    var s = SETTINGS_SECTIONS[i]
+    out.push({ id: s.id, label: s.label, page: s.page, placeholder: !!s.placeholder })
+  }
+  return out
+}
+
+function settingsDefaultSection() {
+  return SETTINGS_SECTIONS[0].id
+}
+
+// Index of a section id, or -1 for anything unknown (including ""/null).
+function settingsSectionIndex(id) {
+  var key = String(id || "")
+  for (var i = 0; i < SETTINGS_SECTIONS.length; i++) {
+    if (SETTINGS_SECTIONS[i].id === key) return i
+  }
+  return -1
+}
+
+// The entry at `index`, or null when out of range / not a number.
+function settingsSectionAt(index) {
+  var i = Number(index)
+  if (!isFinite(i) || i < 0 || i >= SETTINGS_SECTIONS.length) return null
+  var s = SETTINGS_SECTIONS[Math.floor(i)]
+  return { id: s.id, label: s.label, page: s.page, placeholder: !!s.placeholder }
+}
+
+// Where j/k (or Up/Down) land from `index`: clamped to the list, never
+// wrapping, so holding j parks on the last section instead of cycling. A
+// bad starting index reads as the first section.
+function settingsNavStep(index, delta) {
+  var n = SETTINGS_SECTIONS.length
+  var i = Number(index)
+  if (!isFinite(i) || i < 0 || i >= n) i = 0
+  var d = Number(delta) || 0
+  return Math.max(0, Math.min(n - 1, Math.floor(i) + d))
+}
+
+// The section index a single typed character selects ("1" -> 0 ... "9" ->
+// 8), or -1 when the character isn't a digit in range. "0" is never a jump
+// key -- there's no tenth slot to reach, and it's easy to hit by accident.
+function settingsSectionForKey(text) {
+  var t = String(text || "")
+  if (t.length !== 1 || t < "1" || t > "9") return -1
+  var i = Number(t) - 1
+  return i < SETTINGS_SECTIONS.length ? i : -1
+}
+
+// The small trailing badge on a nav row, or "" for none: "Set up" on
+// Transcription whenever the bar's own gear would show (a setup_needed reason
+// while idle, or a failed model switch), "Soon" on a placeholder page.
+function settingsSectionBadge(id, st, modelSwitch) {
+  var key = String(id || "")
+  if (key === "transcription") {
+    if ((st && needsSetup(st)) || modelSwitchFailed(modelSwitch)) return "Set up"
+    return ""
+  }
+  var i = settingsSectionIndex(key)
+  if (i >= 0 && SETTINGS_SECTIONS[i].placeholder) return "Soon"
+  return ""
+}
+
+// ------------------------------------------------------------ call_apps
+// `call_apps` is a {process-name: "Display name"} map (config.DEFAULT_CALL_APPS).
+// The Recording page edits it as a whole value -- `spitball config set
+// call_apps '<json>'` parses a JSON object -- so these build the next map
+// rather than mutating the loaded one.
+
+function callAppsList(map) {
+  if (!map || typeof map !== "object" || Array.isArray(map)) return []
+  var keys = Object.keys(map).sort()
+  var out = []
+  for (var i = 0; i < keys.length; i++) {
+    out.push({ key: keys[i], label: String(map[keys[i]] || keys[i]) })
+  }
+  return out
+}
+
+// Display name for a typed process name: first letter upper-cased, the rest
+// kept as typed ("zoom" -> "Zoom", "WhatsApp" -> "WhatsApp").
+function callAppLabel(name) {
+  var n = String(name || "").trim()
+  return n ? n.charAt(0).toUpperCase() + n.slice(1) : ""
+}
+
+// A fresh {key: label} map in sorted key order (so the JSON written to
+// config.json, and every chip row, reads the same regardless of the order
+// apps were added in).
+function callAppsSorted(map) {
+  var next = {}
+  var list = callAppsList(map)
+  for (var i = 0; i < list.length; i++) next[list[i].key] = list[i].label
+  return next
+}
+
+// A copy of `map` with `name` added under its lower-cased key. Blank input,
+// or a name already present, returns an unchanged copy.
+function callAppsAdd(map, name) {
+  var next = callAppsSorted(map)
+  var key = String(name || "").trim().toLowerCase()
+  if (key && next[key] === undefined) next[key] = callAppLabel(name)
+  return callAppsSorted(next)
+}
+
+function callAppsRemove(map, key) {
+  var next = callAppsSorted(map)
+  delete next[String(key || "")]
+  return next
+}
+
+// The argv value for `spitball config set call_apps ...` -- compact JSON
+// the CLI's _parse_value() reads back as an object.
+function callAppsSerialize(map) {
+  return JSON.stringify(callAppsSorted(map))
+}
+
+// ------------------------------------------------------------ opus bitrate
+// The Recording page's bitrate dropdown. Any value already in config that
+// isn't one of these still shows (as itself) rather than snapping the
+// dropdown to a wrong choice -- `opus_bitrate` is passed straight to ffmpeg,
+// so a hand-edited "40k" is perfectly valid.
+
+var OPUS_BITRATES = ["16k", "24k", "32k", "48k", "64k", "96k", "128k"]
+
+function opusBitrateOptions(current) {
+  var out = []
+  var cur = String(current || "")
+  var seen = false
+  for (var i = 0; i < OPUS_BITRATES.length; i++) {
+    var v = OPUS_BITRATES[i]
+    if (v === cur) seen = true
+    out.push({ value: v, label: v === "32k" ? v + " (default)" : v })
+  }
+  if (cur && !seen) out.push({ value: cur, label: cur })
+  return out
+}
+
+// ------------------------------------------------------------ live engine
+// One line for `spitball live status --json`'s {installed, model, fast} --
+// the same wording the CLI prints without --json. Null/garbage reads blank.
+function liveEngineStatusLine(status) {
+  if (!status || typeof status !== "object") return ""
+  if (status.fast) return "Fast engine: on" + (status.model ? " (" + status.model + ")" : "")
+  if (!status.installed) return "Fast engine: not installed"
+  return "Fast engine: installed, but voxtype isn't on a Parakeet model"
+}
+
+// ------------------------------------------------------------ about / status
+// The daemon line in the overlay header and on the About page.
+function daemonStateLabel(st) {
+  var s = st && st.state ? String(st.state) : "offline"
+  switch (s) {
+    case "offline": return "Daemon: not running"
+    case "idle": return "Daemon: idle"
+    case "detected": return "Daemon: call detected" + (st.app ? " in " + st.app : "")
+    case "recording": return "Daemon: recording" + (st.app ? " " + st.app : "")
+    case "processing": return "Daemon: processing"
+    case "error": return "Daemon: error" + (st.message ? " — " + st.message : "")
+    default: return "Daemon: " + s
+  }
+}
+
+// `status --json`'s `present` list (call apps holding the mic right now),
+// for the Recording page's troubleshooting read-out.
+function presentAppsLine(present) {
+  var list = Array.isArray(present) ? present.filter(function(p) { return !!p }) : []
+  if (!list.length) return "No call app is using the microphone right now."
+  return "Using the microphone now: " + list.join(", ")
+}

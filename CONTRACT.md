@@ -153,7 +153,7 @@ control socket above, and report `daemon not reachable` if nothing answers.
   revealed: a dim record glyph. Exception: when `state` is
   `idle` and `setup_needed` is non-empty, the widget stays visible (not collapsed) as a
   small gear/"Set up" glyph, tooltip = `setup_needed`, and the menu leads with
-  **Set up transcription…** (opens Settings at Transcription).
+  **Set up transcription…** (opens Settings on its Transcription page).
   Settings itself stays reachable from the menu in every state. A second,
   independent exception: while `state` is `idle`/`offline` and model.json (see "Model
   switch file" above) says a `spitball local set-model` switch is in flight or just
@@ -177,14 +177,42 @@ control socket above, and report `daemon not reachable` if nothing answers.
   mid-conversation, so Stop is only ever an explicit menu item or the Live popup's
   button.
 
+## Settings overlay
+
+Settings is not a bar dropdown: `SettingsWindow.qml` is a full-screen transparent
+layer-shell window on the Overlay layer (exclusive keyboard focus while open) with a
+scrim and a centered card, the same surface Omarchy's menu/emoji/clipboard pickers
+use. The card (`settings/SettingsCard.qml`) has a pinned header (title, daemon state
+line, ✕), a section nav on the left (`Model.settingsSections()`: General, Recording,
+Transcription, Live, Audio, Speakers, Summary, Calendar, Storage, About), and one
+page on the right. Esc, an outside click, or ✕ closes it. With no control focused,
+`j`/`k`/Up/Down move between sections, `1`-`9` jump, Tab walks the page's controls.
+
+The widget's `openSettings(section)` is the only entry point (the menu's Settings…
+item passes `general`, every setup prompt passes `transcription`). IPC target
+`supercleanse.spitball-settings`: `open`, `openSection <id>`, `close`, `toggle`.
+
+Every value shown comes from `spitball config get --json`; every change goes through
+`config set` / `config set-secret` (stdin) / `config unset` immediately, and the
+other read-only commands in the CLI table (`local info/models`, `live status`,
+`check`, `status`) fill the pages. `settings/SettingsStore.qml` owns all of those
+round trips; pages never spawn processes. Every key in `config.json` has a control.
+
+**Layering rule.** Before the store launches anything that opens an ordinary window
+-- `pick-folder`, the voxtype installer, `live setup` in a terminal, or `local
+set-model` (which may show a pkexec prompt) -- it asks the widget to close the
+overlay, because a layer-shell surface with exclusive keyboard focus sits above every
+normal window. `pick-folder` reopens it when the picker resolves (any exit code);
+installers and model switches leave it closed, and their progress is watched on the
+bar widget / `model.json` until the user reopens Settings.
+
 ## Live popup
 
-A third bar dropdown popup (same `KeyboardPanel` component as the menu and Settings
-above), opened by the menu's Start recording / Show live transcript items and closable
+A bar dropdown popup (the same `KeyboardPanel` component as the menu),
+opened by the menu's Start recording / Show live transcript items and closable
 with its header ✕, Esc, or an outside click without affecting the recording. Header:
 app name, red dot, elapsed time (from `started_at`), a **Stop recording** button (the
-only way to stop from this popup), and the ✕. The Settings popup has the same ✕ in a
-header pinned above its scrolling form. Body: a chat-style transcript fed by `live.json` below -- my lines
+only way to stop from this popup), and the ✕. Body: a chat-style transcript fed by `live.json` below -- my lines
 (channel 0) on the right, theirs (channel 1) on the left, a speaker label only when the
 speaker changes, small `m:ss` timestamps, auto-scroll to the newest bubble only while
 already at the bottom (otherwise a "New messages ↓" pill). Status line at the bottom:

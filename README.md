@@ -47,12 +47,43 @@ Any click on the widget, left or right, opens its menu: start recording, show th
 live transcript and stop while recording, dismiss the current detection, toggle
 auto-record, open the last call's summary, open the calls folder, or open Settings.
 A click never stops a call by itself; Stop is always an explicit menu item or the
-Live popup's button. Settings and the Live popup each have a ✕ in their header to
-close them. When something needs attention before Spitball can transcribe (no
-Deepgram key, no local dictation installed), the widget shows a small "Set up" gear
-even while idle, and its menu leads with **Set up transcription…**. Switching the local model from Settings (see
+Live popup's button. The Live popup has a ✕ in its header to close it. When
+something needs attention before Spitball can transcribe (no Deepgram key, no local
+dictation installed), the widget shows a small "Set up" gear even while idle, and its
+menu leads with **Set up transcription…**, which opens Settings on the Transcription
+page. Switching the local model from Settings (see
 [Transcription providers](#transcription-providers)) shows the same way: a small
 download glyph while it runs, with the percentage in its tooltip.
+
+## Settings
+
+**Settings…** in the menu opens a centered overlay, the same kind of surface as
+Omarchy's own menu and emoji picker: a card over a dimmed screen, with the sections
+down the left and one page on the right. Esc, a click outside the card, or the ✕
+closes it. When nothing on the page has focus, `j`/`k` or the arrow keys move between
+sections, `1`–`9` jump straight to one, and Tab walks into the page's controls;
+inside a text field, Esc hands focus back to the section list first.
+
+| Page | What's on it |
+|---|---|
+| **General** | Your name, the spoken language, auto-record (with its consent note), the daemon's status and a Restart button. |
+| **Recording** | The calls folder, the detection and ending timings, the minimum call lengths, the Opus bitrate, which apps count as a call, and which of them is on the mic right now. |
+| **Transcription** | Local (voxtype) or Deepgram. Local: the voxtype model picker with its inline Switch confirmation and download progress, or an Install button if voxtype is missing. Deepgram: API key, model, Test, and the key command under Advanced. |
+| **Live** | The live transcript on/off, the line cutoff, the fast-engine toggle, and whether the engine is installed (with an Install button). |
+| **Audio** | Coming in this release: mic noise reduction. Shows the mic and speaker Spitball would record today. |
+| **Speakers** | Coming in this release: naming the far side and splitting it into speakers. |
+| **Summary** | Summaries on/off, the endpoint, the model (a dropdown when the endpoint lists any), API key, Test, and the key command under Advanced. |
+| **Calendar** | Coming in this release: matching calls to calendar events. |
+| **Storage** | The notes-copy folder (`export_dir`) and a way into the calls folder. |
+| **About** | Version, install path, a status snapshot, and the docs. |
+
+Every change is saved the moment you make it (through `spitball config`, below). A
+few actions open something outside the shell — the folder picker, the voxtype or
+live-engine installer, the password prompt for a model switch — and the overlay
+closes first so that window isn't hidden behind it; the folder picker brings it back
+when you're done, the installers and model switch leave it closed until you reopen
+it. From outside the shell, `omarchy-shell supercleanse.spitball-settings open`
+(or `openSection transcription`) opens it too, handy for a keybinding.
 
 ## Live transcript
 
@@ -198,7 +229,7 @@ Set `transcription_provider` to pick one:
   what's active; `spitball local models` lists every model voxtype knows how to
   download with size/language/installed info.
 
-  The Settings popup's Local section has one Model dropdown, with **Parakeet
+  The Transcription page in Settings has one Model dropdown, with **Parakeet
   (unified, English)** marked Recommended. It's the one streaming-capable model:
   switching to it also turns on voxtype's `parakeet.streaming`, so dictation
   types while you talk instead of after you stop, and writes the streaming
@@ -218,7 +249,7 @@ Set `transcription_provider` to pick one:
   click **Switch**. `spitball local set-model <name>` (what that button calls)
   then runs the whole switch **in the background**: it never blocks, and its
   progress (`$XDG_RUNTIME_DIR/spitball/model.json`, see CONTRACT.md) shows both
-  in the popup, if you reopen it, and as a small download glyph on the bar
+  in Settings, if you reopen it, and as a small download glyph on the bar
   widget itself while it runs. Normally there's no terminal at all — just
   Omarchy's own graphical password prompt if the engine needs to change (e.g.
   Whisper → Parakeet), then a background download. It only opens a floating
@@ -273,8 +304,9 @@ The Deepgram key can also come from the `DEEPGRAM_API_KEY` environment variable,
 which wins over both config keys — useful if you'd rather manage it outside the
 config file entirely. Same idea for `summary_api_key`, via `summary_api_key_command`.
 
-You can edit `config.json` by hand (restart the daemon afterward — see
-[Restart the daemon](#restart-the-daemon)), or through `spitball config`:
+Every key above has a control in [Settings](#settings). You can also edit
+`config.json` by hand (restart the daemon afterward — see
+[Restart the daemon](#restart-the-daemon)), or use `spitball config`:
 
 ```bash
 spitball config get --json                       # effective settings; *_api_key values are masked
@@ -391,14 +423,23 @@ After changing Python (`spitball/*.py`, `bin/spitball`), restart just the daemon
 omarchy-shell supercleanse.spitball restart
 ```
 
-After changing QML (`Widget.qml`, `SpitballService.qml`), restart the shell:
+After changing QML (`Widget.qml`, `SpitballService.qml`, `LivePopup.qml`,
+`SettingsWindow.qml`, anything under `settings/`), restart the shell:
 
 ```bash
 omarchy restart shell
 ```
 
 Tests run through `tests/run.sh`; pass `--live` to include anything that talks to a
-real system (PipeWire, an actual model endpoint) instead of just fixtures.
+real system (PipeWire, an actual model endpoint) instead of just fixtures. The
+settings overlay can be rendered without touching your desktop:
+`tests/offscreen/render.sh --fake-data <out-dir>` runs Quickshell offscreen
+against a fake CLI and writes one PNG per page. The layout is `SettingsWindow.qml`
+(the layer-shell window: scrim, focus, dismissal) over `settings/SettingsCard.qml`
+(header, nav, page loader), with `settings/SettingsStore.qml` holding every CLI
+round trip and one `settings/<Name>Page.qml` per section. To add a section, add an
+entry to `SETTINGS_SECTIONS` in `Model.js` and a page file that extends
+`SettingsPage`; the nav, the digit keys, and the tests pick it up from there.
 
 ## License
 

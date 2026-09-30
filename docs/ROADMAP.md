@@ -7,6 +7,20 @@ Recording, detection, the two transcription providers `local` (voxtype) and
 `pick-folder`. See `docs/SPEC-settings-and-providers.md` §§1-3, 7 (local),
 and 8 (the phase cut itself).
 
+## v2 (in progress on `spitball-v2`)
+
+Four features, in order, per `docs/SPEC-v2.md`:
+
+1. **Settings overlay** (done) -- the centered layer-shell settings window with a
+   section nav, replacing the bar dropdown; every config key has a control.
+2. **Calendar** -- match calls to events from a secret ICS feed or a
+   `calendar_command`; fills the Calendar page.
+3. **Noise** -- `highpass` on the mic split plus `mic_denoise: off|auto|on`
+   (RNNoise via ffmpeg `arnndn`, `afftdn` fallback); fills the Audio page.
+4. **Speakers** -- attendee-based naming plus an on-device far-channel split
+   in the live-engine venv, and `spitball speakers <dir>`; fills the Speakers
+   page.
+
 ## Phase 2: more transcription providers
 
 Parked per spec amendment §8 so each can get a real API key and a live test

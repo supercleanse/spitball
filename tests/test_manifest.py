@@ -61,16 +61,66 @@ class TestOmarchyPluginValidate(unittest.TestCase):
                           f"stdout={result.stdout!r} stderr={result.stderr!r}")
 
 
+class TestSettingsOverlayFiles(unittest.TestCase):
+    """The settings overlay (docs/SPEC-v2.md section 1) replaced the old
+    dropdown: Widget.qml hosts SettingsWindow.qml, the dropdown file is gone,
+    and every page Model.js's section list names exists under settings/."""
+
+    def test_widget_hosts_the_overlay_not_the_old_panel(self):
+        widget = (ROOT / "Widget.qml").read_text()
+        self.assertIn("SettingsWindow {", widget)
+        self.assertNotIn("SettingsPanel", widget)
+        self.assertFalse((ROOT / "SettingsPanel.qml").exists(), "SettingsPanel.qml should be deleted")
+
+    def test_every_section_page_exists(self):
+        model_js = (ROOT / "Model.js").read_text()
+        pages = re.findall(r'page:\s*"([A-Za-z]+Page\.qml)"', model_js)
+        self.assertEqual(len(pages), 10, pages)
+        for page in pages:
+            self.assertTrue((ROOT / "settings" / page).is_file(), page)
+
+    def test_offscreen_harness_is_the_only_fake_data_path(self):
+        # The fake CLI is wired only by render.sh (behind --fake-data); no
+        # shipped QML may reference it.
+        for qml in QML_FILES:
+            self.assertNotIn("fake_spitball", (ROOT / qml).read_text(), qml)
+        self.assertIn("--fake-data", (ROOT / "tests" / "offscreen" / "render.sh").read_text())
+
+
+# Every QML file the plugin ships: the two entry points, the two popups'
+# content files, the settings overlay, and each settings/ component/page.
+QML_FILES = ["Widget.qml", "SpitballService.qml", "LivePopup.qml", "SettingsWindow.qml"] + sorted(
+    str(p.relative_to(ROOT)) for p in (ROOT / "settings").glob("*.qml"))
+
+
+def _qmllint():
+    # Arch ships qmllint under /usr/lib/qt6/bin without putting it on PATH.
+    return shutil.which("qmllint") or next(
+        (p for p in ("/usr/lib/qt6/bin/qmllint", "/usr/lib/qt6/bin/qmllint6") if Path(p).exists()), None)
+
+
 class TestQmllint(unittest.TestCase):
     def test_qmllint_report_only(self):
-        if not shutil.which("qmllint"):
+        lint = _qmllint()
+        if not lint:
             self.skipTest("qmllint not installed")
-        for qml in ("Widget.qml", "SpitballService.qml"):
-            result = subprocess.run(["qmllint", str(ROOT / qml)],
-                                     capture_output=True, text=True, timeout=30)
-            # Report-only: never fail the suite on lint findings, just surface them.
+        self.assertGreaterEqual(len(QML_FILES), 4 + 20)
+        for qml in QML_FILES:
+            result = subprocess.run([lint, str(ROOT / qml)],
+                                     capture_output=True, text=True, timeout=60)
+            # Report-only: never fail the suite on lint findings, just surface
+            # them. The `qs.Commons`/`qs.Ui` imports resolve only inside
+            # Quickshell, so import warnings are expected here; syntax errors
+            # are what this is for.
             if result.returncode != 0:
-                print(f"qmllint findings for {qml}:\n{result.stdout}\n{result.stderr}")
+                findings = [line for line in (result.stdout + result.stderr).splitlines()
+                            if "Warnings occurred while importing" not in line
+                            and "Failed to import" not in line
+                            and "was not found. Did you add all imports" not in line
+                            and "Are your import paths set up properly" not in line]
+                text = "\n".join(findings).strip()
+                if text:
+                    print(f"qmllint findings for {qml}:\n{text}")
 
 
 if __name__ == "__main__":
