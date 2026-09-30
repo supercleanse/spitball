@@ -18,7 +18,7 @@ import "../Model.js" as Model
 //
 // requestClose(): the overlay must close BEFORE this store launches
 // anything outside the shell -- a portal folder picker, the voxtype
-// installer, the live-engine installer, or (via `spitball local set-model`)
+// installer, the live-engine or speaker-split installer, or (via `spitball local set-model`)
 // a graphical pkexec/polkit prompt or a fallback terminal. All of those are
 // ordinary top-level windows; the overlay is a layer-shell surface with
 // exclusive keyboard focus that Hyprland stacks ABOVE them, which is exactly
@@ -140,6 +140,11 @@ QtObject {
   property var liveStatus: null
   property bool liveStatusFailed: false
 
+  // `spitball diarize status --json` -- {installed, package, models, venv,
+  // model_dir, engine}: the on-device speaker split (Speakers page).
+  property var diarizeStatus: null
+  property bool diarizeStatusFailed: false
+
   // `spitball status --json` -- only `present` (call apps holding the mic
   // right now) is used here, for the Recording page's read-out. `null`
   // until the first successful read; the daemon being down reads as [].
@@ -218,6 +223,13 @@ QtObject {
     root.runCliJson(["live", "status", "--json"], function(ok, data) {
       root.liveStatusFailed = !ok
       root.liveStatus = (ok && data && typeof data === "object") ? data : null
+    })
+  }
+
+  function loadDiarizeStatus() {
+    root.runCliJson(["diarize", "status", "--json"], function(ok, data) {
+      root.diarizeStatusFailed = !ok
+      root.diarizeStatus = (ok && data && typeof data === "object") ? data : null
     })
   }
 
@@ -496,6 +508,36 @@ QtObject {
       root.livePollTicks += 1
       root.loadLiveStatus()
       if (root.livePollTicks >= root.localPollMaxTicks) root.livePollTimer.stop()
+    }
+  }
+
+  // ------------------------------------------------------------ speaker split
+
+  // `spitball diarize setup`: pip into the live-engine venv plus two model
+  // downloads -- a minute or more, in Omarchy's floating terminal, exactly
+  // like installLiveEngine(). Same layering rule: close first, don't
+  // reopen, poll `diarize status` so the Speakers page is fresh on return.
+  function installDiarize() {
+    root.requestClose()
+    Quickshell.execDetached(["omarchy-launch-floating-terminal-with-presentation",
+                             "/usr/bin/python3 -I " + root.cliPath + " diarize setup"])
+    root.beginDiarizePoll()
+  }
+
+  property int diarizePollTicks: 0
+
+  function beginDiarizePoll() {
+    root.diarizePollTicks = 0
+    root.diarizePollTimer.restart()
+  }
+
+  property Timer diarizePollTimer: Timer {
+    interval: 3000
+    repeat: true
+    onTriggered: {
+      root.diarizePollTicks += 1
+      root.loadDiarizeStatus()
+      if (root.diarizePollTicks >= root.localPollMaxTicks) root.diarizePollTimer.stop()
     }
   }
 

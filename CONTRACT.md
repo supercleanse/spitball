@@ -90,6 +90,7 @@ occupies (idle/offline, nothing more important going on). See Widget.qml's
 | `$XDG_RUNTIME_DIR/spitball/ctl.sock` | The Unix control socket (mode `0600`). |
 | `~/.local/state/spitball/persist.json` | Durable bits that survive a daemon restart: `last_call`. (`auto_record` lived here before it moved into `config.json`; a pre-existing value migrates over once, then this file stops carrying it.) |
 | `~/.config/spitball/config.json` | User settings (optional; see README's Configuration section for every key). |
+| `~/.local/share/spitball/live-engine/venv/`, `models/diarization/` | The optional venv (`spitball live setup` / `spitball diarize setup`) and the speaker split's two models (`pyannote-segmentation-3.0.int8.onnx`, `3dspeaker-eres2net-en-voxceleb.onnx`), downloaded from the k2-fsa GitHub releases and verified by SHA-256 (`models/diarization/README.md`). |
 | `~/.local/state/spitball/calendar/feed.ics`, `feed.json` | The cached calendar feed (mode `0600`, directory `0700`) and its metadata (`fetched_at`, `etag`, `last_modified`, `bytes`, and `key`, a SHA-256 prefix of the feed URL -- never the URL itself). See "Calendar events" below. |
 
 All three env vars `SPITBALL_RUNTIME_DIR`, `SPITBALL_STATE_DIR`, `SPITBALL_CONFIG`
@@ -138,6 +139,10 @@ from a checkout.
 | `spitball local _apply-streaming <name>` | **internal** -- the streaming step on its own (see `set-model`), so `bin/spitball-upgrade-parakeet`'s terminal fallback configures streaming exactly like the background worker. Exit 1 with a message on stderr if voxtype refuses the setting. |
 | `spitball live setup` | creates `~/.local/share/spitball/live-engine/venv` (uv when available, else `python3 -m venv` + pip) with onnx-asr + onnxruntime + sentencepiece for the live engine. Exit 1 with the installer's last error line on stderr. |
 | `spitball live status [--json]` | `{"installed": bool, "venv": "...", "model": "<voxtype parakeet model or empty>", "fast": bool}` -- `fast` means the next recording's live transcript will use the engine. |
+| `spitball speakers <call-dir> [--json]` | the call's far-side speakers from its cached `.transcript.json`: `[{"n", "label", "id", "name", "confidence", "source", "evidence", "seconds", "words"}]` -- `n` is the label number ("Speaker n"; `label` is "Them" when there is one voice), `id` the provider's speaker id, `source` `user` \| `calendar` \| `llm` \| `""`. Exit 1 when the folder has no cached transcript. |
+| `spitball speakers <call-dir> <n> "Name"` \| `--clear` | records a hand-set name (`source: "user"`, kept by every later run) or clears it back to automatic in the `speakers` block, then re-renders `transcript.md`, `summary.md` (speaker labels inside the summary's own text are rewritten), and the `export_dir` copy from the cached transcript -- no transcription, no model call. Prints the new listing. Exit 1 for an unknown speaker number. |
+| `spitball diarize setup` | installs the on-device speaker split: the `sherpa-onnx` wheel (plus numpy) into `~/.local/share/spitball/live-engine/venv` (created if missing; the live engine's own packages are untouched), then the two models above, each verified by hash (a mismatch is deleted and reported). Exit 1 with the reason on stderr. |
+| `spitball diarize status [--json]` | `{"installed": bool, "package": bool, "models": bool, "venv": "...", "model_dir": "...", "engine": "sherpa-onnx"}` -- `installed` means both the wheel and both models are in place. |
 | `spitball pick-folder [--title T]` | native folder chooser (xdg-desktop-portal → zenity → kdialog); prints the chosen absolute path. Exit 1 if canceled, exit 2 if no picker is available at all (caller should fall back to a text field). |
 | `spitball daemon` | run the service (`SpitballService.qml` does this; you shouldn't need to) |
 
@@ -253,7 +258,48 @@ on the invite:
 `attendees` includes you (`self: true`, when the feed identifies you) so a consumer
 can subtract yourself to get the far side; `response` is `accepted` / `declined` /
 `tentative` / `needs_action`; `name` may be empty when the invite carries only an
-address. `spitball speakers` (phase 4) reads this block; it never rewrites it.
+address. Speaker naming reads this block and never rewrites it.
+
+**`speakers`** (spitball/speakers.py) is who each far-side voice is, written by
+`process()` after transcription and by `spitball speakers`:
+
+```json
+{
+  "speakers": {
+    "1": {"id": 2, "name": "Priya Nair", "confidence": "high", "source": "llm",
+          "evidence": "00:00:42 'thanks, Priya' from the next speaker"},
+    "2": {"id": 5, "name": "Alex Demo", "confidence": "medium", "source": "llm", "evidence": "…"},
+    "3": {"id": 7, "name": "", "confidence": "none", "source": "", "evidence": ""}
+  },
+  "diarization": {"ran": true, "engine": "sherpa-onnx", "expected": 3, "num_clusters": 3,
+                  "found": 3, "seconds": 4.1}
+}
+```
+
+Keys are the label numbers as rendered (`Speaker 1`, `Speaker 2`, …; with a single
+far voice the one key is `"1"`, rendered "Them"), ordered by first appearance;
+`id` is the provider's own speaker id for that label, which is how an entry follows
+its voice across a reprocess. Before labels are assigned, far-side ids with under 5
+seconds and under 12 words fold into the id speaking nearest to them, and ids
+beyond `speaker_max` fold the same way; the utterances themselves are never
+rewritten. `confidence` is `high` / `medium` / `low` / `none`; `source` is `user`
+(set by `spitball speakers`, never overwritten), `calendar` (a 1:1: one other
+non-declined invitee and one far voice), `llm` (the naming call), or `""`. Rendering:
+`user` or `high` → the name; `medium` → `Speaker 2 (probably Alex Demo)`; anything
+else → the bare label. Every run recomputes the non-`user` entries (an entry whose
+`id` is gone is dropped); a naming failure leaves them empty and adds a
+`**Note:** speaker names unavailable: …` header line. The block is absent when the
+call has no far-side speech.
+
+**`diarization`** is written by the local provider (or by `process()` when it
+reused `.live.json`): whether the on-device split ran. `ran: false` carries a
+`reason` (`off`, `speaker_max is 1`, `one remote attendee expected`, `not
+installed`, `no speech found on the far channel`, or `failed: …`); `expected` is
+the invitee count from the meeting (null when unknown), `num_clusters` what the
+clustering was asked for (-1 = pick a count by threshold), `found` how many voices
+came back after the cap, `seconds` the worker's own time, and `resplit` (live reuse
+only) how many live utterances that straddled a speaker change were re-transcribed
+as pieces. Deepgram never writes it.
 
 `mic_denoise` is written by the local provider (and by the live transcriber into
 `.live.json`, from where it rides along when that file is reused as the transcript):
@@ -391,13 +437,13 @@ item passes `general`, every setup prompt passes `transcription`). IPC target
 Every value shown comes from `spitball config get --json`; every change goes through
 `config set` / `config set-secret` (stdin) / `config unset` immediately, and the
 other read-only commands in the CLI table (`local info/models`, `live status`,
-`calendar test`,
+`diarize status`, `calendar test`,
 `check`, `status`) fill the pages. `settings/SettingsStore.qml` owns all of those
 round trips; pages never spawn processes. Every key in `config.json` has a control.
 
 **Layering rule.** Before the store launches anything that opens an ordinary window
--- `pick-folder`, the voxtype installer, `live setup` in a terminal, or `local
-set-model` (which may show a pkexec prompt) -- it asks the widget to close the
+-- `pick-folder`, the voxtype installer, `live setup` or `diarize setup` in a
+terminal, or `local set-model` (which may show a pkexec prompt) -- it asks the widget to close the
 overlay, because a layer-shell surface with exclusive keyboard focus sits above every
 normal window. `pick-folder` reopens it when the picker resolves (any exit code);
 installers and model switches leave it closed, and their progress is watched on the

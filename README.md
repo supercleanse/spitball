@@ -51,6 +51,14 @@ stops on its own when the call ends, and leaves you a transcript and a summary i
    attendees, and the summarizer is told who was invited. See
    [Calendar](#calendar).
 
+8. **Knows who said what.** With a matched meeting, one short model call puts the
+   invitees' names on the far-side speakers from what people say ("thanks, Priya";
+   "this is Alex"), and an unsure match stays visibly unsure: "Speaker 2 (probably
+   Priya)". A 1:1 call needs no model at all. On the local provider, an optional
+   on-device add-on tells the other side's voices apart first; Deepgram already
+   does. `spitball speakers <dir> 2 "Priya Nair"` fixes a name by hand. See
+   [Speakers](#speakers).
+
 Any click on the widget, left or right, opens its menu: start recording, show the
 live transcript and stop while recording, dismiss the current detection, toggle
 auto-record, open the last call's summary, open the calls folder, or open Settings.
@@ -79,7 +87,7 @@ inside a text field, Esc hands focus back to the section list first.
 | **Transcription** | Local (voxtype) or Deepgram. Local: the voxtype model picker with its inline Switch confirmation and download progress, or an Install button if voxtype is missing. Deepgram: API key, model, Test, and the key command under Advanced. |
 | **Live** | The live transcript on/off, the line cutoff, the fast-engine toggle, and whether the engine is installed (with an Install button). |
 | **Audio** | Mic noise reduction for the transcriber (Off / Auto / On, with a line on each), the mic and speakers Spitball would record today, and under Advanced the background level Auto trips at. See [Audio and noise](#audio-and-noise). |
-| **Speakers** | Coming in this release: naming the far side and splitting it into speakers. |
+| **Speakers** | Naming the far side from the calendar invite, the on-device split of the far channel into separate voices (with an Install button), the most far-side voices to show, and which providers split speakers. See [Speakers](#speakers). |
 | **Summary** | Summaries on/off, the endpoint, the model (a dropdown when the endpoint lists any), API key, Test, and the key command under Advanced. |
 | **Calendar** | Matching on/off, the source (a secret iCal/ICS address stored like an API key, or your own command), a Test button that shows what a call starting now would match, whether the event title becomes the call title, what goes to the summarizer (attendee names on by default, the description off), and under Advanced the address command, your calendar email, and the feed refresh interval. See [Calendar](#calendar). |
 | **Storage** | The notes-copy folder (`export_dir`) and a way into the calls folder. |
@@ -224,8 +232,9 @@ summarization are done: the matched calendar event's title when there is a confi
 match (see [Calendar](#calendar)), otherwise the summarizer's. A few dot-files sit
 beside them: `.meta.json` (the call's facts, plus the calendar candidates snapshotted
 when recording started), `.transcript.json` (the cached transcript, the matched meeting
-and its attendees, and which mic noise reduction ran), and `.live.json` (the live
-transcript, when it ran).
+and its attendees, who each far-side speaker resolved to, which mic noise reduction
+ran, and whether the speaker split ran), and `.live.json` (the live transcript, when
+it ran).
 
 Set `export_dir` and Spitball also copies the summary and full transcript, as one
 markdown file, into that folder — handy for dropping calls straight into an Obsidian
@@ -271,8 +280,12 @@ Set `transcription_provider` to pick one:
   own process never runs `sudo`/`pkexec` itself or edits voxtype's config
   directly. If voxtype isn't installed at all, the bar shows a "Set up" gear
   with a hint to install it or switch providers.
+
+  voxtype hears the other side as one voice ("Them"). `spitball diarize setup`
+  adds an on-device speaker split that tells the far-side voices apart before
+  they are transcribed — see [Speakers](#speakers).
 - **`deepgram`** — cloud, multichannel + diarized, so the far side can have several
-  distinct speakers. See `deepgram_model`/`deepgram_api_key(_command)` below.
+  distinct speakers without any add-on. See `deepgram_model`/`deepgram_api_key(_command)` below.
 
 More providers (an OpenAI-compatible endpoint, AssemblyAI, Soniox) are planned —
 see `docs/ROADMAP.md`.
@@ -423,6 +436,60 @@ events — the shape is in [CONTRACT.md](CONTRACT.md#calendar-events); only `tit
 `SPITBALL_WINDOW_START`/`SPITBALL_WINDOW_END`. This is how khal/vdirsyncer, gcalcli,
 a CalDAV script, or an Evolution Data Server one-liner plugs into the same matcher.
 
+## Speakers
+
+Your own channel is always labeled with your name. The other side is one voice
+("Them") or several ("Speaker 1", "Speaker 2", …), depending on the provider and on
+the optional split below. Two things then put names on those labels, both on the
+Speakers page.
+
+**Naming from the invite** (`speaker_names`, on by default). When a call has a
+confident calendar match, Spitball hands the transcript (with its neutral labels) and
+the invitees' names to the summary endpoint once, before the summary, and asks which
+"Speaker N" is which invitee and why. Only what people actually say counts: someone
+introducing themselves, being addressed by name right before or after their turn,
+or you addressing them. A name that isn't on the invite is thrown away; a name
+claimed for two speakers makes both unsure. A sure match shows the name; an unsure
+one reads `Speaker 2 (probably Priya Nair)`, in the transcript and in the summary's
+own wording; no evidence keeps `Speaker 2`. A 1:1 call (one other invitee, one
+far-side voice) is named with no model call at all. No pitch or gender guessing,
+and no voiceprints: nothing about anyone's voice is remembered between calls.
+
+Got a name wrong or missing? `spitball speakers <call-dir>` lists the far-side
+speakers with what each resolved to and the evidence; `spitball speakers <call-dir>
+2 "Priya Nair"` names one by hand and re-renders `transcript.md`, `summary.md` (its
+wording included), and the export copy on the spot, without another model call. A
+hand-set name is final: a later `spitball reprocess` keeps it and only re-resolves
+the others. `--clear` goes back to automatic. If you want a fresh summary written
+with the corrected names, run `spitball reprocess <call-dir>` afterward.
+
+**Telling voices apart on this computer** (`speaker_split`, on by default, no
+effect until installed). Deepgram splits the far channel on its own. The local
+provider can too, once you click **Install** on the Speakers page (or run
+`spitball diarize setup`): it adds the [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx)
+wheel (about 100 MB) to the same virtualenv the fast live engine uses,
+`~/.local/share/spitball/live-engine/`, and downloads two small models (pyannote's
+segmentation-3.0 and a 3D-Speaker embedding model, about 30 MB together) from the
+k2-fsa GitHub releases, each verified against a pinned hash. No Hugging Face account
+or token, no PyTorch. Provenance and licenses are in `models/diarization/README.md`.
+
+With it installed, the far channel (only the far channel; your side is already
+separate) is diarized before transcription, each speech window is cut where the
+speaker changes, and every line carries the id of one voice. When the invite says
+how many other people were there, that count drives the clustering, which is the
+single biggest quality lever; when it doesn't, the clustering picks a count on its
+own and the result is capped at **Most far-side voices to show** (`speaker_max`,
+6). A call whose invite lists exactly one other person is never split. A voice with
+only a few words (an "mm-hm" the segmenter split off, a notification sound) folds
+into the voice speaking around it; so do voices beyond the cap. If the add-on is
+missing, the worker fails, or the far channel has no speech, the transcript keeps
+today's single "Them" and `.transcript.json`'s `diarization` block says why. Expect
+clean splits for two to four distinct headset voices, and merges or swaps for very
+similar voices, brief speakers, and several people sharing one room microphone; the
+header's `**Note:** the invite lists 3 other people; 5 voices were found on the far
+side.` line is the tell when a split went wrong. It costs a few seconds of CPU per
+minute of far-side speech.
+
 ## Configuration
 
 Settings live in `~/.config/spitball/config.json`, an optional file — every key has a
@@ -465,6 +532,9 @@ default, and you only need to set the ones you want to change.
 | `calendar_names_to_summary` | `true` | Tell the summarizer who was on the invite. |
 | `calendar_description_to_summary` | `false` | Also send the event description to the summarizer. Off by default: it can carry private text. |
 | `calendar_my_email` | `""` | Your address on the calendar, so your own response is read (declined invites are skipped). Empty: the address on nearly every invite in the feed is taken as yours. |
+| `speaker_names` | `true` | Put invitees' names on the far-side speakers, from what people say, when the call matched a meeting. One short call to the summary endpoint; a 1:1 needs none. See [Speakers](#speakers). |
+| `speaker_split` | `true` | Tell far-side voices apart on the local provider, once `spitball diarize setup` has installed the add-on. Never runs for a 1:1; any failure keeps one "Them". |
+| `speaker_max` | `6` | The most far-side voices a transcript shows (1–12). The invite's headcount is used when known, capped here; extra or tiny voices fold into their neighbors. |
 
 The Deepgram key can also come from the `DEEPGRAM_API_KEY` environment variable,
 which wins over both config keys — useful if you'd rather manage it outside the
@@ -520,6 +590,13 @@ is not your own machine); the event description goes only if you turn
 `calendar_description_to_summary` on. Attendee email addresses stay in the dot-files
 and never appear in `transcript.md` or `summary.md` unless an attendee has no name on
 the invite.
+
+Speaker naming sends the same two things (the transcript and the invitees' names and
+addresses) to that same endpoint once more, before the summary; `speaker_names:
+false` turns it off. The on-device speaker split runs entirely on your machine and
+keeps nothing between calls: no voice profiles, no enrollment, no guesses about
+anyone's gender. The names Spitball prints come only from the invite and from what
+people said.
 
 Recording laws vary by place — some require only your own consent, others require
 everyone on the call to consent. Check your jurisdiction, and tell people you're
@@ -586,6 +663,9 @@ ln -s ~/.config/omarchy/plugins/supercleanse.spitball/bin/spitball ~/.local/bin/
 | `spitball calendar test [--at TIME] [--app APP] [--meet CODE] [--refresh] [--json]` | Which calendar event a call starting now (or at `TIME`) would match, with every candidate and its score. See [Calendar](#calendar). |
 | `spitball local info\|models\|set-model` | What voxtype is configured with, every model it can download, or switch it to one. See [Transcription providers](#transcription-providers). |
 | `spitball live setup\|status [--json]` | Install the fast live-transcript engine, or show whether it's on and which model it loads. See [Live transcript](#live-transcript). |
+| `spitball speakers <call-dir> [--json]` | List a call's far-side speakers: label, resolved name, confidence, source, evidence, talk time. See [Speakers](#speakers). |
+| `spitball speakers <call-dir> <n> "Name"` / `--clear` | Name speaker `n` by hand (or go back to automatic) and re-render `transcript.md`, `summary.md`, and the export copy. No model call. |
+| `spitball diarize setup\|status [--json]` | Install the on-device speaker split (sherpa-onnx + two small models, into the live-engine venv), or show whether it's installed. |
 | `spitball pick-folder [--title T]` | Native folder chooser; prints the chosen path (used by the settings panel). |
 | `spitball daemon` | Run the service directly. `SpitballService.qml` does this for you; you shouldn't need to. |
 
@@ -618,6 +698,11 @@ Tests run through `tests/run.sh`; pass `--live` to include anything that talks t
 real system (PipeWire, an actual model endpoint) instead of just fixtures. Audio
 tests synthesize their own clips with ffmpeg at run time (nothing under `tests/`
 ships audio); `models/rnnoise/sh.rnnn` is the one binary asset in the repository. The
+speaker split's worker is exercised against a fake in the normal run; set
+`SPITBALL_DIARIZE_TEST_DIR` to a directory laid out like `spitball diarize setup`
+leaves `~/.local/share/spitball/live-engine/` (a `venv/` with sherpa-onnx and
+`models/diarization/` with the two pinned models) to also run it for real on a
+two-voice clip built from the speech samples in `tests/.cache/`. The
 settings overlay can be rendered without touching your desktop:
 `tests/offscreen/render.sh --fake-data <out-dir>` runs Quickshell offscreen
 against a fake CLI and writes one PNG per page. The layout is `SettingsWindow.qml`

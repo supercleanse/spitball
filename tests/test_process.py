@@ -941,3 +941,204 @@ class TestCalendarInPipeline(TestProcessPipeline):
             result = process.process(self.call_dir, self._meta([self._event()], ["abc-defg-hij"]), cfg)
         summary = (Path(result["dir"]) / "summary.md").read_text()
         self.assertTrue(summary.startswith("# Weekly sync\n\n## Summary\n- no heading"))
+
+
+class TestSpeakersInPipeline(TestProcessPipeline):
+    """Speaker naming in process() (docs/SPEC-v2.md §4): the invite list
+    plus one fake model call name Deepgram's "Speaker N" labels; a 1:1
+    names "Them" with no model call; user renames survive a reprocess and
+    re-render the outputs without a new summary; the invite/voice count
+    mismatch and a naming failure show up as header notes."""
+
+    def _event(self, far_names):
+        from datetime import datetime, timedelta, timezone
+        s = datetime.fromtimestamp(1790000000 - 120, tz=timezone.utc)
+        attendees = [{"name": n, "email": f"{n.split()[0].lower()}@example.com", "response": "accepted",
+                      "self": False, "optional": False} for n in far_names]
+        attendees.append({"name": "", "email": "me@example.com", "response": "accepted", "self": True, "optional": False})
+        return {"id": "ev-1", "uid": "ev-1", "title": "Weekly sync", "start": s.isoformat(),
+                "end": (s + timedelta(minutes=30)).isoformat(), "all_day": False, "status": "confirmed",
+                "transparency": "opaque", "kind": "default", "my_response": "accepted", "organizer": None,
+                "attendees": attendees, "conference": None, "location": "", "description": "",
+                "recurring": False, "recurrence_id": ""}
+
+    def _decision(self, far_names):
+        ev = self._event(far_names)
+        return {"event": ev, "confident": True, "confidence": 100, "candidates": [], "match": ev}
+
+    def _run(self, far_names, chat_reply=None, transcribe_return=None, cfg=None, call_dir=None, retranscribe=False):
+        transcribe_return = transcribe_return if transcribe_return is not None else \
+            _normalized_fixture("deepgram_multi_speaker.json", self.cfg)
+        chat = mock.Mock(side_effect=AssertionError("model must not be called")) if chat_reply is None \
+            else mock.Mock(return_value=chat_reply)
+        decision = self._decision(far_names) if far_names is not None else None
+        with mock.patch("spitball.calendar.for_call", return_value=decision), \
+             mock.patch("spitball.process.transcribe", return_value=transcribe_return) as t, \
+             mock.patch("spitball.speakers._chat", chat), \
+             mock.patch("spitball.process.summarize", return_value="# Weekly sync\n\n## Summary\n- Speaker 2 will wait.") as sm:
+            result = process.process(call_dir or self.call_dir, {} if call_dir else self.meta, cfg or self.cfg,
+                                     retranscribe=retranscribe)
+        return result, t, chat, sm
+
+    def test_llm_names_deepgram_speakers_and_renders_confidence(self):
+        reply = json.dumps({"Speaker 1": {"name": "Priya Nair", "confidence": "high", "evidence": "0:00 intro"},
+                            "Speaker 2": {"name": "Alex Demo", "confidence": "medium", "evidence": "0:05 'Alex?'"}})
+        result, t, chat, sm = self._run(["Priya Nair", "Alex Demo"], chat_reply=reply)
+        final_dir = Path(result["dir"])
+        text = (final_dir / "transcript.md").read_text()
+        self.assertIn("**[00:00:00] Priya Nair:** I think we should ship Friday", text)
+        self.assertIn("**[00:00:05] Speaker 2 (probably Alex Demo):** I disagree, let's wait", text)
+        self.assertIn("**Speakers:** Speaker 1 = Priya Nair, Speaker 2 (probably Alex Demo)", text)
+        # The model saw neutral labels and the invite list, not the names.
+        system, user, _, _ = chat.call_args[0]
+        self.assertIn("**[00:00:00] Speaker 1:** I think", user)
+        self.assertIn("- Priya Nair <priya@example.com>", user)
+        # The summarizer got the renamed transcript and the Speakers line.
+        transcript_arg, meta_arg = sm.call_args[0][0], sm.call_args[0][1]
+        self.assertIn("Priya Nair:** I think", transcript_arg)
+        self.assertIn("**Speakers:** Speaker 1 = Priya Nair", meta_arg)
+        cache = json.loads((final_dir / ".transcript.json").read_text())
+        self.assertEqual(cache["speakers"]["1"], {"id": 2, "name": "Priya Nair", "confidence": "high",
+                                                  "source": "llm", "evidence": "0:00 intro"})
+        self.assertEqual(cache["speakers"]["2"]["confidence"], "medium")
+        self.assertEqual(t.call_args[1], {"hints": {"far_speakers": 2}})
+
+    def test_one_to_one_names_them_without_the_model(self):
+        single = _normalized_fixture("deepgram_single_speaker.json", self.cfg)
+        result, _, chat, sm = self._run(["Priya Nair"], transcribe_return=single)
+        text = (Path(result["dir"]) / "transcript.md").read_text()
+        self.assertIn("**[00:00:00] Priya Nair:** Hey how's it going today", text)
+        self.assertNotIn("Them:", text)
+        self.assertIn("**Speakers:** Them = Priya Nair", text)
+        chat.assert_not_called()
+        cache = json.loads((Path(result["dir"]) / ".transcript.json").read_text())
+        self.assertEqual(cache["speakers"]["1"]["source"], "calendar")
+
+    def test_no_meeting_means_neutral_labels_and_no_model_call(self):
+        result, _, chat, _ = self._run(None)
+        text = (Path(result["dir"]) / "transcript.md").read_text()
+        self.assertIn("**[00:00:00] Speaker 1:**", text)
+        self.assertNotIn("**Speakers:**", text)
+        chat.assert_not_called()
+        cache = json.loads((Path(result["dir"]) / ".transcript.json").read_text())
+        self.assertEqual([e["name"] for e in cache["speakers"].values()], ["", ""])
+
+    def test_naming_off_skips_the_model(self):
+        cfg = dict(self.cfg, speaker_names=False)
+        result, _, chat, _ = self._run(["Priya Nair", "Alex Demo"], cfg=cfg)
+        chat.assert_not_called()
+        self.assertIn("**[00:00:00] Speaker 1:**", (Path(result["dir"]) / "transcript.md").read_text())
+
+    def test_model_failure_keeps_neutral_labels_and_notes_it(self):
+        chat = mock.Mock(side_effect=RuntimeError("summary model unreachable at http://127.0.0.1:1"))
+        with mock.patch("spitball.calendar.for_call", return_value=self._decision(["Priya Nair", "Alex Demo"])), \
+             mock.patch("spitball.process.transcribe", return_value=_normalized_fixture("deepgram_multi_speaker.json", self.cfg)), \
+             mock.patch("spitball.speakers._chat", chat), \
+             mock.patch("spitball.process.summarize", return_value="# T\n\n## Summary\n- x"):
+            result = process.process(self.call_dir, self.meta, self.cfg)
+        text = (Path(result["dir"]) / "transcript.md").read_text()
+        self.assertIn("**[00:00:00] Speaker 1:**", text)
+        self.assertIn("**Note:** speaker names unavailable: summary model unreachable", text)
+
+    def test_mismatch_between_invite_and_voices_is_noted(self):
+        reply = json.dumps({"Speaker 1": None, "Speaker 2": None})
+        result, _, _, _ = self._run(["Priya Nair", "Alex Demo", "Sam Third"], chat_reply=reply)
+        text = (Path(result["dir"]) / "transcript.md").read_text()
+        self.assertIn("**Note:** the invite lists 3 other people; 2 voices were found on the far side.", text)
+        self.assertNotIn("**Speakers:**", text)  # nothing named: the bare labels say all there is
+
+    def test_rename_by_hand_rerenders_outputs_and_survives_reprocess(self):
+        export = self.tmp_path / "Notes"
+        cfg = dict(self.cfg, export_dir=str(export))
+        reply = json.dumps({"Speaker 1": {"name": "Priya Nair", "confidence": "high", "evidence": "e"}})
+        result, _, _, _ = self._run(["Priya Nair", "Alex Demo"], chat_reply=reply, cfg=cfg)
+        final_dir = Path(result["dir"])
+        # A wrong automatic name and an unnamed second voice, fixed by hand.
+        with mock.patch("spitball.process.summarize", side_effect=AssertionError("no re-summarize")), \
+             mock.patch("spitball.speakers._chat", side_effect=AssertionError("no model")):
+            rows = process.rename_speaker(final_dir, 2, "Alex Demo", cfg)
+            process.rename_speaker(final_dir, 1, "Priya N.", cfg)
+        self.assertEqual(rows[1]["label"], "Alex Demo")
+        transcript = (final_dir / "transcript.md").read_text()
+        self.assertIn("**[00:00:05] Alex Demo:** I disagree", transcript)
+        self.assertIn("**[00:00:00] Priya N.:** I think", transcript)
+        self.assertIn("**Speakers:** Speaker 1 = Priya N., Speaker 2 = Alex Demo", transcript)
+        summary = (final_dir / "summary.md").read_text()
+        self.assertIn("- Alex Demo will wait.", summary)          # the summary's own wording was rewritten
+        self.assertIn("**Speakers:** Speaker 1 = Priya N.", summary)
+        exported = (export / f"{final_dir.name}.md").read_text()
+        self.assertIn("**[00:00:05] Alex Demo:** I disagree", exported)
+        self.assertIn("- Alex Demo will wait.", exported)
+        # A reprocess: the model answers something else; the user's names win.
+        reply2 = json.dumps({"Speaker 1": {"name": "Alex Demo", "confidence": "high", "evidence": "e"},
+                             "Speaker 2": {"name": "Priya Nair", "confidence": "high", "evidence": "e"}})
+        result2, _, _, _ = self._run(["Priya Nair", "Alex Demo"], chat_reply=reply2, cfg=cfg, call_dir=final_dir)
+        transcript = (Path(result2["dir"]) / "transcript.md").read_text()
+        self.assertIn("**[00:00:00] Priya N.:**", transcript)
+        self.assertIn("**[00:00:05] Alex Demo:**", transcript)
+        cache = json.loads((Path(result2["dir"]) / ".transcript.json").read_text())
+        self.assertEqual({e["source"] for e in cache["speakers"].values()}, {"user"})
+
+    def test_clear_goes_back_to_automatic(self):
+        result, _, _, _ = self._run(None)
+        final_dir = Path(result["dir"])
+        process.rename_speaker(final_dir, 1, "Someone", self.cfg)
+        self.assertIn("Someone:**", (final_dir / "transcript.md").read_text())
+        rows = process.rename_speaker(final_dir, 1, "", self.cfg)
+        self.assertEqual(rows[0]["label"], "Speaker 1")
+        self.assertEqual(rows[0]["source"], "")
+        self.assertIn("**[00:00:00] Speaker 1:**", (final_dir / "transcript.md").read_text())
+
+    def test_list_and_bad_number(self):
+        result, _, _, _ = self._run(None)
+        rows = process.list_speakers(Path(result["dir"]), self.cfg)
+        self.assertEqual([(r["n"], r["label"], r["id"]) for r in rows], [(1, "Speaker 1", 2), (2, "Speaker 2", 5)])
+        with self.assertRaises(ValueError):
+            process.rename_speaker(Path(result["dir"]), 3, "X", self.cfg)
+        with self.assertRaises(RuntimeError):
+            process.list_speakers(self.tmp_path / "nowhere", self.cfg)
+
+    def test_reused_live_transcript_is_offered_to_the_split(self):
+        live = {"provider": "local", "model": "m", "note": "live transcript", "utterances": [
+            {"channel": 0, "speaker": 0, "start": 0.0, "end": 3.0, "transcript": "hey"},
+            {"channel": 1, "speaker": 0, "start": 4.0, "end": 9.0, "transcript": "of course glad to help " * 3}]}
+        (self.call_dir / ".live.json").write_text(json.dumps(live))
+        cfg = dict(self.cfg, transcription_provider="local")
+
+        def fake_split(audio, normalized, cfg_, expected, transcribe_piece=None):
+            normalized["diarization"] = {"ran": False, "engine": "sherpa-onnx", "expected": expected, "reason": "test"}
+            return normalized
+
+        with mock.patch("spitball.calendar.for_call", return_value=self._decision(["A One", "B Two", "C Three"])), \
+             mock.patch("spitball.process.transcribe") as t, \
+             mock.patch("spitball.diarize.split_transcript", side_effect=fake_split) as split, \
+             mock.patch("spitball.speakers._chat", return_value="{}"), \
+             mock.patch("spitball.process.summarize", return_value="# T\n\n## Summary\n- x"):
+            result = process.process(self.call_dir, self.meta, cfg)
+        t.assert_not_called()
+        split.assert_called_once()
+        self.assertEqual(split.call_args[0][3], 3)
+        self.assertIsNotNone(split.call_args[1]["transcribe_piece"])
+        cache = json.loads((Path(result["dir"]) / ".transcript.json").read_text())
+        self.assertEqual(cache["diarization"]["reason"], "test")
+
+    def test_cached_transcript_is_not_split_again(self):
+        result, _, _, _ = self._run(None)
+        with mock.patch("spitball.diarize.split_transcript", side_effect=AssertionError("cached: no split")), \
+             mock.patch("spitball.calendar.for_call", return_value=None), \
+             mock.patch("spitball.process.summarize", return_value="# T\n\n## Summary\n- x"):
+            process.process(Path(result["dir"]), {}, self.cfg)
+
+    def test_tiny_far_voice_folds_into_its_neighbor(self):
+        normalized = {"provider": "deepgram", "model": "nova-3", "utterances": [
+            {"channel": 1, "speaker": 0, "start": 0.0, "end": 12.0, "transcript": "a long first stretch of talk " * 3},
+            {"channel": 1, "speaker": 3, "start": 12.5, "end": 13.2, "transcript": "mm-hm"},
+            {"channel": 1, "speaker": 1, "start": 14.0, "end": 30.0, "transcript": "the second person at length " * 3},
+            {"channel": 0, "speaker": 0, "start": 31.0, "end": 32.0, "transcript": "thanks"}]}
+        result, _, _, _ = self._run(None, transcribe_return=normalized)
+        text = (Path(result["dir"]) / "transcript.md").read_text()
+        self.assertNotIn("Speaker 3", text)
+        self.assertIn("a long first stretch of talk a long first stretch of talk a long first stretch of talk mm-hm", text)
+        cache = json.loads((Path(result["dir"]) / ".transcript.json").read_text())
+        self.assertEqual(sorted(cache["speakers"]), ["1", "2"])
+        self.assertEqual(cache["utterances"][1]["speaker"], 3)  # the provider's ids are never rewritten

@@ -580,9 +580,9 @@ test("settingsSections: the ten sections, in the spec's order, each with a label
   }
 });
 
-test("settingsSections: Speakers is the one placeholder left (Calendar landed in phase 2, Audio in phase 3)", () => {
+test("settingsSections: no placeholders are left (Calendar landed in phase 2, Audio in phase 3, Speakers in phase 4)", () => {
   const placeholders = Model.settingsSections().filter(x => x.placeholder).map(x => x.id);
-  assert.equal(JSON.stringify(placeholders), JSON.stringify(["speakers"]));
+  assert.equal(JSON.stringify(placeholders), JSON.stringify([]));
 });
 
 test("settingsSections: every page file exists under settings/", () => {
@@ -665,7 +665,8 @@ test("settingsSectionBadge: Transcription says Set up whenever the bar's gear wo
 });
 
 test("settingsSectionBadge: placeholders say Soon, everything else is blank", () => {
-  assert.equal(Model.settingsSectionBadge("speakers", null, null), "Soon");
+  // No placeholder is left; the branch stays for the next section that ships as one.
+  assert.equal(Model.settingsSectionBadge("speakers", null, null), "");
   assert.equal(Model.settingsSectionBadge("audio", null, null), "");
   assert.equal(Model.settingsSectionBadge("calendar", null, null), "");
   assert.equal(Model.settingsSectionBadge("general", null, null), "");
@@ -849,4 +850,33 @@ test("settingsSections: Audio is no longer a placeholder", () => {
   const audio = Model.settingsSections().find(x => x.id === "audio");
   assert.equal(audio.placeholder, false);
   assert.equal(audio.page, "AudioPage.qml");
+});
+
+test("settingsSections: Speakers is no longer a placeholder", () => {
+  const speakers = Model.settingsSections().find(x => x.id === "speakers");
+  assert.equal(speakers.placeholder, false);
+  assert.equal(speakers.page, "SpeakersPage.qml");
+});
+
+test("diarizeStatusLine: installed / package-only / missing / garbage", () => {
+  assert.equal(Model.diarizeStatusLine({ installed: true, package: true, models: true, engine: "sherpa-onnx" }),
+    "Speaker split: installed (sherpa-onnx)");
+  assert.equal(Model.diarizeStatusLine({ installed: true, package: true, models: true }), "Speaker split: installed");
+  assert.equal(Model.diarizeStatusLine({ installed: false, package: true, models: false }),
+    "Speaker split: sherpa-onnx is installed, but the models are missing");
+  assert.equal(Model.diarizeStatusLine({ installed: false, package: false, models: false }), "Speaker split: not installed");
+  assert.equal(Model.diarizeStatusLine(null), "");
+  assert.equal(Model.diarizeStatusLine("x"), "");
+});
+
+test("speakerMax: clamps to 1-12, defaults to 6", () => {
+  assert.equal(Model.speakerMax(6), 6);
+  assert.equal(Model.speakerMax("4"), 4);
+  assert.equal(Model.speakerMax(3.6), 4);
+  assert.equal(Model.speakerMax(0), 1);
+  assert.equal(Model.speakerMax(-3), 1);
+  assert.equal(Model.speakerMax(40), 12);
+  assert.equal(Model.speakerMax("abc"), 6);
+  assert.equal(Model.speakerMax(undefined), 6);
+  assert.equal(Model.speakerMax(null), 1);  // Number(null) is 0, the same clamp every NumberRow gets
 });

@@ -60,27 +60,41 @@ def model_dir_for(meta: dict) -> Path | None:
     return d if d.is_dir() else None
 
 
-def setup(run=subprocess.run) -> tuple[bool, str]:
-    """Creates the venv and installs PACKAGES. Uses uv when it's on PATH
-    (much faster), else the stdlib venv + pip. Returns (ok, message)."""
+def venv_steps(packages: tuple) -> list:
+    """The commands that create the venv (if needed) and install `packages`
+    into it: uv when it's on PATH (much faster), else the stdlib venv + pip.
+    Shared with spitball/diarize.py, whose add-on lives in this same venv."""
     venv = ENGINE_DIR / "venv"
-    ENGINE_DIR.mkdir(parents=True, exist_ok=True)
     uv = shutil.which("uv")
     if uv:
-        steps = [[uv, "venv", "--quiet", "--allow-existing", "--python", "/usr/bin/python3", str(venv)],
-                 [uv, "pip", "install", "--quiet", "--python", str(venv / "bin" / "python"), *PACKAGES]]
-    else:
-        steps = [["/usr/bin/python3", "-m", "venv", str(venv)],
-                 [str(venv / "bin" / "python"), "-m", "pip", "install", "--quiet", *PACKAGES]]
-    for cmd in steps:
+        return [[uv, "venv", "--quiet", "--allow-existing", "--python", "/usr/bin/python3", str(venv)],
+                [uv, "pip", "install", "--quiet", "--python", str(venv / "bin" / "python"), *packages]]
+    # `python -m venv` over an existing venv leaves its site-packages alone.
+    return [["/usr/bin/python3", "-m", "venv", str(venv)],
+            [str(venv / "bin" / "python"), "-m", "pip", "install", "--quiet", *packages]]
+
+
+def install(packages: tuple, run=subprocess.run) -> str:
+    """Runs venv_steps(packages). Returns "" on success, else a one-line
+    error (the installer's last output line)."""
+    ENGINE_DIR.mkdir(parents=True, exist_ok=True)
+    for cmd in venv_steps(packages):
         try:
             r = run(cmd, capture_output=True, text=True, timeout=900)
         except (OSError, subprocess.SubprocessError) as e:
-            return False, f"{cmd[0]} failed: {e}"
+            return f"{cmd[0]} failed: {e}"
         if r.returncode != 0:
             detail = (r.stderr or r.stdout or "").strip().splitlines()
-            return False, detail[-1] if detail else f"{' '.join(cmd[:3])} failed"
-    return True, f"Live engine installed in {venv}"
+            return detail[-1] if detail else f"{' '.join(cmd[:3])} failed"
+    return ""
+
+
+def setup(run=subprocess.run) -> tuple[bool, str]:
+    """Creates the venv and installs PACKAGES. Returns (ok, message)."""
+    error = install(PACKAGES, run)
+    if error:
+        return False, error
+    return True, f"Live engine installed in {ENGINE_DIR / 'venv'}"
 
 
 class Engine:

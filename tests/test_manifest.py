@@ -149,3 +149,28 @@ class TestVendoredRnnoiseModel(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestSpeakerSplitFiles(unittest.TestCase):
+    """The speaker split (docs/SPEC-v2.md section 4) downloads its models at
+    install time; the repo carries the worker script and the provenance
+    note, and the hashes in that note are the ones the code pins."""
+
+    def test_worker_script_present_and_standalone(self):
+        from spitball import diarize
+        self.assertTrue(diarize.WORKER_SCRIPT.is_file())
+        text = diarize.WORKER_SCRIPT.read_text()
+        self.assertNotIn("from spitball", text)   # runs under the venv's Python, never imports the package
+        self.assertNotIn("import spitball", text)
+
+    def test_models_readme_pins_the_same_hashes(self):
+        from spitball import diarize
+        readme = (ROOT / "models" / "diarization" / "README.md").read_text()
+        for h in (diarize.SEGMENTATION_TAR_SHA256, diarize.SEGMENTATION_SHA256, diarize.EMBEDDING_SHA256):
+            self.assertIn(h, readme)
+        self.assertIn(diarize.SEGMENTATION_URL, readme)
+        self.assertIn(diarize.EMBEDDING_URL, readme)
+        self.assertNotIn("huggingface.co/pyannote/speaker-diarization", readme)  # the gated pipeline is not used
+
+    def test_no_model_binaries_are_shipped(self):
+        self.assertEqual([p.name for p in (ROOT / "models" / "diarization").iterdir()], ["README.md"])

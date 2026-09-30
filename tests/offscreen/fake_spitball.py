@@ -50,6 +50,9 @@ SETTINGS = {
     "calendar_names_to_summary": True,
     "calendar_description_to_summary": False,
     "calendar_my_email": "",
+    "speaker_names": True,
+    "speaker_split": True,
+    "speaker_max": 6,
 }
 
 # Synthetic: a made-up event, never anything from a real feed.
@@ -78,6 +81,9 @@ LOCAL_MODELS = [
 SUMMARY_CHECK = {"ok": True, "message": "3 models", "models": ["qwen3.6:35b-a3b", "llama3.1:8b", "gemma3:12b"]}
 LIVE_STATUS = {"installed": True, "venv": "/home/demo/.local/share/spitball/live-engine/venv",
                "model": "parakeet-unified-en-0.6b", "fast": True}
+DIARIZE_STATUS = {"installed": False, "package": False, "models": False, "engine": "sherpa-onnx",
+                  "venv": "/home/demo/.local/share/spitball/live-engine/venv",
+                  "model_dir": "/home/demo/.local/share/spitball/live-engine/models/diarization"}
 STATUS = {"ok": True, "state": "idle", "app": "", "started_at": 0, "auto_record": True,
           "message": "", "last_call": {"title": "Weekly sync", "dir": "/home/demo/Calls/x"},
           "setup_needed": "", "updated_at": 0, "present": ["Zoom"]}
@@ -127,6 +133,11 @@ def main(argv):
         if sub == "test":
             print(json.dumps(CALENDAR_TEST)); return 0
         return 2
+    if cmd == "diarize":
+        sub = rest[0] if rest else ""
+        if sub == "status":
+            print(json.dumps(DIARIZE_STATUS)); return 0
+        return 0
     if cmd == "status":
         print(json.dumps(STATUS)); return 0
     if cmd == "pick-folder":

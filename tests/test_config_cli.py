@@ -298,3 +298,26 @@ class TestCalendarSecret(ConfigCliTestCase):
                                ("calendar_my_email", "me@example.com", "me@example.com")):
             self.assertEqual(self.run_main(["config", "set", key, raw])[0], 0)
             self.assertEqual(json.loads(self.run_main(["config", "get", "--json"])[1])[key], want)
+
+
+class TestSpeakerKeys(ConfigCliTestCase):
+    """docs/SPEC-v2.md section 4's three keys: two toggles and an integer
+    cap, plain settings, round-tripped through the CLI."""
+
+    def test_defaults(self):
+        parsed = json.loads(self.run_main(["config", "get", "--json"])[1])
+        self.assertTrue(parsed["speaker_names"])
+        self.assertTrue(parsed["speaker_split"])
+        self.assertEqual(parsed["speaker_max"], 6)
+
+    def test_set_and_unset_round_trip(self):
+        self.assertEqual(self.run_main(["config", "set", "speaker_names", "false"])[0], 0)
+        self.assertEqual(self.run_main(["config", "set", "speaker_split", "false"])[0], 0)
+        self.assertEqual(self.run_main(["config", "set", "speaker_max", "3"])[0], 0)
+        parsed = json.loads(self.run_main(["config", "get", "--json"])[1])
+        self.assertFalse(parsed["speaker_names"])
+        self.assertFalse(parsed["speaker_split"])
+        self.assertEqual(parsed["speaker_max"], 3)
+        self.assertIsInstance(parsed["speaker_max"], int)
+        self.assertEqual(self.run_main(["config", "unset", "speaker_max"])[0], 0)
+        self.assertEqual(json.loads(self.run_main(["config", "get", "--json"])[1])["speaker_max"], 6)

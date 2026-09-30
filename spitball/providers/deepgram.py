@@ -1,7 +1,8 @@
 """Deepgram transcription provider (the original, and still the default).
 Multichannel + diarize, so channel 1 (the far side) can carry several
-distinct speakers -- deepgram is the only provider that tells them apart on
-its own; openai and local both treat the far side as one speaker.
+distinct speakers -- deepgram tells them apart on its own; the local
+provider does so only with the optional on-device split
+(spitball/diarize.py), and otherwise treats the far side as one speaker.
 """
 from __future__ import annotations
 
@@ -61,7 +62,9 @@ def normalize(raw: dict, cfg: dict) -> dict:
     }
 
 
-def transcribe(audio: Path, cfg: dict) -> dict:
+def transcribe(audio: Path, cfg: dict, hints: dict | None = None) -> dict:
+    """`hints` (the invitee count) is unused: Deepgram takes no speaker
+    count and splits the far channel on its own."""
     return normalize(raw_transcribe(audio, cfg), cfg)
 
 

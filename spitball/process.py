@@ -16,13 +16,14 @@ import urllib.request
 from datetime import datetime
 from pathlib import Path
 
-from . import calendar, config, providers
+from . import calendar, config, diarize, providers, speakers
 from .providers.deepgram import DEEPGRAM_URL  # re-exported: some callers/tests reference it here
 
 MAX_TRANSCRIPT_CHARS = 180_000  # about 3 hours of talk
 
 LIVE_TRANSCRIPT_FILENAME = ".live.json"
 LIVE_TRANSCRIPT_MAX_FAILED_FRACTION = 0.1  # more than this much of the call's spoken time failed -> re-transcribe
+SUMMARY_SEPARATOR = "\n\n---\n\n"  # summary.md = <model text> SEPARATOR <header>
 
 
 def _hms(seconds: float) -> str:
@@ -37,12 +38,13 @@ def _slug(text: str, limit: int = 60) -> str:
 
 # ------------------------------------------------------------------ transcription
 
-def transcribe(audio: Path, cfg: dict) -> dict:
+def transcribe(audio: Path, cfg: dict, hints: dict | None = None) -> dict:
     """Dispatches to the configured transcription_provider (deepgram/openai/
     local) and returns the shared normalized shape -- see spitball/providers/
     __init__.py. A module-level name (not `providers.transcribe` called
-    inline) so tests can `mock.patch("spitball.process.transcribe", ...)`."""
-    return providers.transcribe(audio, cfg)
+    inline) so tests can `mock.patch("spitball.process.transcribe", ...)`.
+    `hints` carries the invitee count for the local speaker split."""
+    return providers.transcribe(audio, cfg, hints=hints)
 
 
 def _drop_echo(utts: list) -> list:
@@ -67,19 +69,19 @@ def _drop_echo(utts: list) -> list:
     return kept
 
 
-def build_transcript(normalized: dict, cfg: dict) -> list:
+def build_transcript(normalized: dict, cfg: dict, named: bool = True) -> list:
     """[(start_seconds, speaker_label, text)] with consecutive lines merged.
     `normalized` is the shared provider shape: {"utterances": [...]}
-    (see spitball/providers/__init__.py's module docstring)."""
+    (see spitball/providers/__init__.py's module docstring). Far-side labels
+    come from spitball/speakers.py: "Them" for one far voice, "Speaker N"
+    for several (tiny voices folded into their neighbors), and, with
+    `named`, whatever the `speakers` map resolved each one to."""
     utts = sorted(normalized.get("utterances", []), key=lambda u: u["start"])
     utts = _drop_echo([u for u in utts if u.get("transcript", "").strip()])
-    far_speakers = sorted({u.get("speaker", 0) for u in utts if u["channel"] == 1})
-    label = {}
-    for n, spk in enumerate(far_speakers, 1):
-        label[spk] = "Them" if len(far_speakers) == 1 else f"Speaker {n}"
+    _, fold, labels = speakers.labels_for(normalized, cfg, named)
     lines = []
     for u in utts:
-        who = cfg["my_name"] if u["channel"] == 0 else label.get(u.get("speaker", 0), "Them")
+        who = cfg["my_name"] if u["channel"] == 0 else labels.get(speakers.folded_speaker(u, fold), "Them")
         text = u["transcript"].strip()
         if lines and lines[-1][1] == who and u["start"] - lines[-1][3] < 4:
             s, w, t, _ = lines[-1]
@@ -87,6 +89,10 @@ def build_transcript(normalized: dict, cfg: dict) -> list:
         else:
             lines.append((u["start"], who, text, u["end"]))
     return [(s, w, t) for s, w, t, _ in lines]
+
+
+def _render_lines(lines: list) -> str:
+    return "\n\n".join(f"**[{_hms(s)}] {w}:** {t}" for s, w, t in lines) or "_No speech detected._"
 
 
 # ------------------------------------------------------------------ summary
@@ -117,6 +123,8 @@ Use people's names when the transcript makes them clear. {me} is the speaker
 labeled "{me}". If the notes above the transcript list the people on the
 invite, those are the likely names of the other speakers: use them when the
 transcript supports it, and never assume everyone invited was on the call.
+A label like "Speaker 2 (probably Priya)" is an uncertain guess: keep that
+exact wording wherever you refer to that speaker, never just the name.
 Do not invent facts, names, or dates that are not in the transcript."""
 
 
@@ -130,27 +138,25 @@ def _post_json(url: str, body: dict | None, key: str, timeout: int) -> dict:
         return json.load(resp)
 
 
-def summarize(transcript_text: str, meta: str, cfg: dict | None = None) -> str:
-    """One chat completion against any OpenAI-compatible endpoint (Ollama, LM Studio,
-    OpenAI, OpenRouter…). Raises on any failure; the caller keeps the transcript."""
+def chat_completion(system: str, user: str, cfg: dict | None = None, max_tokens: int = 4000,
+                    temperature: float = 0.3) -> str:
+    """One chat completion against the configured summary endpoint (any
+    OpenAI-compatible server: Ollama, LM Studio, OpenAI, OpenRouter…) --
+    the summary and the speaker-naming pass both go through here. Returns
+    the reply text with any <think> block removed; raises RuntimeError on
+    any failure."""
     cfg = cfg or config.load()
-    if not cfg.get("summary_enabled", True):
-        raise RuntimeError("summaries are turned off (summary_enabled)")
     base = cfg["summary_base_url"].rstrip("/")
     key = config.secret(cfg, "summary_api_key")
     try:
         model = cfg.get("summary_model") or _post_json(f"{base}/models", None, key, 10)["data"][0]["id"]
-        body = transcript_text
-        if len(body) > MAX_TRANSCRIPT_CHARS:
-            body = body[:MAX_TRANSCRIPT_CHARS] + "\n\n[transcript truncated]"
-        me = cfg.get("my_name") or "Me"
         reply = _post_json(f"{base}/chat/completions", {
             "model": model,
-            "temperature": 0.3,
-            "max_tokens": 4000,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
             "messages": [
-                {"role": "system", "content": SUMMARY_SYSTEM.replace("{me}", me)},
-                {"role": "user", "content": f"{meta}\n\nTranscript:\n\n{body}"},
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
             ],
         }, key, 600)
     except urllib.error.HTTPError as e:
@@ -164,6 +170,19 @@ def summarize(transcript_text: str, meta: str, cfg: dict | None = None) -> str:
     if not text:
         raise RuntimeError(f"summary model at {base} returned no text")
     return text
+
+
+def summarize(transcript_text: str, meta: str, cfg: dict | None = None) -> str:
+    """The call's summary: one chat completion. Raises on any failure; the
+    caller keeps the transcript."""
+    cfg = cfg or config.load()
+    if not cfg.get("summary_enabled", True):
+        raise RuntimeError("summaries are turned off (summary_enabled)")
+    body = transcript_text
+    if len(body) > MAX_TRANSCRIPT_CHARS:
+        body = body[:MAX_TRANSCRIPT_CHARS] + "\n\n[transcript truncated]"
+    me = cfg.get("my_name") or "Me"
+    return chat_completion(SUMMARY_SYSTEM.replace("{me}", me), f"{meta}\n\nTranscript:\n\n{body}", cfg)
 
 
 def check_summary(cfg: dict | None = None) -> dict:
@@ -240,6 +259,52 @@ def _load_live_transcript(call_dir: Path, cfg: dict) -> dict | None:
     return data
 
 
+def _base_header(meta: dict, decision: dict | None) -> str:
+    started = datetime.fromtimestamp(meta["started_at"])
+    header = (f"**Date:** {started:%B %-d, %Y, %-I:%M %p}  \n"
+              f"**App:** {meta.get('app') or 'Manual'}  \n"
+              f"**Length:** {_hms(meta['duration'])}")
+    cal_lines = calendar.header_lines(decision)
+    if cal_lines:
+        header += "  \n" + "  \n".join(cal_lines)
+    return header
+
+
+def _transcript_notes(normalized: dict) -> list:
+    notes = []
+    if normalized.get("note"):  # e.g. the local provider's Whisper-while-Parakeet-downloads fallback
+        notes.append(f"**Note:** {normalized['note']}")
+    failed = sum(1 for u in normalized.get("utterances", []) if u.get("failed"))
+    if failed:
+        notes.append(f"**Note:** {failed} part{'s' if failed != 1 else ''} of the audio couldn't be "
+                     "transcribed and are marked in the text.")
+    return notes
+
+
+def _speaker_lines(normalized: dict, cfg: dict, naming_error: str = "") -> list:
+    """The `**Speakers:**` line, the invite-count sanity check, and a note
+    when the naming pass was attempted and failed."""
+    order, _ = speakers.far_speaker_order(normalized.get("utterances", []), speakers.max_speakers(cfg))
+    lines = speakers.summary_lines(normalized.get("speakers") or {}, single=len(order) == 1)
+    mismatch = speakers.mismatch_line(diarize.expected_far_speakers(normalized.get("meeting")), len(order))
+    if mismatch:
+        lines.append(mismatch)
+    if naming_error:
+        lines.append(f"**Note:** speaker names unavailable: {naming_error}")
+    return lines
+
+
+def _write_outputs(final_dir: Path, title: str, header: str, transcript: str, summary: str, cfg: dict) -> None:
+    (final_dir / "transcript.md").write_text(f"# {title}: transcript\n\n{header}\n\n{transcript}\n")
+    (final_dir / "summary.md").write_text(f"{summary.strip()}{SUMMARY_SEPARATOR}{header}\n")
+    if cfg.get("export_dir"):
+        export = Path(cfg["export_dir"]).expanduser()
+        export.mkdir(parents=True, exist_ok=True)
+        (export / f"{final_dir.name}.md").write_text(
+            f"{summary.strip()}{SUMMARY_SEPARATOR}{header}  \n**Source:** Spitball, `{final_dir}`\n\n"
+            f"## Transcript\n\n{transcript}\n")
+
+
 def process(call_dir: Path, meta: dict, cfg: dict | None = None, notify=None,
             retranscribe: bool = False) -> dict:
     """Transcribe + summarize one call folder. Returns {dir, title, summary}.
@@ -255,9 +320,6 @@ def process(call_dir: Path, meta: dict, cfg: dict | None = None, notify=None,
         meta = json.loads(meta_path.read_text())
 
     started = datetime.fromtimestamp(meta["started_at"])
-    header = (f"**Date:** {started:%B %-d, %Y, %-I:%M %p}  \n"
-              f"**App:** {meta.get('app') or 'Manual'}  \n"
-              f"**Length:** {_hms(meta['duration'])}")
 
     # Calendar (spitball/calendar.py): the daemon snapshots the candidate
     # events into .meta.json at record start; the decision is made here,
@@ -265,10 +327,14 @@ def process(call_dir: Path, meta: dict, cfg: dict | None = None, notify=None,
     decision = calendar.for_call(meta, cfg, meta["duration"])
     meta_path.write_text(json.dumps(meta))  # the snapshot/decision travels with the folder
     event = decision["event"] if decision else None
-    cal_lines = calendar.header_lines(decision)
-    if cal_lines:
-        header += "  \n" + "  \n".join(cal_lines)
+    header = _base_header(meta, decision)
     use_event_title = bool(event) and bool(cfg.get("calendar_prefer_event_title", True))
+    # `meeting` (CONTRACT.md "Transcript cache"): the matched event's title,
+    # time, and attendees. Speaker naming reads `attendees`; the local
+    # speaker split gets the invitee count as a hint. Rewritten on every run
+    # so a changed match is reflected.
+    meeting = calendar.meeting_record(decision)
+    expected_far = diarize.expected_far_speakers(meeting)
 
     cached = None if retranscribe else _load_cached_transcript(call_dir, cfg)
     if cached is not None:
@@ -280,24 +346,32 @@ def process(call_dir: Path, meta: dict, cfg: dict | None = None, notify=None,
         if normalized is None:
             if notify:
                 notify("Transcribing…")
-            normalized = transcribe(audio, cfg)
-    # `meeting` (CONTRACT.md "Transcript cache"): the matched event's title,
-    # time, and attendees, for later phases (speaker naming reads
-    # `attendees`). Rewritten on every run so a changed match is reflected.
-    meeting = calendar.meeting_record(decision)
+            normalized = transcribe(audio, cfg, hints={"far_speakers": expected_far})
+        else:
+            # The live transcript was made without a speaker split; split
+            # it now (a no-op unless the add-on is installed and the call
+            # had more than one other person).
+            from .providers import local as local_provider
+            normalized = diarize.split_transcript(audio, normalized, cfg, expected_far,
+                                                  transcribe_piece=local_provider.transcribe_piece)
     if meeting:
         normalized["meeting"] = meeting
     else:
         normalized.pop("meeting", None)
     (call_dir / ".transcript.json").write_text(json.dumps(normalized))
-    if normalized.get("note"):  # e.g. the local provider's Whisper-while-Parakeet-downloads fallback
-        header += f"  \n**Note:** {normalized['note']}"
-    failed = sum(1 for u in normalized.get("utterances", []) if u.get("failed"))
-    if failed:
-        header += (f"  \n**Note:** {failed} part{'s' if failed != 1 else ''} of the audio couldn't be "
-                   "transcribed and are marked in the text.")
+
+    # Speaker naming (spitball/speakers.py): who each far-side voice is,
+    # from the invite list and what people say. Reads the transcript with
+    # neutral labels; user renames from an earlier run survive.
+    neutral = _render_lines(build_transcript(normalized, cfg, named=False))
+    naming = speakers.resolve(normalized, cfg, neutral)
+    (call_dir / ".transcript.json").write_text(json.dumps(normalized))
+
+    notes = _transcript_notes(normalized) + _speaker_lines(normalized, cfg, naming["error"])
+    if notes:
+        header += "  \n" + "  \n".join(notes)
     lines = build_transcript(normalized, cfg)
-    transcript = "\n\n".join(f"**[{_hms(s)}] {w}:** {t}" for s, w, t in lines) or "_No speech detected._"
+    transcript = _render_lines(lines)
 
     if notify:
         notify("Summarizing…")
@@ -321,9 +395,6 @@ def process(call_dir: Path, meta: dict, cfg: dict | None = None, notify=None,
         summary = (f"# {title}\n\nSummary unavailable: {e}\n\n"
                    f"Retry with `spitball reprocess \"{call_dir}\"`.")
 
-    (call_dir / "transcript.md").write_text(f"# {title}: transcript\n\n{header}\n\n{transcript}\n")
-    (call_dir / "summary.md").write_text(f"{summary.strip()}\n\n---\n\n{header}\n")
-
     # Rename the folder to include the title, once: 2026-09-28-1400-zoom -> …-zoom-weekly-sync
     final_dir = call_dir
     if not meta.get("titled"):
@@ -335,14 +406,77 @@ def process(call_dir: Path, meta: dict, cfg: dict | None = None, notify=None,
         else:
             final_dir = call_dir
 
-    if cfg.get("export_dir"):
-        export = Path(cfg["export_dir"]).expanduser()
-        export.mkdir(parents=True, exist_ok=True)
-        (export / f"{final_dir.name}.md").write_text(
-            f"{summary.strip()}\n\n---\n\n{header}  \n**Source:** Spitball, `{final_dir}`\n\n"
-            f"## Transcript\n\n{transcript}\n")
+    _write_outputs(final_dir, title, header, transcript, summary, cfg)
     return {"dir": str(final_dir), "title": title, "summary": str(final_dir / "summary.md"),
             "ended_at": int(meta["started_at"] + meta["duration"])}
+
+
+# ------------------------------------------------------------------ speakers CLI
+
+def _read_summary(call_dir: Path, fallback_title: str) -> tuple:
+    """(title, model text) from an existing summary.md, without its header."""
+    try:
+        text = (call_dir / "summary.md").read_text()
+    except OSError:
+        return fallback_title, f"# {fallback_title}\n\nSummary unavailable."
+    body = text.rsplit(SUMMARY_SEPARATOR, 1)[0].strip() if SUMMARY_SEPARATOR in text else text.strip()
+    m = re.match(r"#\s+(.+)", body)
+    return (m.group(1).strip() if m else fallback_title), body
+
+
+def rerender(call_dir: Path, cfg: dict | None = None, label_change: tuple | None = None) -> dict:
+    """Rewrites transcript.md, summary.md, and the export copy from the
+    cached transcript and the existing summary text -- no transcription,
+    no model call. `label_change` is ({n: old label}, {n: new label}) from
+    a rename, applied to the summary's own wording. Used by `spitball
+    speakers`; `spitball reprocess <dir>` is the way to get a fresh summary."""
+    cfg = cfg or config.load()
+    meta = json.loads((call_dir / ".meta.json").read_text())
+    normalized = _load_cached_transcript(call_dir, cfg)
+    if normalized is None:
+        raise RuntimeError(f"no cached transcript in {call_dir}")
+    decision = calendar.for_call(meta, cfg, meta.get("duration"))
+    header = _base_header(meta, decision)
+    notes = _transcript_notes(normalized) + _speaker_lines(normalized, cfg)
+    if notes:
+        header += "  \n" + "  \n".join(notes)
+    transcript = _render_lines(build_transcript(normalized, cfg))
+    started = datetime.fromtimestamp(meta["started_at"])
+    title, summary = _read_summary(call_dir, f"Call on {started:%B %-d}")
+    if label_change:
+        summary = speakers.rename_in_summary(summary, *label_change)
+    _write_outputs(call_dir, title, header, transcript, summary, cfg)
+    return {"dir": str(call_dir), "title": title, "summary": str(call_dir / "summary.md")}
+
+
+def list_speakers(call_dir: Path, cfg: dict | None = None) -> list:
+    """`spitball speakers <dir>`: the far-side speakers and their names."""
+    cfg = cfg or config.load()
+    normalized = _load_cached_transcript(call_dir, cfg)
+    if normalized is None:
+        raise RuntimeError(f"no cached transcript in {call_dir} (run `spitball reprocess` first)")
+    return speakers.listing(normalized, cfg)
+
+
+def rename_speaker(call_dir: Path, n: int, name: str, cfg: dict | None = None) -> list:
+    """`spitball speakers <dir> <n> "Name"` (or "" to clear): records the
+    user's answer in .transcript.json and re-renders the three outputs.
+    Returns the new listing. Raises ValueError for a bad speaker number."""
+    cfg = cfg or config.load()
+    normalized = _load_cached_transcript(call_dir, cfg)
+    if normalized is None:
+        raise RuntimeError(f"no cached transcript in {call_dir} (run `spitball reprocess` first)")
+    old = _label_map(normalized, cfg)
+    speakers.set_name(normalized, cfg, n, name)
+    new = _label_map(normalized, cfg)
+    (call_dir / ".transcript.json").write_text(json.dumps(normalized))
+    rerender(call_dir, cfg, label_change=(old, new))
+    return speakers.listing(normalized, cfg)
+
+
+def _label_map(normalized: dict, cfg: dict) -> dict:
+    order, _, labels = speakers.labels_for(normalized, cfg)
+    return {str(n): labels[spk] for n, spk in enumerate(order, 1)}
 
 
 def set_calendar_override(call_dir: Path, event_id: str | None) -> None:

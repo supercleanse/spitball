@@ -444,7 +444,7 @@ var SETTINGS_SECTIONS = [
   { id: "transcription", label: "Transcription", page: "TranscriptionPage.qml" },
   { id: "live",          label: "Live",          page: "LivePage.qml" },
   { id: "audio",         label: "Audio",         page: "AudioPage.qml" },
-  { id: "speakers",      label: "Speakers",      page: "SpeakersPage.qml", placeholder: true },
+  { id: "speakers",      label: "Speakers",      page: "SpeakersPage.qml" },
   { id: "summary",       label: "Summary",       page: "SummaryPage.qml" },
   { id: "calendar",      label: "Calendar",      page: "CalendarPage.qml" },
   { id: "storage",       label: "Storage",       page: "StoragePage.qml" },
@@ -700,6 +700,27 @@ function liveEngineStatusLine(status) {
   if (status.fast) return "Fast engine: on" + (status.model ? " (" + status.model + ")" : "")
   if (!status.installed) return "Fast engine: not installed"
   return "Fast engine: installed, but voxtype isn't on a Parakeet model"
+}
+
+// ------------------------------------------------------------ speakers page
+// One line for `spitball diarize status --json`'s {installed, package,
+// models} -- the same wording the CLI prints without --json.
+function diarizeStatusLine(status) {
+  if (!status || typeof status !== "object") return ""
+  if (status.installed) return "Speaker split: installed" + (status.engine ? " (" + status.engine + ")" : "")
+  if (status.package) return "Speaker split: sherpa-onnx is installed, but the models are missing"
+  return "Speaker split: not installed"
+}
+
+// `speaker_max` as an integer in the range the backend clamps to (1-12);
+// anything unreadable is the default, 6.
+function speakerMax(value) {
+  var n = Number(value)
+  if (!isFinite(n)) return 6
+  n = Math.round(n)
+  if (n < 1) return 1
+  if (n > 12) return 12
+  return n
 }
 
 // ------------------------------------------------------------ about / status

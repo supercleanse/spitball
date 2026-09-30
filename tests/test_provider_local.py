@@ -765,3 +765,77 @@ class TestEnsureStreamingWindows(unittest.TestCase):
         once = self.path.read_text()
         local._ensure_streaming_windows(self.path)
         self.assertEqual(self.path.read_text(), once)
+
+
+class TestSpeakerSplitInTranscribe(unittest.TestCase):
+    """The far channel's diarized turns (spitball/diarize.py) cut voxtype's
+    windows at speaker changes; without the add-on nothing changes. The
+    diarizer itself is mocked; segmentation and clipping run through real
+    ffmpeg."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.audio = Path(self.tmp.name) / "stereo.wav"
+        if not (shutil.which("ffmpeg") and shutil.which("ffprobe")):
+            self.skipTest("ffmpeg/ffprobe not installed")
+        # 6 s of unbroken tone on each channel: exactly one speech window per channel.
+        os.system("ffmpeg -hide_banner -loglevel error "
+                  "-f lavfi -i \"sine=frequency=440:duration=6\" "
+                  "-f lavfi -i \"sine=frequency=880:duration=6\" "
+                  "-filter_complex \"[0:a][1:a]amerge=inputs=2[a]\" -map \"[a]\" -ac 2 "
+                  f"{self.audio}")
+
+    def _transcribe(self, cfg, hints=None):
+        def fake_run(cmd, **kw):
+            if cmd[0] == "voxtype":
+                return mock.Mock(stdout="Loading audio file: x\n\nsome words\n", returncode=0)
+            return _REAL_RUN(cmd, **kw)
+        with mock.patch("shutil.which", return_value="/usr/bin/voxtype"), \
+             mock.patch("spitball.providers.local.subprocess.run", side_effect=fake_run), \
+             mock.patch("spitball.providers.local.info", return_value={"model": "base.en", "engine": "parakeet"}):
+            return local.transcribe(self.audio, cfg, hints=hints)
+
+    def test_segments_cut_the_far_window_at_the_speaker_change(self):
+        segments = [(0.0, 3.0, 0), (3.0, 6.0, 1)]
+        record = {"ran": True, "engine": "sherpa-onnx", "expected": 2, "num_clusters": 2, "found": 2, "seconds": 0.5}
+        with mock.patch("spitball.providers.local.diarize.far_channel", return_value=(segments, record)) as fc:
+            result = self._transcribe({}, hints={"far_speakers": 2})
+        self.assertEqual(fc.call_args[0][2], 2)               # the invitee count reached the diarizer
+        self.assertTrue(str(fc.call_args[0][0]).endswith("channel-1.wav"))  # far channel only
+        far = sorted(((round(u["start"], 1), round(u["end"], 1), u["speaker"]) for u in result["utterances"]
+                      if u["channel"] == 1))
+        self.assertEqual(far, [(0.0, 3.0, 0), (3.0, 6.0, 1)])
+        mic = [u for u in result["utterances"] if u["channel"] == 0]
+        self.assertEqual(len(mic), 1)
+        self.assertEqual(mic[0]["speaker"], 0)
+        self.assertEqual(result["diarization"], record)
+
+    def test_without_the_add_on_everything_is_speaker_zero(self):
+        result = self._transcribe({}, hints={"far_speakers": 3})
+        self.assertEqual({u["speaker"] for u in result["utterances"]}, {0})
+        self.assertEqual(len([u for u in result["utterances"] if u["channel"] == 1]), 1)
+        self.assertFalse(result["diarization"]["ran"])
+        self.assertEqual(result["diarization"]["reason"], "not installed")
+        self.assertEqual(result["diarization"]["expected"], 3)
+
+    def test_one_remote_attendee_never_diarizes(self):
+        with mock.patch("spitball.providers.local.diarize.run", side_effect=AssertionError("must not run")), \
+             mock.patch("spitball.providers.local.diarize.installed", return_value=True):
+            result = self._transcribe({}, hints={"far_speakers": 1})
+        self.assertEqual(result["diarization"]["reason"], "one remote attendee expected")
+
+    def test_split_off_never_diarizes(self):
+        with mock.patch("spitball.providers.local.diarize.run", side_effect=AssertionError("must not run")), \
+             mock.patch("spitball.providers.local.diarize.installed", return_value=True):
+            result = self._transcribe({"speaker_split": False}, hints={"far_speakers": 4})
+        self.assertEqual(result["diarization"]["reason"], "off")
+
+    def test_worker_failure_falls_back_to_one_voice(self):
+        from spitball import diarize
+        with mock.patch("spitball.providers.local.diarize.installed", return_value=True), \
+             mock.patch("spitball.providers.local.diarize.run", side_effect=diarize.DiarizationError("boom")):
+            result = self._transcribe({}, hints={"far_speakers": 3})
+        self.assertEqual({u["speaker"] for u in result["utterances"]}, {0})
+        self.assertEqual(result["diarization"]["reason"], "failed: boom")
+        self.assertEqual(result["diarization"]["num_clusters"], 3)

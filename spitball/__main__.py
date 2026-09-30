@@ -38,6 +38,14 @@ USAGE = """usage: spitball <command>
   local set-model <name>    switch voxtype to that model in the background (progress in model.json)
   live setup                install the live transcript's fast engine (a small venv with onnx-asr)
   live status [--json]      whether the fast engine is installed and which model it would load
+  speakers <call-dir> [--json]
+                             list the far-side speakers of one call and who they resolved to
+  speakers <call-dir> <n> "Name" | --clear
+                             name speaker n by hand (or go back to automatic) and re-render
+                             transcript.md, summary.md, and the export copy
+  diarize setup             install the on-device speaker split (sherpa-onnx + two small
+                             models, into the live-engine venv)
+  diarize status [--json]   whether the speaker split is installed
   pick-folder [--title T]   native folder chooser; prints the chosen path
   daemon                    run the service (systemd does this)"""
 
@@ -271,6 +279,58 @@ def _live_cmd(rest: list) -> int:
     return 2
 
 
+def _diarize_cmd(rest: list) -> int:
+    sub = rest[0] if rest else ""
+    from . import diarize
+
+    if sub == "setup":
+        print("Installing the speaker split (sherpa-onnx into the live-engine venv, then two models)...")
+        ok, message = diarize.setup()
+        print(message, file=sys.stdout if ok else sys.stderr)
+        return 0 if ok else 1
+
+    if sub == "status":
+        status = diarize.status()
+        if "--json" in rest:
+            print(json.dumps(status))
+        elif status["installed"]:
+            print(f"Speaker split: installed ({status['engine']}, models in {status['model_dir']})")
+        elif status["package"]:
+            print("Speaker split: sherpa-onnx is installed but the models are missing (run `spitball diarize setup`)")
+        else:
+            print("Speaker split: not installed (run `spitball diarize setup`)")
+        return 0
+
+    print(USAGE)
+    return 2
+
+
+def _speakers_cmd(rest: list) -> int:
+    args = [a for a in rest if a not in ("--json", "--clear")]
+    if not args:
+        print(USAGE)
+        return 2
+    from . import process, speakers
+    call_dir = Path(args[0]).expanduser().resolve()
+    try:
+        if len(args) == 1 and "--clear" not in rest:
+            rows = process.list_speakers(call_dir)
+        else:
+            if len(args) < 2 or not args[1].isdigit() or (len(args) < 3 and "--clear" not in rest):
+                print(USAGE)
+                return 2
+            name = "" if "--clear" in rest else args[2]
+            rows = process.rename_speaker(call_dir, int(args[1]), name)
+    except (RuntimeError, ValueError, OSError) as e:
+        print(str(e), file=sys.stderr)
+        return 1
+    if "--json" in rest:
+        print(json.dumps(rows))
+    else:
+        print(speakers.format_listing(rows))
+    return 0
+
+
 def main(argv=None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     if not argv or argv[0] in ("-h", "--help", "help"):
@@ -307,6 +367,10 @@ def main(argv=None) -> int:
         return _local_cmd(rest)
     if cmd == "live":
         return _live_cmd(rest)
+    if cmd == "diarize":
+        return _diarize_cmd(rest)
+    if cmd == "speakers":
+        return _speakers_cmd(rest)
     if cmd == "pick-folder":
         title = _flag_value(rest, "--title") or "Choose a folder"
         from . import pickfolder

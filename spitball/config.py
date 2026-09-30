@@ -154,6 +154,25 @@ DEFAULTS = {
     # invites are skipped). Empty = detect it: the address on nearly every
     # invite in the feed is the owner's.
     "calendar_my_email": "",
+    # Speakers (spitball/speakers.py, spitball/diarize.py, docs/SPEC-v2.md
+    # §4). `speaker_names`: after transcription, when the call matched a
+    # calendar event with attendees, one short call to the summary endpoint
+    # maps "Speaker N" labels to invitee names from what people say
+    # ("thanks, Priya", "this is Alex"); an uncertain match reads "Speaker 2
+    # (probably Priya)". A 1:1 call names the far side without any model
+    # call. `spitball speakers <dir> <n> "Name"` corrects by hand.
+    "speaker_names": True,
+    # `speaker_split`: tell far-side voices apart on the local provider with
+    # sherpa-onnx (installed by `spitball diarize setup` into the live-engine
+    # venv; no effect until then). Runs on the far channel only, never when
+    # the invite says exactly one other person, and any failure quietly
+    # keeps today's single "Them". Deepgram splits speakers on its own.
+    "speaker_split": True,
+    # The most far-side voices a transcript will show, any provider: the
+    # calendar's invitee count is used when known (capped here); voices
+    # beyond it, and any voice with only a few words, fold into the voice
+    # speaking around them.
+    "speaker_max": 6,
 }
 
 # The secrets the settings panel/CLI ever handles. Never settable via

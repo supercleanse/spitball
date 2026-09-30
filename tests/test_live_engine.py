@@ -141,3 +141,21 @@ class TestSetup(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestInstallHelper(unittest.TestCase):
+    """install()/venv_steps(): shared with spitball/diarize.py, which puts
+    its add-on in this same venv."""
+
+    def test_install_returns_empty_on_success(self):
+        run = mock.Mock(return_value=mock.Mock(returncode=0, stdout="", stderr=""))
+        with mock.patch("spitball.live_engine.shutil.which", return_value="/usr/bin/uv"):
+            self.assertEqual(live_engine.install(("sherpa-onnx",), run=run), "")
+        cmds = [c.args[0] for c in run.call_args_list]
+        self.assertIn("sherpa-onnx", cmds[1])
+        self.assertNotIn("sentencepiece", cmds[1])
+
+    def test_install_reports_the_error(self):
+        run = mock.Mock(side_effect=OSError("no uv here"))
+        with mock.patch("spitball.live_engine.shutil.which", return_value="/usr/bin/uv"):
+            self.assertIn("no uv here", live_engine.install(("x",), run=run))

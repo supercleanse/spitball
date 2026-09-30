@@ -32,9 +32,30 @@ Four features, in order, per `docs/SPEC-v2.md`:
    design: Silero VAD (needs onnxruntime + a 2 MB model, i.e. the optional venv),
    GTCRN/DeepFilterNet (research option C), a Spitball-owned PipeWire filter
    (option D), denoising for the Deepgram upload.
-4. **Speakers** -- attendee-based naming plus an on-device far-channel split
-   in the live-engine venv, and `spitball speakers <dir>`; fills the Speakers
-   page.
+4. **Speakers** (done) -- `spitball/speakers.py`: far-side ids folded into
+   labels (tiny voices and voices beyond `speaker_max` fold into their
+   neighbors), a `speakers` map in `.transcript.json` (label → name, confidence,
+   source, evidence, provider id), a 1:1 named from the invite with no model
+   call, otherwise one naming call to the summary endpoint with the neutral
+   transcript and the invite list (strict JSON, names off the invite rejected,
+   duplicates made unsure), rendered as the name / `Speaker 2 (probably X)` /
+   the bare label; `**Speakers:**` and invite-vs-voices mismatch header lines;
+   `spitball speakers <dir> [n "Name" | --clear]` with a re-render (summary
+   wording rewritten, no new model call; `reprocess` keeps user names).
+   `spitball/diarize.py` + `diarize_worker.py`: sherpa-onnx offline diarization
+   of the far channel only (pyannote segmentation-3.0 int8 + 3D-Speaker ERes2Net,
+   from the k2-fsa GitHub releases, SHA-256 pinned, no Hugging Face token),
+   installed by `spitball diarize setup` into the live-engine venv; skipped for
+   a 1:1, `num_clusters` from the invite count capped at `speaker_max`, else
+   threshold clustering; voxtype windows cut at speaker changes before
+   transcription; a reused live transcript is labeled by overlap and its
+   straddling lines re-transcribed as pieces; any failure keeps one "Them" with
+   a `diarization` block saying why. Fills the Speakers page. Not done, by
+   design: pitch/gender inference (never), voiceprint memory across calls
+   (biometric; would need opt-in + a delete command), a rename UI in the popup
+   (the CLI is enough for now), a user-facing clustering-threshold knob
+   (constant 0.7), a speaker-count hint for Deepgram (its API takes none), live
+   (mid-call) speaker splitting in the popup.
 
 ## Phase 2: more transcription providers
 

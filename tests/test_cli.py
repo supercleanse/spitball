@@ -322,3 +322,95 @@ class TestReprocessCalendarFlags(CliTestCase):
         code, out, _ = self.run_main(["reprocess", "/tmp/x", "--event", "a", "--no-event"])
         self.assertEqual(code, 2)
         self.assertIn("usage:", out)
+
+
+class TestSpeakersAndDiarizeCommands(CliTestCase):
+    """`spitball speakers <dir> [n "Name" | --clear] [--json]` and `spitball
+    diarize setup|status`. The processing side is real (a cached transcript
+    and an existing summary in a temp call folder); no model, no worker."""
+
+    def _call_dir(self):
+        call_dir = self.tmp / "Calls" / "2026-09-28-1400-zoom-weekly"
+        call_dir.mkdir(parents=True)
+        (call_dir / "audio.opus").write_bytes(b"x")
+        (call_dir / ".meta.json").write_text(json.dumps(
+            {"app": "Zoom", "started_at": 1790000000.0, "duration": 90.0, "titled": True}))
+        (call_dir / ".transcript.json").write_text(json.dumps({"provider": "deepgram", "model": "nova-3", "utterances": [
+            {"channel": 1, "speaker": 2, "start": 0.0, "end": 8.0, "transcript": "first voice with a good many words in it here"},
+            {"channel": 1, "speaker": 5, "start": 9.0, "end": 17.0, "transcript": "second voice with a good many words in it too"},
+            {"channel": 0, "speaker": 0, "start": 18.0, "end": 19.0, "transcript": "ok"}]}))
+        (call_dir / "summary.md").write_text("# Weekly\n\n## Summary\n- Speaker 2 will wait.\n\n---\n\n**Date:** x\n")
+        return call_dir
+
+    def test_list_text_and_json(self):
+        call_dir = self._call_dir()
+        code, out, _ = self.run_main(["speakers", str(call_dir)])
+        self.assertEqual(code, 0)
+        self.assertIn("1  Speaker 1  (unnamed)", out)
+        self.assertIn("2  Speaker 2  (unnamed)", out)
+        code, out, _ = self.run_main(["speakers", str(call_dir), "--json"])
+        self.assertEqual(code, 0)
+        rows = json.loads(out)
+        self.assertEqual([r["label"] for r in rows], ["Speaker 1", "Speaker 2"])
+
+    def test_rename_then_clear(self):
+        call_dir = self._call_dir()
+        code, out, _ = self.run_main(["speakers", str(call_dir), "2", "Priya Nair"])
+        self.assertEqual(code, 0, out)
+        self.assertIn("2  Speaker 2  Priya Nair (user, high)", out)
+        self.assertIn("**[00:00:09] Priya Nair:**", (call_dir / "transcript.md").read_text())
+        self.assertIn("- Priya Nair will wait.", (call_dir / "summary.md").read_text())
+        cache = json.loads((call_dir / ".transcript.json").read_text())
+        self.assertEqual(cache["speakers"]["2"]["source"], "user")
+        code, out, _ = self.run_main(["speakers", str(call_dir), "2", "--clear"])
+        self.assertEqual(code, 0, out)
+        self.assertIn("2  Speaker 2  (unnamed)", out)
+        self.assertIn("**[00:00:09] Speaker 2:**", (call_dir / "transcript.md").read_text())
+
+    def test_errors(self):
+        call_dir = self._call_dir()
+        code, out, err = self.run_main(["speakers", str(call_dir), "7", "Nobody"])
+        self.assertEqual(code, 1)
+        self.assertIn("no far-side speaker 7", err)
+        code, out, err = self.run_main(["speakers", str(self.tmp / "nope")])
+        self.assertEqual(code, 1)
+        self.assertIn("no cached transcript", err)
+        code, out, _ = self.run_main(["speakers"])
+        self.assertEqual(code, 2)
+        code, out, _ = self.run_main(["speakers", str(call_dir), "2"])  # a number with no name and no --clear
+        self.assertEqual(code, 2)
+        code, out, _ = self.run_main(["speakers", str(call_dir), "two", "Name"])
+        self.assertEqual(code, 2)
+
+    def test_diarize_status_text_and_json(self):
+        code, out, _ = self.run_main(["diarize", "status"])
+        self.assertEqual(code, 0)
+        self.assertIn("Speaker split: not installed", out)
+        code, out, _ = self.run_main(["diarize", "status", "--json"])
+        self.assertEqual(code, 0)
+        data = json.loads(out)
+        self.assertFalse(data["installed"])
+        self.assertEqual(data["engine"], "sherpa-onnx")
+        with mock.patch("spitball.diarize.status", return_value={"installed": True, "package": True, "models": True,
+                                                                  "engine": "sherpa-onnx", "model_dir": "/m", "venv": "/v"}):
+            code, out, _ = self.run_main(["diarize", "status"])
+        self.assertIn("Speaker split: installed (sherpa-onnx, models in /m)", out)
+        with mock.patch("spitball.diarize.status", return_value={"installed": False, "package": True, "models": False,
+                                                                  "engine": "sherpa-onnx", "model_dir": "/m", "venv": "/v"}):
+            code, out, _ = self.run_main(["diarize", "status"])
+        self.assertIn("models are missing", out)
+
+    def test_diarize_setup_reports_result(self):
+        with mock.patch("spitball.diarize.setup", return_value=(True, "Speaker split installed")):
+            code, out, _ = self.run_main(["diarize", "setup"])
+        self.assertEqual(code, 0)
+        self.assertIn("Speaker split installed", out)
+        with mock.patch("spitball.diarize.setup", return_value=(False, "no wheel")):
+            code, _, err = self.run_main(["diarize", "setup"])
+        self.assertEqual(code, 1)
+        self.assertIn("no wheel", err)
+
+    def test_diarize_unknown_subcommand(self):
+        code, out, _ = self.run_main(["diarize", "frobnicate"])
+        self.assertEqual(code, 2)
+        self.assertIn("usage: spitball", out)
