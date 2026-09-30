@@ -1,0 +1,17 @@
+--- a/Model.js
++++ b/Model.js
+@@ -94,7 +94,13 @@
+ // Local is the default and leads the choice.
+ var TRANSCRIPTION_PROVIDERS = [
+   { value: "local", label: "Local" },
+-  { value: "deepgram", label: "Deepgram" }
++  { value: "deepgram", label: "Deepgram" },
++  // [PHASE 2] restore these three (plus assemblyai_model/soniox_model
++  // settings keys and their check-transcription branches) when phase 2
++  // starts -- see docs/ROADMAP.md.
++  { value: "assemblyai", label: "AssemblyAI" },
++  { value: "soniox", label: "Soniox" },
++  { value: "openai", label: "OpenAI Whisper" }
+ ]
+ 
+ function providerOptions() {

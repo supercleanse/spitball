@@ -1,0 +1,165 @@
+diff --git a/spitball/multipart.py b/spitball/multipart.py
+new file mode 100644
+index 0000000..3cff81e
+--- /dev/null
++++ b/spitball/multipart.py
+@@ -0,0 +1,31 @@
++"""Hand-rolled multipart/form-data encoding (stdlib only -- no `requests`,
++no third-party multipart helper). Used by the OpenAI-compatible transcription
++provider to upload an audio file plus form fields to `/audio/transcriptions`.
++"""
++from __future__ import annotations
++
++import binascii
++import os
++
++
++def encode(fields: dict, file_field: str, filename: str, data: bytes,
++           content_type: str = "application/octet-stream") -> tuple[str, bytes]:
++    """Builds a multipart/form-data body from a dict of plain string fields
++    plus one file part. Returns (content_type_header, body_bytes)."""
++    boundary = binascii.hexlify(os.urandom(16)).decode()
++    parts = []
++    for name, value in fields.items():
++        parts.append(
++            f"--{boundary}\r\n"
++            f'Content-Disposition: form-data; name="{name}"\r\n\r\n'
++            f"{value}\r\n".encode()
++        )
++    parts.append(
++        (f"--{boundary}\r\n"
++         f'Content-Disposition: form-data; name="{file_field}"; filename="{filename}"\r\n'
++         f"Content-Type: {content_type}\r\n\r\n").encode()
++        + data + b"\r\n"
++    )
++    parts.append(f"--{boundary}--\r\n".encode())
++    body = b"".join(parts)
++    return f"multipart/form-data; boundary={boundary}", body
+diff --git a/spitball/providers/openai.py b/spitball/providers/openai.py
+new file mode 100644
+index 0000000..cda32e3
+--- /dev/null
++++ b/spitball/providers/openai.py
+@@ -0,0 +1,122 @@
++"""OpenAI (and OpenAI-compatible) transcription provider: works against the
++real OpenAI API, or any server speaking the same `/audio/transcriptions`
++shape -- Groq, speaches/faster-whisper-server, LocalAI, a whisper.cpp
++server, etc. No multichannel support on that endpoint, so we split the
++stereo call into two mono files and transcribe each channel separately.
++"""
++from __future__ import annotations
++
++import json
++import tempfile
++import urllib.error
++import urllib.request
++from pathlib import Path
++
++from .. import audio as audio_mod
++from .. import config, multipart
++
++MAX_UPLOAD_BYTES = 25 * 1024 * 1024
++CHUNK_TARGET_BYTES = 24 * 1024 * 1024  # stay a hair under the 25 MB hard limit
++CHUNK_MAX_SECONDS = 1200.0             # 20 minutes
++
++
++def _post(base: str, model: str, key: str, ogg_bytes: bytes, filename: str) -> dict:
++    fields = {"model": model, "response_format": "verbose_json",
++              "timestamp_granularities[]": "segment", "language": "en"}
++    content_type, body = multipart.encode(fields, "file", filename, ogg_bytes, "audio/ogg")
++    headers = {"Content-Type": content_type}
++    if key:
++        headers["Authorization"] = "Bearer " + key
++    req = urllib.request.Request(f"{base}/audio/transcriptions", data=body,
++                                  headers=headers, method="POST")
++    try:
++        with urllib.request.urlopen(req, timeout=900) as resp:
++            return json.load(resp)
++    except urllib.error.HTTPError as e:
++        raise RuntimeError(f"OpenAI transcription error {e.code} at {base}: "
++                           f"{e.read()[:300].decode(errors='replace')}")
++    except urllib.error.URLError as e:
++        raise RuntimeError(f"OpenAI transcription unreachable at {base}: {e.reason}")
++
++
++def _utterances_from_reply(reply: dict, channel: int, offset: float, chunk_duration: float) -> list:
++    segments = reply.get("segments") or []
++    if segments:
++        return [
++            {"channel": channel, "speaker": 0, "start": offset + s["start"], "end": offset + s["end"],
++             "transcript": s.get("text", "").strip()}
++            for s in segments if s.get("text", "").strip()
++        ]
++    # Some models (e.g. gpt-4o-transcribe) only ever return "text", no
++    # per-segment timing -- fall back to one utterance spanning the chunk.
++    text = (reply.get("text") or "").strip()
++    if not text:
++        return []
++    return [{"channel": channel, "speaker": 0, "start": offset, "end": offset + chunk_duration,
++              "transcript": text}]
++
++
++def _transcribe_channel(wav: Path, channel: int, base: str, model: str, key: str, tmp: Path) -> list:
++    ogg = tmp / f"ch{channel}.ogg"
++    audio_mod.encode_opus(wav, ogg, bitrate="24k")
++    if ogg.stat().st_size <= CHUNK_TARGET_BYTES:
++        reply = _post(base, model, key, ogg.read_bytes(), ogg.name)
++        duration = audio_mod.ffprobe_duration(wav)
++        return _utterances_from_reply(reply, channel, 0.0, duration)
++
++    duration = audio_mod.ffprobe_duration(wav)
++    utterances = []
++    for i, (start, end) in enumerate(audio_mod.chunk_ranges(duration, CHUNK_MAX_SECONDS)):
++        clip_wav = tmp / f"ch{channel}-part{i}.wav"
++        audio_mod.extract_clip(wav, start, end, clip_wav)
++        clip_ogg = tmp / f"ch{channel}-part{i}.ogg"
++        audio_mod.encode_opus(clip_wav, clip_ogg, bitrate="24k")
++        reply = _post(base, model, key, clip_ogg.read_bytes(), clip_ogg.name)
++        utterances += _utterances_from_reply(reply, channel, start, end - start)
++    return utterances
++
++
++def transcribe(audio: Path, cfg: dict) -> dict:
++    base = cfg["openai_base_url"].rstrip("/")
++    model = cfg["openai_model"]
++    key = config.secret(cfg, "openai_api_key", env="OPENAI_API_KEY")
++    with tempfile.TemporaryDirectory() as tmp_str:
++        tmp = Path(tmp_str)
++        left, right = audio_mod.split_stereo_to_mono_wavs(audio, tmp)
++        utterances = (_transcribe_channel(left, 0, base, model, key, tmp) +
++                      _transcribe_channel(right, 1, base, model, key, tmp))
++    return {"provider": "openai", "model": model, "utterances": utterances}
++
++
++def ready(cfg: dict) -> str:
++    """Cheap, no-network readiness check. A key is only required against the
++    real OpenAI API -- a self-hosted/compatible server may not need one."""
++    import os
++    base = (cfg.get("openai_base_url") or "").lower()
++    is_official = "api.openai.com" in base
++    if not is_official:
++        return ""
++    if os.environ.get("OPENAI_API_KEY"):
++        return ""
++    if cfg.get("openai_api_key") or cfg.get("openai_api_key_command"):
++        return ""
++    return "Add an OpenAI key"
++
++
++def check(cfg: dict) -> dict:
++    """GET {base}/models. Tried even with no key against a non-OpenAI base,
++    since a self-hosted server may not require one."""
++    base = cfg["openai_base_url"].rstrip("/")
++    key = config.secret(cfg, "openai_api_key", env="OPENAI_API_KEY")
++    headers = {}
++    if key:
++        headers["Authorization"] = "Bearer " + key
++    req = urllib.request.Request(f"{base}/models", headers=headers)
++    try:
++        with urllib.request.urlopen(req, timeout=15) as resp:
++            json.load(resp)
++        return {"ok": True, "message": f"Reached {base}"}
++    except urllib.error.HTTPError as e:
++        return {"ok": False, "message": f"{base} error {e.code}: {e.read()[:200].decode(errors='replace')}"}
++    except urllib.error.URLError as e:
++        return {"ok": False, "message": f"{base} unreachable: {e.reason}"}

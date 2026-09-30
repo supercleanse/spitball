@@ -14,7 +14,7 @@ import time
 import traceback
 from pathlib import Path
 
-from . import config, detect, process
+from . import config, detect, live, process, providers
 from .recorder import Recording
 
 
@@ -35,6 +35,7 @@ class Daemon:
         self.rec: Recording | None = None
         self.rec_dir: Path | None = None
         self.rec_origin = ""          # "detected" or "manual"
+        self.live: live.LiveTranscriber | None = None  # one per recording; see spitball/live.py
         self.present: set = set()     # call apps holding the mic right now
         self.first_seen: dict = {}    # app -> time first seen this session
         self.last_seen: dict = {}     # app -> time last seen
@@ -43,8 +44,10 @@ class Daemon:
         self.error = ""
         self._shutting_down = False   # set once run()'s finally starts; blocks further publishes
         persist = self._load_persist()
-        self.auto_record = bool(persist.get("auto_record", False))
+        self._migrate_auto_record(persist)
+        self.auto_record = bool(self.cfg.get("auto_record", False))
         self.last_call = persist.get("last_call")
+        self.setup_needed = providers.setup_needed(self.cfg)
         self.rescan = threading.Event()
 
     # ---------------------------------------------------------------- state I/O
@@ -55,9 +58,23 @@ class Daemon:
         except (OSError, ValueError):
             return {}
 
+    def _migrate_auto_record(self, persist: dict) -> None:
+        """auto_record used to live only in ~/.local/state/spitball/persist.json;
+        it's now a config.json key like any other setting (so `spitball auto`
+        writes config, and the settings panel can edit it directly). One-time
+        migration: if config.json doesn't have the key yet but the old
+        persist.json does, copy it over once and reflect it in self.cfg
+        immediately (no reload needed this session)."""
+        raw = config.read_raw()
+        if "auto_record" not in raw and "auto_record" in persist:
+            raw["auto_record"] = bool(persist["auto_record"])
+            config.write_raw(raw)
+            self.cfg["auto_record"] = raw["auto_record"]
+
     def _save_persist(self):
-        config.atomic_write(config.PERSIST_FILE, json.dumps(
-            {"auto_record": self.auto_record, "last_call": self.last_call}, indent=1))
+        # auto_record moved to config.json (see _migrate_auto_record) -- this
+        # file now only carries last_call.
+        config.atomic_write(config.PERSIST_FILE, json.dumps({"last_call": self.last_call}, indent=1))
 
     def snapshot(self) -> dict:
         return {
@@ -67,6 +84,7 @@ class Daemon:
             "auto_record": self.auto_record,
             "message": self.message,
             "last_call": self.last_call,
+            "setup_needed": self.setup_needed,
             "updated_at": int(time.time()),
         }
 
@@ -115,6 +133,9 @@ class Daemon:
                 self._set("error", self.error)
                 notify("Spitball failed to start", self.error, "critical")
                 return {"ok": False, "error": self.error}
+            self.live = live.LiveTranscriber(self.rec_dir, self.rec_dir / "audio.opus",
+                                              self.rec.started_at, self.cfg)
+            self.live.start()
             self._set("recording", f"Recording {self.app or 'audio'}")
             return {"ok": True}
 
@@ -124,7 +145,16 @@ class Daemon:
                 return {"ok": True, "note": "not recording"}
             rec, call_dir, origin, app = self.rec, self.rec_dir, self.rec_origin, self.app
             self.rec = None
+            live_ref, self.live = self.live, None
             duration = rec.stop()
+            if live_ref:
+                # Finish AFTER the recorder itself has stopped (audio.opus is
+                # now complete, not still being written) and BEFORE any
+                # discard/process() below -- see LiveTranscriber.stop_and_finish's
+                # own docstring for why this ordering matters (one voxtype
+                # process at a time, and process() needs a finished
+                # .live.json to decide whether it can reuse it).
+                live_ref.stop_and_finish()
             if self.present:
                 self.dismissed |= self.present  # don't re-prompt for the call we just ended
             minimum = self.cfg["min_call_s"] if origin == "detected" else self.cfg["min_manual_s"]
@@ -232,13 +262,16 @@ class Daemon:
                 return {"ok": True}
             if cmd == "auto":
                 self.auto_record = {"on": True, "off": False}.get(arg, not self.auto_record)
-                self._save_persist()
+                config.set_key("auto_record", self.auto_record)  # config.json is the source of truth now
+                self.cfg["auto_record"] = self.auto_record
                 self.publish()
                 return {"ok": True, "auto_record": self.auto_record}
             if cmd == "status":
                 return {"ok": True, **self.snapshot(), "present": sorted(self.present)}
             if cmd == "reload":
                 self.cfg = config.load()
+                self.setup_needed = providers.setup_needed(self.cfg)
+                self.publish()
                 return {"ok": True}
         return {"ok": False, "error": f"unknown command {cmd!r}"}
 

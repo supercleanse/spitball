@@ -31,6 +31,13 @@ def make_cfg(tmp: Path, **overrides) -> dict:
     cfg["end_after_s"] = 1
     cfg["min_call_s"] = 2
     cfg["min_manual_s"] = 1
+    # Off by default: most daemon/process tests aren't exercising live
+    # transcription and mock Recording() so audio.opus never really exists --
+    # leaving this on would spin up a real (if harmless) background
+    # LiveTranscriber thread per recording. Tests that ARE about live
+    # transcription (tests/test_live_transcriber.py, and the daemon-wiring
+    # tests in tests/test_daemon.py) turn it on explicitly via `**overrides`.
+    cfg["live_transcript"] = False
     cfg.update(overrides)
     return cfg
 
@@ -73,9 +80,14 @@ def new_daemon(tmp: Path, **cfg_overrides):
     """Construct a Daemon() with runtime/state fully isolated under `tmp` and
     its cfg pointed at a temp calls_dir. Caller is expected to already be
     inside an `isolated_runtime(tmp)` block."""
+    from spitball import providers
     from spitball.daemon import Daemon
     d = Daemon()
     d.cfg = make_cfg(tmp, **cfg_overrides)
+    # Daemon.__init__ already computed setup_needed from the (isolated,
+    # pure-DEFAULTS) cfg it loaded before this override -- recompute it
+    # against the actual test cfg so it's not stale/misleading.
+    d.setup_needed = providers.setup_needed(d.cfg)
     return d
 
 

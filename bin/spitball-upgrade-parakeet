@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# Switches voxtype to a given model (and its engine, if that's different from
+# the one currently running), interactively, in a terminal the user is
+# watching. This is the FALLBACK path only -- `spitball local set-model
+# <name>` (spitball/providers/local.py:set_model()) normally does the whole
+# switch itself in a detached background worker with a graphical polkit
+# password prompt (see CONTRACT.md's model.json). It only reaches for this
+# script when `pkexec` is missing or Omarchy's own shell (and therefore its
+# embedded polkit agent) doesn't answer, i.e. there's no way to draw a
+# graphical prompt at all. Never invoked directly by Spitball's own process
+# either way.
+#
+# Spitball itself never runs sudo or edits voxtype's config; this script does
+# that instead, out loud, with a real terminal and a real sudo prompt if one's
+# needed.
+set -uo pipefail
+
+MODEL="${1:-}"
+ENGINE="${2:-}"
+
+if [[ -z "$MODEL" || -z "$ENGINE" ]]; then
+  echo "usage: spitball-upgrade-parakeet <model-name> <whisper|parakeet>" >&2
+  read -r -p "Press Enter to close..." _
+  exit 2
+fi
+
+echo "Spitball: switching voxtype to $ENGINE ($MODEL)"
+echo
+
+status="$(voxtype setup onnx --status 2>/dev/null || true)"
+active_line="$(printf '%s\n' "$status" | grep -i "Active engine:" || true)"
+
+if [[ "$ENGINE" == "parakeet" ]]; then
+  if printf '%s' "$active_line" | grep -qi whisper; then
+    echo "Enabling voxtype's ONNX engine (needs sudo)..."
+    if ! sudo voxtype setup onnx --enable; then
+      echo "Failed to enable the ONNX engine." >&2
+      read -r -p "Press Enter to close..." _
+      exit 1
+    fi
+  fi
+else
+  if printf '%s' "$active_line" | grep -qi onnx; then
+    echo "Switching voxtype back to its Whisper engine (needs sudo)..."
+    if ! sudo voxtype setup onnx --disable; then
+      echo "Failed to disable the ONNX engine." >&2
+      read -r -p "Press Enter to close..." _
+      exit 1
+    fi
+  fi
+fi
+
+echo
+echo "Downloading and activating $MODEL (this can take a while for a large model)..."
+if ! voxtype setup --download --model "$MODEL" --activate; then
+  echo "Download/activation failed." >&2
+  read -r -p "Press Enter to close..." _
+  exit 1
+fi
+
+if [[ "$ENGINE" == "parakeet" ]]; then
+  echo
+  echo "Setting voxtype's streaming mode for $MODEL..."
+  if ! /usr/bin/python3 -I "$(dirname "$(readlink -f "$0")")/spitball" local _apply-streaming "$MODEL"; then
+    echo "Failed to set voxtype's streaming mode." >&2
+    read -r -p "Press Enter to close..." _
+    exit 1
+  fi
+fi
+
+if systemctl --user is-active --quiet voxtype 2>/dev/null; then
+  echo
+  echo "Restarting the voxtype service..."
+  systemctl --user restart voxtype
+fi
+
+echo
+echo "Done. voxtype is now set to $ENGINE / $MODEL."
+read -r -p "Press Enter to close..." _

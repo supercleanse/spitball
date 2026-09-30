@@ -46,6 +46,10 @@ os.environ["SPITBALL_STATE_DIR"] = str(_SESSION_DIR / "state")
 # A config.json that can never exist, exactly like isolated_runtime()'s
 # per-test override: config.load() always returns pure DEFAULTS here.
 os.environ["SPITBALL_CONFIG"] = str(_SESSION_DIR / "no-such-config" / "config.json")
+# No live-engine venv here, so the live transcriber always takes the voxtype
+# path in tests unless a test hands it a fake engine itself -- never the real
+# ~/.local/share/spitball/live-engine model worker.
+os.environ["SPITBALL_ENGINE_DIR"] = str(_SESSION_DIR / "live-engine")
 
 _FAKE_BIN = _SESSION_DIR / "fake-bin"
 _FAKE_BIN.mkdir(parents=True, exist_ok=True)

@@ -89,14 +89,16 @@ test("elapsedLabel: never goes negative for a clock that hasn't caught up", () =
 
 test("tooltipFor: detected names the app", () => {
   assert.equal(Model.tooltipFor({ state: "detected", app: "Zoom" }),
-    "Call detected in Zoom: click to record");
+    "Call detected in Zoom: click for options");
   assert.equal(Model.tooltipFor({ state: "detected", app: "" }),
-    "Call detected in an app: click to record");
+    "Call detected in an app: click for options");
 });
 
-test("tooltipFor: recording names the app", () => {
-  assert.equal(Model.tooltipFor({ state: "recording", app: "Zoom" }), "Recording Zoom: click to stop");
-  assert.equal(Model.tooltipFor({ state: "recording", app: "" }), "Recording call: click to stop");
+test("tooltipFor: recording names the app and points at the menu, not stop", () => {
+  // Per docs/SPEC-live-transcript.md: clicking the red dot while recording
+  // must never stop it -- it opens the menu instead.
+  assert.equal(Model.tooltipFor({ state: "recording", app: "Zoom" }), "Recording Zoom: click for options");
+  assert.equal(Model.tooltipFor({ state: "recording", app: "" }), "Recording call: click for options");
 });
 
 test("tooltipFor: processing/error use message, with fallbacks", () => {
@@ -107,7 +109,7 @@ test("tooltipFor: processing/error use message, with fallbacks", () => {
 });
 
 test("tooltipFor: idle and offline/default", () => {
-  assert.equal(Model.tooltipFor({ state: "idle" }), "No call in progress: click to record");
+  assert.equal(Model.tooltipFor({ state: "idle" }), "No call in progress: click for options");
   assert.equal(Model.tooltipFor({ state: "offline" }), "Spitball: daemon not running");
   assert.equal(Model.tooltipFor({ state: "garbage" }), "Spitball: daemon not running");
 });
@@ -130,4 +132,434 @@ test("lastCallLabel: titled call includes a truncated title", () => {
   const label = Model.lastCallLabel({ title: "Weekly Sync With Morgan About The Roadmap" });
   assert.ok(label.startsWith("Open last summary: "));
   assert.ok(label.length <= "Open last summary: ".length + 34);
+});
+
+// ---------------------------------------------------------------- setup_needed
+
+test("emptyState/parseState carry setup_needed, defaulting to empty", () => {
+  assert.equal(Model.emptyState().setup_needed, "");
+  const s = Model.parseState(JSON.stringify({ state: "idle" }));
+  assert.equal(s.setup_needed, "");
+});
+
+test("parseState: non-string setup_needed is coerced to empty", () => {
+  const s = Model.parseState(JSON.stringify({ state: "idle", setup_needed: 42 }));
+  assert.equal(s.setup_needed, "");
+});
+
+test("parseState: setup_needed round-trips when idle", () => {
+  const s = Model.parseState(JSON.stringify({ state: "idle", setup_needed: "Add a Deepgram key" }));
+  assert.equal(s.setup_needed, "Add a Deepgram key");
+});
+
+test("needsSetup: true only when idle with a non-empty reason", () => {
+  assert.equal(Model.needsSetup({ state: "idle", setup_needed: "Add a Deepgram key" }), true);
+  assert.equal(Model.needsSetup({ state: "idle", setup_needed: "" }), false);
+  assert.equal(Model.needsSetup({ state: "offline", setup_needed: "Add a Deepgram key" }), false);
+  assert.equal(Model.needsSetup({ state: "recording", setup_needed: "Add a Deepgram key" }), false);
+});
+
+test("tooltipFor: needs-setup reason wins over the plain idle tooltip", () => {
+  assert.equal(
+    Model.tooltipFor({ state: "idle", setup_needed: "Download a local model" }),
+    "Download a local model"
+  );
+  assert.equal(
+    Model.tooltipFor({ state: "idle", setup_needed: "" }),
+    "No call in progress: click for options"
+  );
+});
+
+// ---------------------------------------------------------------- providers
+
+test("providerOptions: Local leads (the voxtype default), then Deepgram -- phase 1 is exactly these two", () => {
+  // opts (and anything .map() derives from it) is constructed in Model.js's
+  // own vm realm, so compare by JSON shape rather than assert.deepEqual's
+  // cross-realm prototype check (same reasoning as the last_call comparison
+  // above) -- JSON.stringify flattens both sides to a plain string first.
+  const opts = Model.providerOptions();
+  const values = [], labels = [];
+  for (let i = 0; i < opts.length; i++) { values.push(opts[i].value); labels.push(opts[i].label); }
+  assert.equal(JSON.stringify(values), JSON.stringify(["local", "deepgram"]));
+  assert.equal(JSON.stringify(labels), JSON.stringify(["Local", "Deepgram"]));
+});
+
+test("providerOptions: returns a fresh copy each call (caller can't mutate the source)", () => {
+  const a = Model.providerOptions();
+  a.push({ value: "x", label: "X" });
+  assert.equal(Model.providerOptions().length, 2);
+});
+
+test("providerLabel: known values map to their display label", () => {
+  assert.equal(Model.providerLabel("deepgram"), "Deepgram");
+  assert.equal(Model.providerLabel("local"), "Local");
+});
+
+test("providerLabel: unknown/missing values fall back to the raw string", () => {
+  assert.equal(Model.providerLabel("something-else"), "something-else");
+  assert.equal(Model.providerLabel(""), "");
+  assert.equal(Model.providerLabel(undefined), "");
+});
+
+// ---------------------------------------------------------------- key sources
+
+test("keySourcePlaceholder: config/env source reads as Set", () => {
+  assert.equal(Model.keySourcePlaceholder({ set: true, source: "config" }), "Set");
+  assert.equal(Model.keySourcePlaceholder({ set: true, source: "env" }), "Set");
+});
+
+test("keySourcePlaceholder: command source reads as From command", () => {
+  assert.equal(Model.keySourcePlaceholder({ set: true, source: "command" }), "From command");
+});
+
+test("keySourcePlaceholder: none/unset/missing reads as Not set", () => {
+  assert.equal(Model.keySourcePlaceholder({ set: false, source: "none" }), "Not set");
+  assert.equal(Model.keySourcePlaceholder(null), "Not set");
+  assert.equal(Model.keySourcePlaceholder(undefined), "Not set");
+  assert.equal(Model.keySourcePlaceholder({}), "Not set");
+});
+
+// ---------------------------------------------------------------- local (voxtype) info
+
+test("engineTitle: title-cases a known engine name", () => {
+  assert.equal(Model.engineTitle("whisper"), "Whisper");
+  assert.equal(Model.engineTitle("parakeet"), "Parakeet");
+});
+
+test("engineTitle: empty/missing input is blank", () => {
+  assert.equal(Model.engineTitle(""), "");
+  assert.equal(Model.engineTitle(undefined), "");
+  assert.equal(Model.engineTitle(null), "");
+});
+
+test("localInfoLine: installed shows engine + model", () => {
+  assert.equal(
+    Model.localInfoLine({ installed: true, engine: "whisper", model: "base.en" }),
+    "Using voxtype: Whisper base.en"
+  );
+});
+
+test("localInfoLine: not installed (or missing/malformed) reads blank -- the caller shows its own install prompt instead", () => {
+  assert.equal(Model.localInfoLine({ installed: false, engine: "whisper", model: "base.en" }), "");
+  assert.equal(Model.localInfoLine(null), "");
+  assert.equal(Model.localInfoLine(undefined), "");
+  assert.equal(Model.localInfoLine("not-an-object"), "");
+});
+
+test("localInfoLine: installed but missing engine/model degrades gracefully", () => {
+  assert.equal(Model.localInfoLine({ installed: true }), "Using voxtype");
+  assert.equal(Model.localInfoLine({ installed: true, model: "base.en" }), "Using voxtype: base.en");
+  assert.equal(Model.localInfoLine({ installed: true, engine: "whisper" }), "Using voxtype: Whisper");
+});
+
+// ---------------------------------------------------------------- local model picker
+
+test("localModelLabel: every optional segment present", () => {
+  assert.equal(
+    Model.localModelLabel({
+      name: "Parakeet v3 (int8)", languages: "25 European languages", size_mb: 640,
+      recommended: true, installed: true
+    }),
+    "Parakeet v3 (int8) — 25 European languages · 640 MB · Recommended · ✓ installed"
+  );
+});
+
+test("localModelLabel: no optional segments is just the name", () => {
+  assert.equal(Model.localModelLabel({ name: "Whisper base.en" }), "Whisper base.en");
+});
+
+test("localModelLabel: only the segments actually present appear", () => {
+  assert.equal(Model.localModelLabel({ name: "X", size_mb: 142 }), "X — 142 MB");
+  assert.equal(Model.localModelLabel({ name: "X", recommended: true }), "X — Recommended");
+});
+
+test("localModelLabel: no name at all is blank", () => {
+  assert.equal(Model.localModelLabel({}), "");
+  assert.equal(Model.localModelLabel(null), "");
+});
+
+test("localModelOptions: value/label pairs, skipping nameless entries", () => {
+  const models = [
+    { name: "Parakeet v3 (int8)", recommended: true },
+    { name: "" },
+    { name: "Whisper base.en" }
+  ];
+  const opts = Model.localModelOptions(models);
+  const values = [];
+  for (let i = 0; i < opts.length; i++) values.push(opts[i].value);
+  assert.equal(JSON.stringify(values), JSON.stringify(["Parakeet v3 (int8)", "Whisper base.en"]));
+  assert.equal(opts[0].label, "Parakeet v3 (int8) — Recommended");
+});
+
+test("localModelOptions: non-array input reads as empty", () => {
+  assert.equal(Model.localModelOptions(null).length, 0);
+  assert.equal(Model.localModelOptions(undefined).length, 0);
+});
+
+test("activeModelName: finds the active: true entry", () => {
+  const models = [{ name: "a" }, { name: "b", active: true }, { name: "c" }];
+  assert.equal(Model.activeModelName(models), "b");
+});
+
+test("activeModelName: none active, or malformed input, reads as empty", () => {
+  assert.equal(Model.activeModelName([{ name: "a" }, { name: "b" }]), "");
+  assert.equal(Model.activeModelName(null), "");
+  assert.equal(Model.activeModelName(undefined), "");
+});
+
+// ---------------------------------------------------------------- language
+
+test("languageOptions: English / Auto-detect / Other, in that order", () => {
+  const opts = Model.languageOptions();
+  const values = [], labels = [];
+  for (let i = 0; i < opts.length; i++) { values.push(opts[i].value); labels.push(opts[i].label); }
+  assert.equal(JSON.stringify(values), JSON.stringify(["en", "auto", "other"]));
+  assert.equal(JSON.stringify(labels), JSON.stringify(["English", "Auto-detect", "Other…"]));
+});
+
+test("languageChoiceFor: empty/missing/en all read as the English chip", () => {
+  assert.equal(Model.languageChoiceFor(""), "en");
+  assert.equal(Model.languageChoiceFor(undefined), "en");
+  assert.equal(Model.languageChoiceFor("en"), "en");
+});
+
+test("languageChoiceFor: auto reads as the Auto-detect chip", () => {
+  assert.equal(Model.languageChoiceFor("auto"), "auto");
+});
+
+test("languageChoiceFor: any other code reads as the Other chip", () => {
+  assert.equal(Model.languageChoiceFor("es"), "other");
+  assert.equal(Model.languageChoiceFor("fr"), "other");
+});
+
+// ---------------------------------------------------------------- model friendly names
+
+test("modelFriendlyName: known voxtype slugs map to a friendly name", () => {
+  assert.equal(Model.modelFriendlyName("parakeet-tdt-0.6b-v3-int8"), "Parakeet v3 (int8)");
+  assert.equal(Model.modelFriendlyName("base.en"), "Whisper Base (English)");
+});
+
+test("modelFriendlyName: accepts a model object with .name", () => {
+  assert.equal(Model.modelFriendlyName({ name: "parakeet-tdt-0.6b-v3" }), "Parakeet v3");
+});
+
+test("modelFriendlyName: unknown slug falls back to the raw string", () => {
+  assert.equal(Model.modelFriendlyName("some-future-model"), "some-future-model");
+  assert.equal(Model.modelFriendlyName(""), "");
+  assert.equal(Model.modelFriendlyName(null), "");
+});
+
+test("localModelLabel: uses the friendly name, not the raw slug", () => {
+  assert.equal(
+    Model.localModelLabel({ name: "parakeet-tdt-0.6b-v3-int8", recommended: true, installed: true }),
+    "Parakeet v3 (int8) — Recommended · ✓ installed"
+  );
+});
+
+test("findModel: finds by name, or null", () => {
+  const models = [{ name: "a" }, { name: "b" }];
+  assert.equal(Model.findModel(models, "b"), models[1]);
+  assert.equal(Model.findModel(models, "nope"), null);
+  assert.equal(Model.findModel(null, "a"), null);
+});
+
+test("switchConfirmText: known model with a size", () => {
+  const models = [{ name: "parakeet-tdt-0.6b-v3-int8", size_mb: 640 }];
+  assert.equal(
+    Model.switchConfirmText(models, "parakeet-tdt-0.6b-v3-int8"),
+    "Switch to Parakeet v3 (int8)? Downloads about 640 MB and asks for your password once. Also changes Omarchy dictation."
+  );
+});
+
+test("switchConfirmText: model not in the list still reads sensibly", () => {
+  assert.equal(
+    Model.switchConfirmText([], "base.en"),
+    "Switch to Whisper Base (English)? Asks for your password once. Also changes Omarchy dictation."
+  );
+});
+
+// ---------------------------------------------------------------- model switch (model.json)
+
+test("parseModelState: missing/unparseable/non-object all read as null", () => {
+  assert.equal(Model.parseModelState(""), null);
+  assert.equal(Model.parseModelState("not json"), null);
+  assert.equal(Model.parseModelState(undefined), null);
+  assert.equal(Model.parseModelState("42"), null);
+  assert.equal(Model.parseModelState("null"), null);
+});
+
+test("parseModelState: valid JSON object round-trips", () => {
+  const s = Model.parseModelState(JSON.stringify({ name: "base.en", state: "downloading" }));
+  assert.equal(s.name, "base.en");
+  assert.equal(s.state, "downloading");
+});
+
+test("modelSwitchActive: true only for the in-progress states", () => {
+  for (const state of ["switching-engine", "downloading", "activating", "restarting"]) {
+    assert.equal(Model.modelSwitchActive({ state }), true);
+  }
+  for (const state of ["done", "error", "terminal"]) {
+    assert.equal(Model.modelSwitchActive({ state }), false);
+  }
+  assert.equal(Model.modelSwitchActive(null), false);
+});
+
+test("modelSwitchFailed: true only for state error", () => {
+  assert.equal(Model.modelSwitchFailed({ state: "error" }), true);
+  assert.equal(Model.modelSwitchFailed({ state: "downloading" }), false);
+  assert.equal(Model.modelSwitchFailed(null), false);
+});
+
+test("modelSwitchPercent: computes from done/total, clamped 0-100", () => {
+  assert.equal(Model.modelSwitchPercent({ done_bytes: 50, total_bytes: 200 }), 25);
+  assert.equal(Model.modelSwitchPercent({ done_bytes: 200, total_bytes: 200 }), 100);
+  assert.equal(Model.modelSwitchPercent({ done_bytes: 0, total_bytes: 0 }), -1);
+  assert.equal(Model.modelSwitchPercent(null), -1);
+});
+
+test("modelSwitchStatusText: downloading includes the friendly name and percent", () => {
+  const text = Model.modelSwitchStatusText({
+    name: "parakeet-tdt-0.6b-v3-int8", state: "downloading", done_bytes: 84, total_bytes: 200
+  });
+  assert.equal(text, "Downloading Parakeet v3 (int8)… 42%");
+});
+
+test("modelSwitchStatusText: downloading with no byte count yet omits the percent", () => {
+  const text = Model.modelSwitchStatusText({ name: "base.en", state: "downloading", done_bytes: 0, total_bytes: 0 });
+  assert.equal(text, "Downloading Whisper Base (English)…");
+});
+
+test("modelSwitchStatusText: error surfaces the message", () => {
+  assert.equal(
+    Model.modelSwitchStatusText({ name: "base.en", state: "error", message: "Password prompt canceled" }),
+    "Model switch failed: Password prompt canceled"
+  );
+});
+
+test("modelSwitchStatusText: null reads as blank", () => {
+  assert.equal(Model.modelSwitchStatusText(null), "");
+});
+
+// ---------------------------------------------------------------- live transcript (live.json)
+
+test("emptyLiveState/parseLiveState: missing or unparseable text falls back to the empty shape", () => {
+  const empty = Model.emptyLiveState();
+  assert.equal(empty.call_id, "");
+  assert.equal(empty.started_at, 0);
+  assert.equal(empty.status, "");
+  assert.equal(empty.message, "");
+  assert.equal(empty.utterances.length, 0);
+  const emptyJson = JSON.stringify(empty);
+  assert.equal(JSON.stringify(Model.parseLiveState("")), emptyJson);
+  assert.equal(JSON.stringify(Model.parseLiveState("not json")), emptyJson);
+  assert.equal(JSON.stringify(Model.parseLiveState(undefined)), emptyJson);
+  assert.equal(JSON.stringify(Model.parseLiveState("null")), emptyJson);
+  assert.equal(JSON.stringify(Model.parseLiveState("42")), emptyJson);
+});
+
+test("parseLiveState: known statuses round-trip", () => {
+  for (const status of ["listening", "catching-up", "unavailable", "stopped"]) {
+    const s = Model.parseLiveState(JSON.stringify({ status, call_id: "c1" }));
+    assert.equal(s.status, status);
+    assert.equal(s.call_id, "c1");
+  }
+});
+
+test("parseLiveState: unknown status is blanked, not passed through", () => {
+  const s = Model.parseLiveState(JSON.stringify({ status: "not-a-real-status" }));
+  assert.equal(s.status, "");
+});
+
+test("parseLiveState: non-array utterances / non-string message are coerced", () => {
+  const s = Model.parseLiveState(JSON.stringify({ status: "listening", utterances: "nope", message: 5 }));
+  assert.equal(s.utterances.length, 0);
+  assert.equal(s.message, "");
+});
+
+test("parseLiveState: utterances array passes through", () => {
+  const utts = [{ channel: 0, start: 1, end: 2, transcript: "hi" }];
+  const s = Model.parseLiveState(JSON.stringify({ status: "listening", utterances: utts }));
+  assert.equal(JSON.stringify(s.utterances), JSON.stringify(utts));
+});
+
+test("liveStatusText: one line per status", () => {
+  assert.equal(Model.liveStatusText({ status: "listening" }), "Listening…");
+  assert.equal(Model.liveStatusText({ status: "catching-up" }), "Catching up…");
+  assert.equal(Model.liveStatusText({ status: "stopped" }), "Live transcript stopped.");
+});
+
+test("liveStatusText: unavailable surfaces the reason, falling back if blank", () => {
+  assert.equal(Model.liveStatusText({ status: "unavailable", message: "Live transcript needs voxtype" }),
+    "Live transcript needs voxtype");
+  assert.equal(Model.liveStatusText({ status: "unavailable", message: "" }), "Live transcript unavailable");
+});
+
+test("liveStatusText: null/unknown reads as blank", () => {
+  assert.equal(Model.liveStatusText(null), "");
+  assert.equal(Model.liveStatusText({ status: "" }), "");
+});
+
+test("liveBubbles: sorted by start regardless of input order", () => {
+  const bubbles = Model.liveBubbles([
+    { channel: 0, start: 5, end: 6, transcript: "second" },
+    { channel: 1, start: 1, end: 2, transcript: "first" },
+  ]);
+  assert.equal(bubbles[0].transcript, "first");
+  assert.equal(bubbles[1].transcript, "second");
+});
+
+test("liveBubbles: showLabel true on the first bubble and on every speaker change", () => {
+  const bubbles = Model.liveBubbles([
+    { channel: 1, speaker: 0, start: 0, end: 1, transcript: "hey" },
+    { channel: 1, speaker: 0, start: 1, end: 2, transcript: "there" },
+    { channel: 0, speaker: 0, start: 2, end: 3, transcript: "hi" },
+    { channel: 1, speaker: 0, start: 3, end: 4, transcript: "again" },
+  ]);
+  assert.equal(JSON.stringify(bubbles.map(b => b.showLabel)), JSON.stringify([true, false, true, true]));
+});
+
+test("liveBubbles: non-array/garbage entries are ignored, never throw", () => {
+  assert.equal(Model.liveBubbles(null).length, 0);
+  assert.equal(Model.liveBubbles(undefined).length, 0);
+  const bubbles = Model.liveBubbles([null, { channel: 0, start: 1, end: 2, transcript: "x" }, "garbage"]);
+  assert.equal(bubbles.length, 1);
+});
+
+test("liveBubbleSide: channel 0 is right (mine), anything else is left (them)", () => {
+  assert.equal(Model.liveBubbleSide(0), "right");
+  assert.equal(Model.liveBubbleSide(1), "left");
+});
+
+test("liveSpeakerLabel: channel 0 uses my_name (or a fallback), channel 1 is Them", () => {
+  assert.equal(Model.liveSpeakerLabel(0, "Morgan"), "Morgan");
+  assert.equal(Model.liveSpeakerLabel(0, ""), "Me");
+  assert.equal(Model.liveSpeakerLabel(1, "Morgan"), "Them");
+});
+
+test("liveTimestampLabel: m:ss, zero-padded, never negative", () => {
+  assert.equal(Model.liveTimestampLabel(0), "0:00");
+  assert.equal(Model.liveTimestampLabel(5), "0:05");
+  assert.equal(Model.liveTimestampLabel(65), "1:05");
+  assert.equal(Model.liveTimestampLabel(-3), "0:00");
+});
+
+test("liveShouldAutoScroll: true when already at (or within threshold of) the bottom", () => {
+  // contentHeight 500, viewport 200 tall -- bottom is at contentY == 300.
+  assert.equal(Model.liveShouldAutoScroll(300, 200, 500), true);
+  assert.equal(Model.liveShouldAutoScroll(290, 200, 500), true);  // within default 24px threshold
+  assert.equal(Model.liveShouldAutoScroll(200, 200, 500), false); // scrolled up 100px -- stay put
+});
+
+test("liveShouldAutoScroll: custom threshold is honored", () => {
+  assert.equal(Model.liveShouldAutoScroll(250, 200, 500, 60), true);
+  assert.equal(Model.liveShouldAutoScroll(250, 200, 500, 10), false);
+});
+
+test("liveBubbles: partial flag passes through, absent means final", () => {
+  const out = Model.liveBubbles([
+    { channel: 0, start: 1, transcript: "done" },
+    { channel: 0, start: 5, transcript: "still talk", partial: true },
+  ]);
+  assert.equal(out[0].partial, false);
+  assert.equal(out[1].partial, true);
 });

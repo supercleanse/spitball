@@ -15,7 +15,8 @@ from spitball.detect import OWN_APP_NAME
 from tests.testutil import (FakeClock, Gate, isolated_runtime, make_fake_recording,
                              new_daemon, track_threads)
 
-STATE_KEYS = {"state", "app", "started_at", "auto_record", "message", "last_call", "updated_at"}
+STATE_KEYS = {"state", "app", "started_at", "auto_record", "message", "last_call", "setup_needed",
+              "updated_at"}
 
 
 class DaemonTestCase(unittest.TestCase):
@@ -180,16 +181,22 @@ class TestDismiss(DaemonTestCase):
 
 class TestAutoRecordPersistence(DaemonTestCase):
     def test_auto_on_off_toggle_and_persisted(self):
+        # auto_record moved from persist.json into config.json (spec §2) --
+        # `spitball auto ...` now writes config, and a fresh daemon instance
+        # picks it up the same way it picks up any other config setting.
         d = new_daemon(self.tmp)
         self.assertFalse(d.auto_record)
         r = d.handle("auto", "on")
         self.assertTrue(r["auto_record"])
         self.assertTrue(d.auto_record)
+        self.assertTrue(d.cfg["auto_record"])  # reflected in-memory immediately, no reload needed
 
-        persisted = json.loads(self.config.PERSIST_FILE.read_text())
-        self.assertTrue(persisted["auto_record"])
+        raw = json.loads(self.config.CONFIG_FILE.read_text())
+        self.assertTrue(raw["auto_record"])
+        self.assertFalse((self.config.PERSIST_FILE.exists() and
+                           "auto_record" in json.loads(self.config.PERSIST_FILE.read_text())))
 
-        d2 = new_daemon(self.tmp)  # fresh instance re-reads persist.json
+        d2 = new_daemon(self.tmp)  # fresh instance re-reads config.json
         self.assertTrue(d2.auto_record)
 
         d2.handle("auto", "off")
@@ -198,6 +205,28 @@ class TestAutoRecordPersistence(DaemonTestCase):
         self.assertTrue(d2.auto_record)
         d2.handle("auto", "toggle")
         self.assertFalse(d2.auto_record)
+
+    def test_auto_record_migrates_once_from_old_persist_json(self):
+        # Simulates an existing install: persist.json already has
+        # auto_record=True from before this feature, config.json doesn't
+        # have the key yet. The very next daemon start should migrate it
+        # into config.json once and behave as if it had always been there.
+        from spitball import config
+        self.config.STATE_DIR.mkdir(parents=True, exist_ok=True)
+        self.config.PERSIST_FILE.write_text(json.dumps({"auto_record": True}))
+        self.assertFalse(self.config.CONFIG_FILE.exists())
+
+        d = new_daemon(self.tmp)
+        self.assertTrue(d.auto_record)
+        raw = json.loads(self.config.CONFIG_FILE.read_text())
+        self.assertTrue(raw["auto_record"])
+
+        # A second start (config.json already has the key) doesn't touch it
+        # again even if persist.json still says something different --
+        # config.json is the source of truth from here on.
+        self.config.PERSIST_FILE.write_text(json.dumps({"auto_record": False}))
+        d2 = new_daemon(self.tmp)
+        self.assertTrue(d2.auto_record)
 
     def test_last_call_persisted_across_instances(self):
         d = new_daemon(self.tmp)
@@ -266,6 +295,76 @@ class TestFfmpegStartFailure(DaemonTestCase):
         # critical notification fired
         urgencies = [c.args[2] if len(c.args) > 2 else c.kwargs.get("urgency") for c in self.notify.call_args_list]
         self.assertIn("critical", urgencies)
+
+
+class TestLiveTranscriberWiring(DaemonTestCase):
+    """Daemon.start()/stop() wiring around spitball/live.py -- the
+    LiveTranscriber class itself (segmentation, publishing, etc.) is tested
+    on its own in tests/test_live_transcriber.py; this is purely "does the
+    daemon create/start/finish exactly one, at the right times". The class
+    is mocked throughout (like Recording elsewhere in this file) so no real
+    thread or voxtype/ffmpeg call is ever involved here."""
+
+    def test_start_creates_and_starts_one_live_transcriber(self):
+        d = new_daemon(self.tmp, live_transcript=True)
+        rec = make_fake_recording(alive=True, started_at=1790000000.0)
+        live_instance = mock.Mock()
+        with mock.patch("spitball.daemon.Recording", return_value=rec), \
+             mock.patch("spitball.daemon.live.LiveTranscriber", return_value=live_instance) as live_cls:
+            d.handle("start")
+        live_cls.assert_called_once_with(d.rec_dir, d.rec_dir / "audio.opus", 1790000000.0, d.cfg)
+        live_instance.start.assert_called_once()
+        self.assertIs(d.live, live_instance)
+
+    def test_stop_finishes_the_live_transcriber_and_clears_it(self):
+        d = new_daemon(self.tmp, live_transcript=True, min_manual_s=1)
+        rec = make_fake_recording(alive=True, stop_duration=999)
+        live_instance = mock.Mock()
+        with mock.patch("spitball.daemon.Recording", return_value=rec), \
+             mock.patch("spitball.daemon.live.LiveTranscriber", return_value=live_instance):
+            d.handle("start")
+        with track_threads() as threads, \
+             mock.patch("spitball.process.process",
+                        return_value={"dir": str(d.rec_dir), "title": "T",
+                                       "summary": str(d.rec_dir / "summary.md"), "ended_at": 1}):
+            d.handle("stop")
+            for t in threads:
+                t.join(timeout=5)
+        live_instance.stop_and_finish.assert_called_once()
+        self.assertIsNone(d.live)
+
+    def test_stop_and_finish_runs_before_discard_for_a_too_short_recording(self):
+        # A too-short recording is discarded -- the live thread must still be
+        # told to finish (and stop existing) first, or its background writes
+        # could land in a folder that's about to be rmtree'd.
+        d = new_daemon(self.tmp, live_transcript=True)  # default min_manual_s/min_call_s are short in make_cfg
+        rec = make_fake_recording(alive=True, stop_duration=0.1)
+        live_instance = mock.Mock()
+        with mock.patch("spitball.daemon.Recording", return_value=rec), \
+             mock.patch("spitball.daemon.live.LiveTranscriber", return_value=live_instance):
+            d.handle("start")
+        d.handle("stop")
+        live_instance.stop_and_finish.assert_called_once()
+        self.assertIsNone(d.live)
+
+    def test_never_two_live_transcribers_while_already_recording(self):
+        d = new_daemon(self.tmp, live_transcript=True)
+        rec = make_fake_recording(alive=True)
+        with mock.patch("spitball.daemon.Recording", return_value=rec), \
+             mock.patch("spitball.daemon.live.LiveTranscriber") as live_cls:
+            d.handle("start")
+            r = d.handle("start")  # already recording -- must not spin up a second one
+        self.assertEqual(r.get("note"), "already recording")
+        live_cls.assert_called_once()
+
+    def test_ffmpeg_start_failure_never_creates_a_live_transcriber(self):
+        d = new_daemon(self.tmp, live_transcript=True)
+        rec = make_fake_recording(alive=False)
+        with mock.patch("spitball.daemon.Recording", return_value=rec), \
+             mock.patch("spitball.daemon.live.LiveTranscriber") as live_cls:
+            d.handle("start")
+        live_cls.assert_not_called()
+        self.assertIsNone(d.live)
 
 
 class TestProcessingSuccessFailure(DaemonTestCase):

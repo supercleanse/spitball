@@ -16,10 +16,13 @@ import urllib.request
 from datetime import datetime
 from pathlib import Path
 
-from . import config
+from . import config, providers
+from .providers.deepgram import DEEPGRAM_URL  # re-exported: some callers/tests reference it here
 
-DEEPGRAM_URL = "https://api.deepgram.com/v1/listen"
 MAX_TRANSCRIPT_CHARS = 180_000  # about 3 hours of talk
+
+LIVE_TRANSCRIPT_FILENAME = ".live.json"
+LIVE_TRANSCRIPT_MAX_FAILED_FRACTION = 0.1  # more than this much of the call's spoken time failed -> re-transcribe
 
 
 def _hms(seconds: float) -> str:
@@ -35,27 +38,11 @@ def _slug(text: str, limit: int = 60) -> str:
 # ------------------------------------------------------------------ transcription
 
 def transcribe(audio: Path, cfg: dict) -> dict:
-    key = config.secret(cfg, "deepgram_api_key", env="DEEPGRAM_API_KEY")
-    if not key:
-        raise RuntimeError("No Deepgram API key: set DEEPGRAM_API_KEY, or deepgram_api_key "
-                           f"or deepgram_api_key_command in {config.CONFIG_FILE}")
-    params = {
-        "model": cfg["deepgram_model"], "language": "en", "multichannel": "true",
-        "diarize": "true", "smart_format": "true", "punctuate": "true",
-        "utterances": "true", "mip_opt_out": "true",
-    }
-    url = DEEPGRAM_URL + "?" + "&".join(f"{k}={v}" for k, v in params.items())
-    req = urllib.request.Request(url, data=audio.read_bytes(), method="POST", headers={
-        "Authorization": "Token " + key,
-        "Content-Type": "audio/ogg",
-    })
-    try:
-        with urllib.request.urlopen(req, timeout=900) as resp:
-            return json.load(resp)
-    except urllib.error.HTTPError as e:
-        raise RuntimeError(f"Deepgram error {e.code}: {e.read()[:300].decode(errors='replace')}")
-    except urllib.error.URLError as e:
-        raise RuntimeError(f"Deepgram unreachable: {e.reason}")
+    """Dispatches to the configured transcription_provider (deepgram/openai/
+    local) and returns the shared normalized shape -- see spitball/providers/
+    __init__.py. A module-level name (not `providers.transcribe` called
+    inline) so tests can `mock.patch("spitball.process.transcribe", ...)`."""
+    return providers.transcribe(audio, cfg)
 
 
 def _drop_echo(utts: list) -> list:
@@ -80,9 +67,11 @@ def _drop_echo(utts: list) -> list:
     return kept
 
 
-def build_transcript(dg: dict, cfg: dict) -> list:
-    """[(start_seconds, speaker_label, text)] with consecutive lines merged."""
-    utts = sorted(dg.get("results", {}).get("utterances", []), key=lambda u: u["start"])
+def build_transcript(normalized: dict, cfg: dict) -> list:
+    """[(start_seconds, speaker_label, text)] with consecutive lines merged.
+    `normalized` is the shared provider shape: {"utterances": [...]}
+    (see spitball/providers/__init__.py's module docstring)."""
+    utts = sorted(normalized.get("utterances", []), key=lambda u: u["start"])
     utts = _drop_echo([u for u in utts if u.get("transcript", "").strip()])
     far_speakers = sorted({u.get("speaker", 0) for u in utts if u["channel"] == 1})
     label = {}
@@ -103,7 +92,9 @@ def build_transcript(dg: dict, cfg: dict) -> list:
 # ------------------------------------------------------------------ summary
 
 SUMMARY_SYSTEM = """You write meeting notes from a call transcript for {me}.
-Plain, direct American English. No filler, no hype, no preamble.
+Plain, direct American English. No filler, no hype, no preamble. Write the
+summary in English unless the transcript itself is in another language, in
+which case write the summary in that language instead.
 
 Return markdown in exactly this shape:
 
@@ -172,11 +163,86 @@ def summarize(transcript_text: str, meta: str, cfg: dict | None = None) -> str:
     return text
 
 
+def check_summary(cfg: dict | None = None) -> dict:
+    """`spitball check summary --json`: {"ok", "message", "models": [...]}
+    from {summary_base_url}/models -- a real network call, for the Settings
+    panel's Test button (and to fill its model dropdown)."""
+    cfg = cfg or config.load()
+    base = cfg["summary_base_url"].rstrip("/")
+    key = config.secret(cfg, "summary_api_key")
+    try:
+        reply = _post_json(f"{base}/models", None, key, 10)
+        models = [m["id"] for m in reply.get("data", []) if m.get("id")]
+        return {"ok": True, "message": f"Reached {base}", "models": models}
+    except urllib.error.HTTPError as e:
+        return {"ok": False, "message": f"{base} error {e.code}: {e.read()[:200].decode(errors='replace')}",
+                "models": []}
+    except (urllib.error.URLError, TimeoutError) as e:
+        return {"ok": False, "message": f"{base} unreachable ({getattr(e, 'reason', e)})", "models": []}
+    except (KeyError, ValueError) as e:
+        return {"ok": False, "message": f"{base} returned an unexpected reply ({e})", "models": []}
+
+
 # ------------------------------------------------------------------ pipeline
 
-def process(call_dir: Path, meta: dict, cfg: dict | None = None, notify=None) -> dict:
+def _load_cached_transcript(call_dir: Path, cfg: dict) -> dict | None:
+    """The current cache is `.transcript.json` (the normalized shape, any
+    provider). Folders made before this feature only have `.deepgram.json`
+    (Deepgram's raw shape) -- read and normalize it on the fly so old call
+    folders keep reprocessing without a re-transcribe."""
+    tpath = call_dir / ".transcript.json"
+    if tpath.exists():
+        return json.loads(tpath.read_text())
+    dg_path = call_dir / ".deepgram.json"
+    if dg_path.exists():
+        from .providers import deepgram
+        normalized = deepgram.normalize(json.loads(dg_path.read_text()), cfg)
+        tpath.write_text(json.dumps(normalized))  # migrate once; future reprocesses skip the old file
+        return normalized
+    return None
+
+
+def _load_live_transcript(call_dir: Path, cfg: dict) -> dict | None:
+    """`.live.json`, written by the live transcriber thread (spitball/live.py)
+    when a recording stops -- reused as the transcript instead of
+    transcribing the whole file again (spec: docs/SPEC-live-transcript.md).
+
+    Only for the local provider: the live thread always transcribes with
+    `local` regardless of `transcription_provider` (never deepgram, so it
+    never costs money or sends audio anywhere mid-call), so reusing it under
+    `deepgram` would silently downgrade a call the user asked to have
+    transcribed in the cloud -- deepgram always does its own full
+    transcription, same as before this feature existed.
+
+    Falls back to None (a normal full transcription) when the file is
+    missing/unparsable, has no utterances at all, or when failed segments
+    cover more than LIVE_TRANSCRIPT_MAX_FAILED_FRACTION of the call's total
+    spoken time -- a badly-degraded live pass (voxtype fell over repeatedly)
+    isn't worth keeping over a clean, complete transcription."""
+    if cfg.get("transcription_provider", "local") != "local":
+        return None
+    try:
+        data = json.loads((call_dir / LIVE_TRANSCRIPT_FILENAME).read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    utts = data.get("utterances")
+    if not isinstance(utts, list) or not utts:
+        return None
+    total = sum(max(0.0, u.get("end", 0) - u.get("start", 0)) for u in utts)
+    failed = sum(max(0.0, u.get("end", 0) - u.get("start", 0)) for u in utts if u.get("failed"))
+    if total <= 0 or failed > LIVE_TRANSCRIPT_MAX_FAILED_FRACTION * total:
+        return None
+    return data
+
+
+def process(call_dir: Path, meta: dict, cfg: dict | None = None, notify=None,
+            retranscribe: bool = False) -> dict:
     """Transcribe + summarize one call folder. Returns {dir, title, summary}.
-    `meta` holds app/started_at/duration (also saved as meta.json for reprocessing)."""
+    `meta` holds app/started_at/duration (also saved as meta.json for reprocessing).
+    `retranscribe=True` (spitball reprocess --retranscribe) ignores any cached
+    transcript and calls the provider again."""
     cfg = cfg or config.load()
     audio = call_dir / "audio.opus"
     meta_path = call_dir / ".meta.json"
@@ -190,15 +256,25 @@ def process(call_dir: Path, meta: dict, cfg: dict | None = None, notify=None) ->
               f"**App:** {meta.get('app') or 'Manual'}  \n"
               f"**Length:** {_hms(meta['duration'])}")
 
-    dg_path = call_dir / ".deepgram.json"
-    if dg_path.exists():
-        dg = json.loads(dg_path.read_text())
+    cached = None if retranscribe else _load_cached_transcript(call_dir, cfg)
+    if cached is not None:
+        normalized = cached
     else:
-        if notify:
-            notify("Transcribing…")
-        dg = transcribe(audio, cfg)
-        dg_path.write_text(json.dumps(dg))
-    lines = build_transcript(dg, cfg)
+        # `reprocess --retranscribe` ignores .live.json too, same as it
+        # ignores .transcript.json/.deepgram.json above.
+        normalized = None if retranscribe else _load_live_transcript(call_dir, cfg)
+        if normalized is None:
+            if notify:
+                notify("Transcribing…")
+            normalized = transcribe(audio, cfg)
+        (call_dir / ".transcript.json").write_text(json.dumps(normalized))
+    if normalized.get("note"):  # e.g. the local provider's Whisper-while-Parakeet-downloads fallback
+        header += f"  \n**Note:** {normalized['note']}"
+    failed = sum(1 for u in normalized.get("utterances", []) if u.get("failed"))
+    if failed:
+        header += (f"  \n**Note:** {failed} part{'s' if failed != 1 else ''} of the audio couldn't be "
+                   "transcribed and are marked in the text.")
+    lines = build_transcript(normalized, cfg)
     transcript = "\n\n".join(f"**[{_hms(s)}] {w}:** {t}" for s, w, t in lines) or "_No speech detected._"
 
     if notify:

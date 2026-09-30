@@ -58,11 +58,28 @@ DEFAULTS = {
     # markdown file into this folder, e.g. a notes vault. Empty = off.
     "export_dir": "",
     "my_name": _first_name(),
+    # Start recording automatically the moment a call is detected. Used to live
+    # in ~/.local/state/spitball/persist.json; migrated into config.json once
+    # (see daemon.Daemon._migrate_auto_record) so the settings panel can edit it
+    # like any other setting.
+    "auto_record": False,
+    # Spoken language: "en" (default), "auto" (let the provider detect it --
+    # deepgram uses its own language-detection mode; local just follows
+    # whatever voxtype's active model supports), or an ISO code.
+    "language": "en",
+    # Which transcription provider to use: "local" (default, on-device via
+    # voxtype -- audio never leaves the machine) or "deepgram". See
+    # spitball/providers/. (OpenAI-compatible/AssemblyAI/Soniox are phase 2 --
+    # see docs/ROADMAP.md.) Spitball never manages voxtype's own model/engine
+    # choice -- "local" just runs whatever the user already has voxtype
+    # configured with.
+    "transcription_provider": "local",
     # Deepgram key: first match wins among the DEEPGRAM_API_KEY env var,
     # "deepgram_api_key", and "deepgram_api_key_command" (run it, use stdout; handy
     # for password managers, e.g. "op read op://Private/Deepgram/credential").
     "deepgram_api_key": "",
     "deepgram_api_key_command": "",
+    "deepgram_model": "nova-3",
     # Summaries: any OpenAI-compatible chat endpoint. The default is a local Ollama.
     # If it can't be reached you still get audio + transcript, and
     # `spitball reprocess <dir>` fills in the summary later.
@@ -72,6 +89,20 @@ DEFAULTS = {
     "summary_api_key_command": "",
     "summary_enabled": True,
     "call_apps": DEFAULT_CALL_APPS,
+    # Live transcript while recording (spitball/live.py): near-real-time,
+    # local-provider-only (never deepgram, regardless of
+    # transcription_provider -- it never costs money or sends audio
+    # anywhere), shown in the bar's Live popup. Runs only while voxtype is
+    # actually available; see providers.local.ready().
+    "live_transcript": True,
+    # A still-open (no pause yet) live segment is cut here regardless, so one
+    # long uninterrupted stretch of talk doesn't grow forever before the
+    # first line appears.
+    "live_max_window_s": 12,
+    # Use the persistent live engine (spitball/live_engine.py) when it's set
+    # up -- a kept-loaded Parakeet model instead of a fresh `voxtype
+    # transcribe` per segment. false forces the voxtype path.
+    "live_engine": True,
     # A mic stream must exist this long before we call it a detected call.
     "detect_after_s": 2,
     # The app must let go of the mic this long before we call the call over.
@@ -79,8 +110,19 @@ DEFAULTS = {
     # Throw away recordings shorter than this (auto-detected / manual starts).
     "min_call_s": 60,
     "min_manual_s": 10,
-    "deepgram_model": "nova-3",
     "opus_bitrate": "32k",
+}
+
+# The secrets the settings panel/CLI ever handles. Never settable via
+# `config set` (that would put them on argv/in shell history) -- only via
+# `config set-secret`, which reads the value from stdin. (Grows again in
+# phase 2 as more transcription providers add their own key.)
+SECRET_KEYS = ("deepgram_api_key", "summary_api_key")
+
+# Secret key -> the environment variable that overrides it (empty = none).
+SECRET_ENV = {
+    "deepgram_api_key": "DEEPGRAM_API_KEY",
+    "summary_api_key": "",
 }
 
 
@@ -105,6 +147,58 @@ def secret(cfg: dict, key: str, env: str = "") -> str:
         if r.returncode == 0 and r.stdout.strip():
             return r.stdout.strip()
     return ""
+
+
+def secret_status(cfg: dict, key: str) -> dict:
+    """{"set": bool, "source": "env"|"config"|"command"|"none"} for one of the
+    SECRET_KEYS -- never resolves the value itself (no subprocess, no
+    reading the actual secret), so `config get --json` stays instant and
+    can't leak anything. This is what `config get --json` masks each
+    *_api_key down to."""
+    env = SECRET_ENV.get(key, "")
+    if env and os.environ.get(env):
+        return {"set": True, "source": "env"}
+    if cfg.get(key):
+        return {"set": True, "source": "config"}
+    if cfg.get(f"{key}_command"):
+        return {"set": True, "source": "command"}
+    return {"set": False, "source": "none"}
+
+
+def read_raw() -> dict:
+    """The user's config.json exactly as written -- no DEFAULTS merged in.
+    Used by the config-editing CLI commands (set/unset/set-secret) so a write
+    only ever touches the one key it means to, preserving every other key
+    already in the file (including ones this version of Spitball doesn't
+    know about)."""
+    try:
+        data = json.loads(CONFIG_FILE.read_text())
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def write_raw(data: dict) -> None:
+    """Writes the raw config dict back atomically, mode 600 -- once a config
+    file holds any key at all it may hold a secret, so every write from here
+    on keeps it private rather than trying to track exactly which key made it
+    sensitive."""
+    atomic_write(CONFIG_FILE, json.dumps(data, indent=1) + "\n", mode=0o600)
+
+
+def set_key(key: str, value) -> None:
+    """Reads the raw file, sets one key, writes it back -- preserving every
+    other key. Used both by `config set`/`set-secret` and by the daemon's
+    one-time auto_record migration."""
+    raw = read_raw()
+    raw[key] = value
+    write_raw(raw)
+
+
+def unset_key(key: str) -> None:
+    raw = read_raw()
+    raw.pop(key, None)
+    write_raw(raw)
 
 
 def atomic_write(path: Path, text: str, mode: int = 0o644) -> None:

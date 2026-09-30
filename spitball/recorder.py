@@ -36,6 +36,17 @@ class Recording:
                *pulse_in, "-i", monitor,
                "-filter_complex", "[0:a][1:a]amerge=inputs=2[a]", "-map", "[a]",
                "-c:a", "libopus", "-b:a", bitrate, "-application", "voip",
+               # Forces the Ogg muxer to flush each packet to disk immediately
+               # instead of buffering -- without this, the file stays at 0
+               # bytes for long stretches (confirmed empirically) and the
+               # live transcriber (spitball/live.py) would have nothing
+               # readable to decode until the recording stopped.
+               "-flush_packets", "1",
+               # Ogg pages of 0.2s instead of the default 1s: audio is only
+               # decodable once its page is on disk, so the default kept the
+               # live transcript ~0.4s (up to 0.9s) behind real time; 0.2s
+               # pages measured ~0.0s (max 0.12s).
+               "-page_duration", "200000",
                str(path)]
         path.parent.mkdir(parents=True, exist_ok=True)
         self.log = open(path.with_name("ffmpeg.log"), "w")

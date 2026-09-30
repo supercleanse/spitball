@@ -4,7 +4,8 @@ An [Omarchy](https://omarchy.org) bar plugin that records your calls, transcribe
 both sides, and writes a summary — without you starting anything.
 
 Spitball watches the microphone. When a call app opens it, an amber record button
-appears in the bar. Click it (or turn on auto-record) and Spitball captures the call,
+appears in the bar. Click it and choose **Start recording** (or turn on auto-record) and
+Spitball captures the call,
 stops on its own when the call ends, and leaves you a transcript and a summary in
 `~/Calls/`.
 
@@ -24,24 +25,64 @@ stops on its own when the call ends, and leaves you a transcript and a summary i
 
 3. **Records stereo Opus.** Left channel is your default microphone; right channel is
    whatever's playing through your default speakers or headphones. Keeping the two
-   sides on separate channels is what lets Deepgram tell your voice from everyone
-   else's without guessing.
+   sides on separate channels is what lets the transcriber tell your voice from
+   everyone else's without guessing.
 
 4. **Stops on its own.** About 8 seconds after the call app releases the mic,
    recording stops and processing starts. A recording under 60 seconds (10 for a
    manual start) gets discarded, on the theory that it's a Slack huddle you clicked
    out of, not a call.
 
-5. **Transcribes.** The audio goes to Deepgram (`nova-3`, multichannel, diarized), so
-   your side and theirs come back correctly labeled.
+5. **Transcribes.** By default, on-device with [voxtype](https://voxtype.io) (ships
+   with Omarchy) — audio never leaves your machine. Switch to Deepgram
+   (`nova-3`, multichannel, diarized) for cloud transcription instead. See
+   [Transcription providers](#transcription-providers) below.
 
 6. **Summarizes.** The transcript goes to any OpenAI-compatible chat endpoint (a
    local Ollama by default) for a title, summary, decisions, and action items. No
    model configured or reachable just means a transcript instead of a summary;
    `spitball reprocess <dir>` fills the summary in later.
 
-Right-click the widget for the whole UI: start/stop, dismiss the current detection,
-toggle auto-record, open the last call's summary, or open the calls folder.
+Any click on the widget, left or right, opens its menu: start recording, show the
+live transcript and stop while recording, dismiss the current detection, toggle
+auto-record, open the last call's summary, open the calls folder, or open Settings.
+A click never stops a call by itself; Stop is always an explicit menu item or the
+Live popup's button. Settings and the Live popup each have a ✕ in their header to
+close them. When something needs attention before Spitball can transcribe (no
+Deepgram key, no local dictation installed), the widget shows a small "Set up" gear
+even while idle, and its menu leads with **Set up transcription…**. Switching the local model from Settings (see
+[Transcription providers](#transcription-providers)) shows the same way: a small
+download glyph while it runs, with the percentage in its tooltip.
+
+## Live transcript
+
+Starting a recording from the menu opens the **Live popup**, and **Show live
+transcript** in the menu reopens it while recording: a chat-style transcript that fills
+in as you talk, plus a **Stop recording** button and a ✕ that closes the popup while
+the recording keeps going. Your lines sit
+on the right, the other side's on the left, each with a small timestamp. It's powered
+by a background live transcriber that runs on-device with voxtype regardless of
+`transcription_provider` (see [Configuration](#configuration)'s `live_transcript` and
+`live_max_window_s`) — it never costs money or sends audio anywhere mid-call, and
+turning it off (`live_transcript: false`) just means the popup shows why it isn't
+available instead of a transcript.
+
+**Fast live engine.** Out of the box each line is one `voxtype transcribe` run, which
+reloads the model every time, so lines land several seconds after each pause. Run
+`spitball live setup` once to install a small venv (onnx-asr + onnxruntime, about
+130 MB, under `~/.local/share/spitball/live-engine/`) that keeps voxtype's Parakeet
+model loaded for the whole call. The popup then shows the sentence as it's spoken,
+dimmed, trailing the speaker by well under a second, and locks it in about a second
+after the pause. It uses whichever Parakeet model voxtype is set to (the streaming
+`parakeet-unified-en-0.6b` included) and needs roughly that model's size in extra
+memory during a call. `spitball live status` says whether it's on; if the engine
+isn't installed, voxtype is on Whisper, or the worker fails, the live transcript
+falls back to the voxtype path on its own. Once you stop, the popup shows "Recording saved;
+transcribing…" briefly and closes on its own (or click ✕). If
+`transcription_provider` is `local`, the finished live transcript is reused instead of
+transcribing the whole call again — a normal full transcription still runs if it came
+out too thin or too many parts failed. See CONTRACT.md for the full `live.json`/
+`.live.json` file formats.
 
 ## Install
 
@@ -89,12 +130,16 @@ a bad state.
 ## What it needs
 
 Already on a stock Omarchy install: `python3`, `ffmpeg`, `pactl` (part of
-`libpulse`), and `notify-send`. Spitball's own code is Python standard library only —
+`libpulse`), `notify-send`, and [voxtype](https://voxtype.io) (Omarchy's own
+dictation tool — Spitball's default transcription provider runs on it, on-device,
+with no key and no setup). Spitball's own code is Python standard library only —
 no `pip install`, no virtualenv.
 
-You also need a **Deepgram API key** — new accounts get free credit to start, and
-`nova-3` prerecorded transcription runs at roughly $0.26/hour at the time of writing.
-See [Deepgram's pricing](https://deepgram.com/pricing) for current rates.
+Want cloud transcription instead? Switch `transcription_provider` to `deepgram`
+and set a **Deepgram API key** — new accounts get free credit to start, and
+`nova-3` prerecorded transcription runs at roughly $0.26/hour at the time of
+writing. See [Deepgram's pricing](https://deepgram.com/pricing) for current rates,
+and [Transcription providers](#transcription-providers) below.
 
 Summaries are optional and need one more thing: something speaking the OpenAI chat
 API. A local [Ollama](https://ollama.com) works out of the box at its default port;
@@ -118,6 +163,57 @@ Set `export_dir` and Spitball also copies the summary and full transcript, as on
 markdown file, into that folder — handy for dropping calls straight into an Obsidian
 vault or a notes tool.
 
+## Transcription providers
+
+Set `transcription_provider` to pick one:
+
+- **`local`** (default) — runs on voxtype, on-device, no key needed. Spitball never
+  manages voxtype's model or engine choice itself; it just runs whatever you already
+  have voxtype configured with (Whisper `base.en` out of the box on Omarchy, or
+  Parakeet if you've picked it in voxtype's own setup). `spitball local info` shows
+  what's active; `spitball local models` lists every model voxtype knows how to
+  download with size/language/installed info.
+
+  The Settings popup's Local section has one Model dropdown, with **Parakeet
+  (unified, English)** marked Recommended. It's the one streaming-capable model:
+  switching to it also turns on voxtype's `parakeet.streaming`, so dictation
+  types while you talk instead of after you stop, and writes the streaming
+  window sizes voxtype needs into its `[parakeet]` config. Switching to any
+  other Parakeet model turns streaming back off. Language coverage varies by
+  model:
+  - **Parakeet (unified, English)** (recommended) — English only, about 2.4 GB.
+  - **Parakeet v3** (and its int8 variant) — 25 European languages.
+  - **Parakeet v2** (and its int8 variant) — English only.
+  - **Whisper** multilingual models (the plain `tiny`/`base`/`small`/`medium`/
+    `large-v3`/`large-v3-turbo`, without a `.en` suffix) — around 99 languages;
+    the `.en` variants are English-only and slightly more accurate for it.
+
+  Picking a different model in the dropdown shows an inline confirmation
+  ("Switch to Parakeet v3 (int8)? Downloads about 640 MB and asks for your
+  password once. Also changes Omarchy dictation.") — nothing switches until you
+  click **Switch**. `spitball local set-model <name>` (what that button calls)
+  then runs the whole switch **in the background**: it never blocks, and its
+  progress (`$XDG_RUNTIME_DIR/spitball/model.json`, see CONTRACT.md) shows both
+  in the popup, if you reopen it, and as a small download glyph on the bar
+  widget itself while it runs. Normally there's no terminal at all — just
+  Omarchy's own graphical password prompt if the engine needs to change (e.g.
+  Whisper → Parakeet), then a background download. It only opens a floating
+  terminal (the original, fully interactive approach) as a fallback, when
+  there's no way to draw that graphical prompt at all. Either way, Spitball's
+  own process never runs `sudo`/`pkexec` itself or edits voxtype's config
+  directly. If voxtype isn't installed at all, the bar shows a "Set up" gear
+  with a hint to install it or switch providers.
+- **`deepgram`** — cloud, multichannel + diarized, so the far side can have several
+  distinct speakers. See `deepgram_model`/`deepgram_api_key(_command)` below.
+
+More providers (an OpenAI-compatible endpoint, AssemblyAI, Soniox) are planned —
+see `docs/ROADMAP.md`.
+
+Every provider transcribes into the same shape, cached as `.transcript.json` in the
+call folder so `spitball reprocess <dir>` doesn't re-transcribe unless you pass
+`--retranscribe`. `language` picks the spoken language: `"en"` (default), `"auto"`
+(provider-dependent detection), or an ISO code.
+
 ## Configuration
 
 Settings live in `~/.config/spitball/config.json`, an optional file — every key has a
@@ -128,24 +224,52 @@ default, and you only need to set the ones you want to change.
 | `calls_dir` | `~/Calls` | Where finished call folders go. |
 | `export_dir` | `""` | Also copy each call's summary + transcript as one markdown file here. Empty means off. |
 | `my_name` | your account's first name | The label used for your channel in the transcript and summary. |
+| `auto_record` | `false` | Start recording automatically the moment a call is detected. Same setting `spitball auto on\|off\|toggle` flips. |
+| `language` | `"en"` | Spoken language: an ISO code, or `"auto"` for provider-dependent detection (deepgram: its own language-detection mode; local: whatever voxtype's active model supports). |
+| `transcription_provider` | `"local"` | `"local"` (voxtype, on-device) or `"deepgram"` (cloud). See [Transcription providers](#transcription-providers). |
 | `deepgram_api_key` | `""` | Your Deepgram API key, in plain text. |
 | `deepgram_api_key_command` | `""` | A shell command whose stdout is the key, for a password manager, e.g. `op read op://Private/Deepgram/credential`. |
+| `deepgram_model` | `nova-3` | Deepgram transcription model. |
 | `summary_base_url` | `http://127.0.0.1:11434/v1` | Any OpenAI-compatible chat endpoint. |
 | `summary_model` | `""` | Model name to request. Empty means the first model the endpoint lists. |
 | `summary_api_key` | `""` | API key for `summary_base_url`, in plain text. |
 | `summary_api_key_command` | `""` | A shell command whose stdout is that key, same idea as `deepgram_api_key_command`. |
 | `summary_enabled` | `true` | Turn summarization off entirely and keep transcripts only. |
 | `call_apps` | Zoom, Chrome, Chromium, Brave, Firefox, Slack, Teams, Discord, Signal, Webex, WhatsApp | Mic users that count as a call, matched case-insensitively against the process name; each key maps to a display name shown in the bar. |
+| `live_transcript` | `true` | Show a live, chat-style transcript in the bar's Live popup while recording (see [Live transcript](#live-transcript)). Always uses the local provider, regardless of `transcription_provider` -- it never costs money or sends audio anywhere mid-call. |
+| `live_max_window_s` | `12` | A live segment with no pause yet is cut here regardless, so one long uninterrupted stretch of talk still shows a line before the call ends. |
+| `live_engine` | `true` | Use the fast live engine once `spitball live setup` has installed it (see [Live transcript](#live-transcript)). `false` goes back to one `voxtype transcribe` per line. |
 | `detect_after_s` | `2` | Seconds the mic must stay open before a call counts as detected. |
 | `end_after_s` | `8` | Seconds the app must be gone before a call counts as ended (rides out brief device switches). |
 | `min_call_s` | `60` | Discard an auto-detected recording shorter than this. |
 | `min_manual_s` | `10` | Discard a manually-started recording shorter than this. |
-| `deepgram_model` | `nova-3` | Deepgram transcription model. |
 | `opus_bitrate` | `32k` | ffmpeg's Opus encoding bitrate. |
 
 The Deepgram key can also come from the `DEEPGRAM_API_KEY` environment variable,
 which wins over both config keys — useful if you'd rather manage it outside the
-config file entirely.
+config file entirely. Same idea for `summary_api_key`, via `summary_api_key_command`.
+
+You can edit `config.json` by hand (restart the daemon afterward — see
+[Restart the daemon](#restart-the-daemon)), or through `spitball config`:
+
+```bash
+spitball config get --json                       # effective settings; *_api_key values are masked
+spitball config set my_name Morgan
+spitball config set transcription_provider deepgram
+echo -n "your-deepgram-key" | spitball config set-secret deepgram_api_key
+spitball config unset export_dir                 # back to the default
+```
+
+`config set`/`set-secret`/`unset` write atomically, make `config.json` mode `600`
+once it holds a secret, and reload the running daemon automatically (falls back to
+nothing happening — no crash — if the daemon isn't up). `set` rejects unknown keys
+and the secret keys themselves (`deepgram_api_key`, `summary_api_key`) — those go
+through `set-secret`, which reads the value from stdin so it never lands in your
+shell history or `ps` output.
+
+`spitball check transcription --json` and `spitball check summary --json` test the
+configured provider/endpoint for real (a live network call) and report `{"ok", "message"}`
+(summary also lists `"models"`).
 
 ## Crash recovery
 
@@ -217,7 +341,12 @@ ln -s ~/.config/omarchy/plugins/supercleanse.spitball/bin/spitball ~/.local/bin/
 | `spitball open-last` | Open the last call's `summary.md`. |
 | `spitball open-folder` | Open `~/Calls` in the file manager. |
 | `spitball status [--json]` | Print the current state. |
-| `spitball reprocess <call-dir>` | Redo transcription and summary for one call folder. |
+| `spitball reprocess <call-dir> [--retranscribe]` | Redo transcription and summary for one call folder. `--retranscribe` ignores the cached transcript and calls the provider again. |
+| `spitball config get\|set\|set-secret\|unset` | Read/edit settings. See [Configuration](#configuration). |
+| `spitball check transcription\|summary [--json]` | Test the configured transcription provider or summary endpoint for real. |
+| `spitball local info\|models\|set-model` | What voxtype is configured with, every model it can download, or switch it to one. See [Transcription providers](#transcription-providers). |
+| `spitball live setup\|status [--json]` | Install the fast live-transcript engine, or show whether it's on and which model it loads. See [Live transcript](#live-transcript). |
+| `spitball pick-folder [--title T]` | Native folder chooser; prints the chosen path (used by the settings panel). |
 | `spitball daemon` | Run the service directly. `SpitballService.qml` does this for you; you shouldn't need to. |
 
 Full state-file and CLI contract in [CONTRACT.md](CONTRACT.md).

@@ -1,0 +1,90 @@
+--- a/SettingsPanel.qml
++++ b/SettingsPanel.qml
+@@ -280,6 +280,12 @@
+ 
+   property bool deepgramTesting: false
+   property string deepgramTestMsg: ""
++  // [PHASE 2] openai/assemblyai/soniox each need their own testing/message
++  // pair like this once testTranscription() is generalized back to a
++  // provider-keyed map instead of the single deepgram pair phase 1 uses.
++  property bool openaiTesting: false
++  property string openaiTestMsg: ""
++  property bool openaiAdvancedOpen: false
+   property bool summaryTesting: false
+   property string summaryTestMsg: ""
+ 
+@@ -289,11 +295,15 @@
+   }
+ 
+   function testTranscription(providerName) {
+-    root.deepgramTesting = true
+-    root.deepgramTestMsg = ""
++    // [PHASE 2] this was a single deepgram-only pair in phase 1; restore the
++    // provider branch (or better, generalize to a provider-keyed map) once
++    // openai/assemblyai/soniox are back.
++    if (providerName === "openai") { root.openaiTesting = true; root.openaiTestMsg = "" }
++    else { root.deepgramTesting = true; root.deepgramTestMsg = "" }
+     root.runCliJson(["check", "transcription", "--provider", providerName, "--json"], function(ok, data) {
+-      root.deepgramTesting = false
+-      root.deepgramTestMsg = root.checkResultText(ok, data)
++      var msg = root.checkResultText(ok, data)
++      if (providerName === "openai") { root.openaiTesting = false; root.openaiTestMsg = msg }
++      else { root.deepgramTesting = false; root.deepgramTestMsg = msg }
+     })
+   }
+ 
+@@ -677,6 +687,54 @@
+         ErrorNote { key: "deepgram_model" }
+       }
+ 
++      // ---- OpenAI Whisper (or any OpenAI-compatible endpoint) [PHASE 2] ----
++      Column {
++        visible: root.provider === "openai"
++        width: parent.width
++        spacing: Style.space(8)
++        topPadding: Style.space(4)
++
++        SecretRow {
++          label: "API key"
++          placeholder: Model.keySourcePlaceholder(root.secretInfo("openai_api_key"))
++          disabledLook: root.loadFailed
++          onSaved: function(t) { root.setSecret("openai_api_key", t) }
++        }
++
++        FieldRow {
++          label: "Model"
++          text: root.value("openai_model", "whisper-1")
++          disabledLook: root.loadFailed
++          onCommitted: function(t) { root.setKey("openai_model", t) }
++        }
++
++        ToggleRow {
++          label: "Advanced"
++          checked: root.openaiAdvancedOpen
++          disabledLook: false
++          onToggled: root.openaiAdvancedOpen = !checked
++        }
++
++        FieldRow {
++          visible: root.openaiAdvancedOpen
++          label: "Base URL"
++          text: root.value("openai_base_url", "https://api.openai.com/v1")
++          disabledLook: root.loadFailed
++          onCommitted: function(t) { root.setKey("openai_base_url", t) }
++        }
++
++        TestRow {
++          busy: root.openaiTesting
++          message: root.openaiTestMsg
++          disabledLook: root.loadFailed
++          onRun: root.testTranscription("openai")
++        }
++
++        ErrorNote { key: "openai_api_key" }
++        ErrorNote { key: "openai_model" }
++        ErrorNote { key: "openai_base_url" }
++      }
++
+       PanelSeparator { foreground: root.foreground }
+       PanelSectionHeader { text: "SUMMARIES"; foreground: root.foreground; fontFamily: root.fontFamily }
+ 

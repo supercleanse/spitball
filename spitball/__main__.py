@@ -1,5 +1,7 @@
 """`spitball` CLI. `spitball daemon` runs the service; everything else is a thin client
-over the control socket (see CONTRACT.md)."""
+over the control socket (see CONTRACT.md), or a local read/write against config.json
+for the `config`/`check`/`local`/`pick-folder` commands (the settings panel's whole
+backend surface)."""
 from __future__ import annotations
 
 import json
@@ -17,7 +19,21 @@ USAGE = """usage: spitball <command>
   open-last                 open the last call's summary
   open-folder               open the calls folder
   status [--json]           show the current state
-  reprocess <call-dir>      redo transcription + summary for one call
+  reprocess <call-dir> [--retranscribe]
+                             redo transcription + summary for one call
+  config get [--json]       show effective settings (secrets masked)
+  config set <key> <value>  set one setting (JSON-typed)
+  config set-secret <key>   set a secret from stdin (deepgram_api_key, summary_api_key)
+  config unset <key>        remove a setting override, back to its default
+  check transcription [--provider P] [--json]
+                             test the configured (or given) transcription provider
+  check summary [--json]    test the summary endpoint
+  local info [--json]       what voxtype is currently configured with
+  local models [--json]     every whisper/parakeet model voxtype knows about
+  local set-model <name>    switch voxtype to that model in the background (progress in model.json)
+  live setup                install the live transcript's fast engine (a small venv with onnx-asr)
+  live status [--json]      whether the fast engine is installed and which model it would load
+  pick-folder [--title T]   native folder chooser; prints the chosen path
   daemon                    run the service (systemd does this)"""
 
 
@@ -33,7 +49,7 @@ def send(cmd: str, arg: str = "") -> dict:
             data += chunk
         return json.loads(data or b"{}")
     except (OSError, ValueError) as e:
-        return {"ok": False, "error": f"daemon not reachable ({e}); is `spitball.service` running?"}
+        return {"ok": False, "error": f"daemon not reachable ({e}); is the Spitball plugin enabled? Restart it with `omarchy-shell supercleanse.spitball restart`"}
     finally:
         s.close()
 
@@ -41,6 +57,188 @@ def send(cmd: str, arg: str = "") -> dict:
 def _open(path: str) -> None:
     subprocess.Popen(["xdg-open", path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                      start_new_session=True)
+
+
+def _parse_value(raw: str):
+    """JSON-typed: true/false/numbers (and null/lists/objects) parsed as
+    JSON; anything that isn't valid JSON (a plain unquoted string, which is
+    the common case -- e.g. a folder path) passes through as-is."""
+    try:
+        return json.loads(raw)
+    except ValueError:
+        return raw
+
+
+def _flag_value(args: list, flag: str) -> str | None:
+    if flag in args:
+        i = args.index(flag)
+        if i + 1 < len(args):
+            return args[i + 1]
+    return None
+
+
+def _config_cmd(rest: list) -> int:
+    sub = rest[0] if rest else ""
+    args = rest[1:]
+
+    if sub == "get":
+        cfg = config.load()
+        out = dict(cfg)
+        for key in config.SECRET_KEYS:
+            out[key] = config.secret_status(cfg, key)
+        print(json.dumps(out, indent=1))
+        return 0
+
+    if sub == "set":
+        if len(args) < 2:
+            print(USAGE)
+            return 2
+        key, raw_value = args[0], args[1]
+        if key in config.SECRET_KEYS:
+            print(f"{key!r} is a secret -- use `spitball config set-secret {key}` instead", file=sys.stderr)
+            return 1
+        if key not in config.DEFAULTS:
+            print(f"unknown config key: {key!r}", file=sys.stderr)
+            return 1
+        config.set_key(key, _parse_value(raw_value))
+        send("reload")
+        return 0
+
+    if sub == "set-secret":
+        if not args:
+            print(USAGE)
+            return 2
+        key = args[0]
+        if key not in config.SECRET_KEYS:
+            print(f"not a secret key: {key!r} (expected one of {', '.join(config.SECRET_KEYS)})",
+                  file=sys.stderr)
+            return 1
+        value = sys.stdin.read().strip()  # never argv -- empty stdin clears it
+        config.set_key(key, value)
+        send("reload")
+        return 0
+
+    if sub == "unset":
+        if not args:
+            print(USAGE)
+            return 2
+        key = args[0]
+        if key not in config.DEFAULTS:
+            print(f"unknown config key: {key!r}", file=sys.stderr)
+            return 1
+        config.unset_key(key)
+        send("reload")
+        return 0
+
+    print(USAGE)
+    return 2
+
+
+def _check_cmd(rest: list) -> int:
+    sub = rest[0] if rest else ""
+    cfg = config.load()
+
+    if sub == "transcription":
+        provider = _flag_value(rest, "--provider")
+        from . import providers
+        try:
+            result = providers.check(cfg, provider)
+        except RuntimeError as e:
+            result = {"ok": False, "message": str(e)}
+        print(json.dumps(result))
+        return 0 if result.get("ok") else 1
+
+    if sub == "summary":
+        from . import process
+        result = process.check_summary(cfg)
+        print(json.dumps(result))
+        return 0 if result.get("ok") else 1
+
+    print(USAGE)
+    return 2
+
+
+def _local_cmd(rest: list) -> int:
+    sub = rest[0] if rest else ""
+    from .providers import local
+
+    if sub == "info":
+        print(json.dumps(local.info()))
+        return 0
+
+    if sub == "models":
+        print(json.dumps(local.list_models()))
+        return 0
+
+    if sub == "set-model":
+        args = rest[1:]
+        if not args:
+            print(USAGE)
+            return 2
+        result = local.set_model(args[0])
+        if result.get("ok"):
+            print(result.get("message", "ok"))
+            return 0
+        print(result.get("message", "couldn't switch models"), file=sys.stderr)
+        return 1
+
+    # Internal: the detached child `set_model()` re-execs itself into. Not
+    # part of the documented CLI (see CONTRACT.md) -- never run this
+    # directly; it blocks until the switch finishes or fails.
+    if sub == "_set-model-worker":
+        args = rest[1:]
+        if not args:
+            print(USAGE)
+            return 2
+        local.run_set_model_worker(args[0])
+        return 0
+
+    # Internal: bin/spitball-upgrade-parakeet's streaming step, so the
+    # terminal fallback configures streaming exactly like the worker does.
+    if sub == "_apply-streaming":
+        args = rest[1:]
+        if not args:
+            print(USAGE)
+            return 2
+        error = local.apply_streaming_config(args[0])
+        if error:
+            print(error, file=sys.stderr)
+            return 1
+        return 0
+
+    print(USAGE)
+    return 2
+
+
+def _live_cmd(rest: list) -> int:
+    sub = rest[0] if rest else ""
+    from . import live_engine
+    from .providers import local
+
+    if sub == "setup":
+        print("Installing the live transcript engine (onnx-asr + onnxruntime)...")
+        ok, message = live_engine.setup()
+        print(message, file=sys.stdout if ok else sys.stderr)
+        return 0 if ok else 1
+
+    if sub == "status":
+        model_dir = live_engine.model_dir_for(local.info())
+        status = {"installed": live_engine.installed(),
+                  "venv": str(live_engine.venv_python().parent.parent),
+                  "model": model_dir.name if model_dir else "",
+                  "fast": live_engine.installed() and model_dir is not None}
+        if "--json" in rest:
+            print(json.dumps(status))
+        elif status["fast"]:
+            print(f"Fast live transcript: on ({status['model']})")
+        elif not status["installed"]:
+            print("Fast live transcript: not installed (run `spitball live setup`)")
+        else:
+            print("Fast live transcript: installed, but voxtype isn't on a Parakeet model")
+        return 0
+
+    print(USAGE)
+    return 2
 
 
 def main(argv=None) -> int:
@@ -54,13 +252,31 @@ def main(argv=None) -> int:
         run()
         return 0
     if cmd == "reprocess":
-        if not rest:
+        retranscribe = "--retranscribe" in rest
+        dirs = [a for a in rest if a != "--retranscribe"]
+        if not dirs:
             print(USAGE)
             return 2
         from . import process
-        r = process.process(Path(rest[0]).expanduser().resolve(), {}, notify=print)
+        r = process.process(Path(dirs[0]).expanduser().resolve(), {}, notify=print,
+                             retranscribe=retranscribe)
         print(f"{r['title']}\n{r['summary']}")
         return 0
+    if cmd == "config":
+        return _config_cmd(rest)
+    if cmd == "check":
+        return _check_cmd(rest)
+    if cmd == "local":
+        return _local_cmd(rest)
+    if cmd == "live":
+        return _live_cmd(rest)
+    if cmd == "pick-folder":
+        title = _flag_value(rest, "--title") or "Choose a folder"
+        from . import pickfolder
+        code, path = pickfolder.pick_folder(title)
+        if code == 0:
+            print(path)
+        return code
     if cmd == "open-folder":
         d = Path(config.load()["calls_dir"]).expanduser()
         d.mkdir(parents=True, exist_ok=True)

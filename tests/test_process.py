@@ -11,7 +11,18 @@ from pathlib import Path
 from unittest import mock
 
 from spitball import config, process
+from spitball.providers import deepgram
 from tests.testutil import load_fixture, make_cfg
+
+
+def _normalized_fixture(name: str, cfg: dict) -> dict:
+    """The fixtures under tests/fixtures/ are Deepgram's own raw JSON shape
+    (results.utterances[...]) -- real API responses, still used to test
+    deepgram.normalize() directly in test_provider_deepgram.py. Everything
+    downstream of a provider (build_transcript, the process() pipeline) now
+    works on the shared normalized shape, so tests exercising that stage
+    normalize the fixture first, same as the real pipeline does."""
+    return deepgram.normalize(load_fixture(name), cfg)
 
 
 class TestHms(unittest.TestCase):
@@ -30,7 +41,7 @@ class TestHms(unittest.TestCase):
 
 class TestSlug(unittest.TestCase):
     def test_basic(self):
-        self.assertEqual(process._slug("Weekly Sync with Curt"), "weekly-sync-with-curt")
+        self.assertEqual(process._slug("Weekly Sync with Morgan"), "weekly-sync-with-morgan")
 
     def test_punctuation_collapses(self):
         self.assertEqual(process._slug("Q3!! Review -- Numbers??"), "q3-review-numbers")
@@ -107,7 +118,7 @@ class TestBuildTranscript(unittest.TestCase):
         self.cfg = make_cfg(Path(self.tmp.name), my_name="Morgan")
 
     def test_single_far_speaker_echo_and_merge(self):
-        dg = load_fixture("deepgram_single_speaker.json")
+        dg = _normalized_fixture("deepgram_single_speaker.json", self.cfg)
         lines = process.build_transcript(dg, self.cfg)
         speakers_texts = [(round(s, 1), w, t) for s, w, t in lines]
         self.assertEqual(speakers_texts, [
@@ -118,58 +129,58 @@ class TestBuildTranscript(unittest.TestCase):
         ])
 
     def test_echo_utterance_is_dropped(self):
-        dg = load_fixture("deepgram_single_speaker.json")
+        dg = _normalized_fixture("deepgram_single_speaker.json", self.cfg)
         lines = process.build_transcript(dg, self.cfg)
         full_text = " ".join(t for _, _, t in lines)
         self.assertNotIn("hey how's it going today and", full_text)  # the echoed dup
         self.assertEqual(sum(1 for _, w, t in lines if "Hey how's it going today" in t), 1)
 
     def test_real_mic_speech_kept_when_not_an_echo(self):
-        dg = {"results": {"utterances": [
+        dg = {"utterances": [
             {"channel": 1, "start": 0.0, "end": 1.5, "speaker": 0,
              "transcript": "so what did you think of the proposal"},
             {"channel": 0, "start": 6.0, "end": 8.0, "speaker": 0,
              "transcript": "honestly I think we should rewrite the whole thing"},
-        ]}}
+        ]}
         lines = process.build_transcript(dg, self.cfg)
         self.assertEqual(len(lines), 2)
         self.assertEqual(lines[1][1], "Morgan")
         self.assertIn("rewrite the whole thing", lines[1][2])
 
     def test_multi_far_speakers_labeled(self):
-        dg = load_fixture("deepgram_multi_speaker.json")
+        dg = _normalized_fixture("deepgram_multi_speaker.json", self.cfg)
         lines = process.build_transcript(dg, self.cfg)
         labels = [w for _, w, _ in lines]
         self.assertEqual(labels, ["Speaker 1", "Speaker 2", "Morgan"])
 
     def test_no_speech_returns_empty(self):
-        dg = load_fixture("deepgram_no_speech.json")
+        dg = _normalized_fixture("deepgram_no_speech.json", self.cfg)
         lines = process.build_transcript(dg, self.cfg)
         self.assertEqual(lines, [])
 
     def test_blank_transcript_utterances_filtered(self):
-        dg = {"results": {"utterances": [
+        dg = {"utterances": [
             {"channel": 0, "start": 0.0, "end": 1.0, "speaker": 0, "transcript": "   "},
             {"channel": 0, "start": 2.0, "end": 3.0, "speaker": 0, "transcript": "real words"},
-        ]}}
+        ]}
         lines = process.build_transcript(dg, self.cfg)
         self.assertEqual(len(lines), 1)
         self.assertEqual(lines[0][2], "real words")
 
     def test_consecutive_same_speaker_merged_within_4s(self):
-        dg = {"results": {"utterances": [
+        dg = {"utterances": [
             {"channel": 1, "start": 0.0, "end": 1.0, "speaker": 0, "transcript": "part one"},
             {"channel": 1, "start": 2.0, "end": 3.0, "speaker": 0, "transcript": "part two"},
-        ]}}
+        ]}
         lines = process.build_transcript(dg, self.cfg)
         self.assertEqual(len(lines), 1)
         self.assertEqual(lines[0][2], "part one part two")
 
     def test_gap_over_4s_not_merged(self):
-        dg = {"results": {"utterances": [
+        dg = {"utterances": [
             {"channel": 1, "start": 0.0, "end": 1.0, "speaker": 0, "transcript": "part one"},
             {"channel": 1, "start": 10.0, "end": 11.0, "speaker": 0, "transcript": "part two"},
-        ]}}
+        ]}
         lines = process.build_transcript(dg, self.cfg)
         self.assertEqual(len(lines), 2)
 
@@ -180,7 +191,8 @@ class TestTranscribe(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.audio = Path(self.tmp.name) / "audio.opus"
         self.audio.write_bytes(b"fake-opus-bytes")
-        self.cfg = make_cfg(Path(self.tmp.name), deepgram_api_key="dg-test-key-123")
+        self.cfg = make_cfg(Path(self.tmp.name), transcription_provider="deepgram",
+                            deepgram_api_key="dg-test-key-123")
         self._env_patch = mock.patch.dict(os.environ, {}, clear=False)
         self._env_patch.start()
         os.environ.pop("DEEPGRAM_API_KEY", None)
@@ -204,7 +216,9 @@ class TestTranscribe(unittest.TestCase):
             self.assertIn(expected, req.full_url)
         self.assertEqual(req.get_header("Authorization"), "Token dg-test-key-123")
         self.assertEqual(req.data, b"fake-opus-bytes")
-        self.assertEqual(result, {"results": {"utterances": []}})
+        # process.transcribe() dispatches through the provider abstraction now,
+        # so it returns the normalized shape, not Deepgram's raw JSON.
+        self.assertEqual(result, {"provider": "deepgram", "model": "nova-3", "utterances": []})
 
     def test_env_var_overrides_cfg_key(self):
         captured = {}
@@ -219,7 +233,7 @@ class TestTranscribe(unittest.TestCase):
         self.assertEqual(captured["req"].get_header("Authorization"), "Token env-key")
 
     def test_missing_key_raises_clear_error(self):
-        cfg = make_cfg(Path(self.tmp.name))  # deepgram_api_key/_command both empty
+        cfg = make_cfg(Path(self.tmp.name), transcription_provider="deepgram")  # key/_command both empty
         with self.assertRaises(RuntimeError) as cm:
             process.transcribe(self.audio, cfg)
         self.assertIn("No Deepgram API key", str(cm.exception))
@@ -471,9 +485,9 @@ class TestProcessPipeline(unittest.TestCase):
         self.call_dir.mkdir(parents=True)
         (self.call_dir / "audio.opus").write_bytes(b"fake")
         self.meta = {"app": "Zoom", "started_at": 1790000000, "duration": 125.0}
-        self.dg_fixture = load_fixture("deepgram_single_speaker.json")
+        self.dg_fixture = _normalized_fixture("deepgram_single_speaker.json", self.cfg)
 
-    def _patched(self, summarize_return="# Weekly Sync With Curt\n\n## Summary\n- talked",
+    def _patched(self, summarize_return="# Weekly Sync With Morgan\n\n## Summary\n- talked",
                  transcribe_return=None):
         transcribe_return = transcribe_return if transcribe_return is not None else self.dg_fixture
         return mock.patch("spitball.process.transcribe", return_value=transcribe_return), \
@@ -491,14 +505,14 @@ class TestProcessPipeline(unittest.TestCase):
         p_transcribe, p_summarize = self._patched()
         with p_transcribe, p_summarize:
             result = process.process(self.call_dir, self.meta, self.cfg)
-        self.assertEqual(result["title"], "Weekly Sync With Curt")
+        self.assertEqual(result["title"], "Weekly Sync With Morgan")
 
     def test_folder_renamed_with_slug_once(self):
         p_transcribe, p_summarize = self._patched()
         with p_transcribe, p_summarize:
             result = process.process(self.call_dir, self.meta, self.cfg)
         final_dir = Path(result["dir"])
-        self.assertTrue(final_dir.name.endswith("-weekly-sync-with-curt"))
+        self.assertTrue(final_dir.name.endswith("-weekly-sync-with-morgan"))
         self.assertFalse(self.call_dir.exists())
 
     def test_reprocess_does_not_double_rename(self):
@@ -507,22 +521,50 @@ class TestProcessPipeline(unittest.TestCase):
             result = process.process(self.call_dir, self.meta, self.cfg)
         final_dir = Path(result["dir"])
         p_transcribe2, p_summarize2 = self._patched(
-            summarize_return="# Weekly Sync With Curt\n\n## Summary\n- talked more")
+            summarize_return="# Weekly Sync With Morgan\n\n## Summary\n- talked more")
         with p_transcribe2 as t2, p_summarize2:
             result2 = process.process(final_dir, {}, self.cfg)
-        t2.assert_not_called()  # cached .deepgram.json reused
+        t2.assert_not_called()  # cached .transcript.json reused
         self.assertEqual(result2["dir"], result["dir"])
 
-    def test_reprocess_reuses_cached_deepgram_json(self):
+    def test_reprocess_reuses_cached_transcript_json(self):
         p_transcribe, p_summarize = self._patched()
         with p_transcribe as t1, p_summarize:
             process.process(self.call_dir, self.meta, self.cfg)
         self.assertEqual(t1.call_count, 1)
         final_dir = next(iter(Path(self.cfg["calls_dir"]).glob("*")))
+        self.assertTrue((final_dir / ".transcript.json").exists())
         with mock.patch("spitball.process.transcribe") as t2, \
              mock.patch("spitball.process.summarize", return_value="# T2\n\nx"):
             process.process(final_dir, {}, self.cfg)
         t2.assert_not_called()
+
+    def test_retranscribe_ignores_cache(self):
+        p_transcribe, p_summarize = self._patched()
+        with p_transcribe as t1, p_summarize:
+            process.process(self.call_dir, self.meta, self.cfg)
+        self.assertEqual(t1.call_count, 1)
+        final_dir = next(iter(Path(self.cfg["calls_dir"]).glob("*")))
+        with mock.patch("spitball.process.transcribe", return_value=self.dg_fixture) as t2, \
+             mock.patch("spitball.process.summarize", return_value="# T2\n\nx"):
+            process.process(final_dir, {}, self.cfg, retranscribe=True)
+        t2.assert_called_once()  # --retranscribe skips the cache and calls the provider again
+
+    def test_legacy_deepgram_json_cache_is_read_and_normalized(self):
+        # A call folder made before .transcript.json existed only has the
+        # old .deepgram.json (Deepgram's raw shape) -- reprocessing it must
+        # not need a network call, and must still produce the real transcript.
+        (self.call_dir / ".deepgram.json").write_text(json.dumps(load_fixture("deepgram_single_speaker.json")))
+        with mock.patch("spitball.process.transcribe") as t, \
+             mock.patch("spitball.process.summarize", return_value="# T\n\nx") as sm:
+            result = process.process(self.call_dir, self.meta, self.cfg)
+        t.assert_not_called()
+        sm.assert_called_once()
+        transcript_text = Path(result["dir"], "transcript.md").read_text()
+        self.assertIn("Hey how's it going today", transcript_text)
+        # The pipeline also wrote the new-format cache so future reprocesses
+        # don't need to re-read/re-normalize the legacy file.
+        self.assertTrue(Path(result["dir"], ".transcript.json").exists())
 
     def test_export_dir_gets_summary_and_transcript_never_audio(self):
         cfg = dict(self.cfg)
@@ -535,7 +577,7 @@ class TestProcessPipeline(unittest.TestCase):
         self.assertTrue(export_files[0].name.endswith(".md"))
         self.assertIn(Path(result["dir"]).name, export_files[0].name)
         exported_text = export_files[0].read_text()
-        self.assertIn("Weekly Sync With Curt", exported_text)
+        self.assertIn("Weekly Sync With Morgan", exported_text)
         self.assertIn("Hey how's it going today", exported_text)  # transcript included
         self.assertNotIn("audio.opus", "".join(p.suffix for p in export_files))
 
@@ -559,7 +601,7 @@ class TestProcessPipeline(unittest.TestCase):
 
     def test_no_speech_path(self):
         p_transcribe, p_summarize = self._patched(
-            transcribe_return=load_fixture("deepgram_no_speech.json"))
+            transcribe_return=_normalized_fixture("deepgram_no_speech.json", self.cfg))
         with p_transcribe, p_summarize as sm:
             result = process.process(self.call_dir, self.meta, self.cfg)
         sm.assert_not_called()  # no lines -> summarize() is never called
@@ -586,3 +628,113 @@ class TestProcessPipeline(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestFailedPartsNote(TestProcessPipeline):
+    def test_header_notes_parts_that_failed(self):
+        normalized = {"provider": "local", "model": "x", "utterances": [
+            {"channel": 0, "speaker": 0, "start": 0.0, "end": 5.0, "transcript": "hello there"},
+            {"channel": 0, "speaker": 0, "start": 5.0, "end": 9.0,
+             "transcript": "[transcription failed for this part]", "failed": True}]}
+        p_transcribe, p_summarize = self._patched(transcribe_return=normalized)
+        with p_transcribe, p_summarize:
+            result = process.process(self.call_dir, self.meta, self.cfg)
+        text = (Path(result["dir"]) / "transcript.md").read_text()
+        self.assertIn("1 part of the audio couldn't be transcribed", text)
+        self.assertIn("[transcription failed for this part]", text)
+
+
+class TestLiveTranscriptReuse(TestProcessPipeline):
+    """`.live.json` reuse rules, per docs/SPEC-live-transcript.md: process()
+    uses the live transcriber's cached output instead of transcribing again,
+    but only for the local provider, and only when it looks usable."""
+
+    LIVE_JSON = {"provider": "local", "model": "base.en", "note": "live transcript", "utterances": [
+        {"channel": 0, "speaker": 0, "start": 0.0, "end": 3.0, "transcript": "hey thanks for hopping on"},
+        {"channel": 1, "speaker": 0, "start": 4.0, "end": 7.0, "transcript": "of course glad to help"},
+    ]}
+
+    def _write_live_json(self, data=None):
+        (self.call_dir / ".live.json").write_text(json.dumps(self.LIVE_JSON if data is None else data))
+
+    def test_used_when_provider_is_local_and_looks_clean(self):
+        self._write_live_json()
+        cfg = dict(self.cfg, transcription_provider="local")
+        with mock.patch("spitball.process.transcribe") as t, \
+             mock.patch("spitball.process.summarize", return_value="# Call\n\n## Summary\n- x"):
+            result = process.process(self.call_dir, self.meta, cfg)
+        t.assert_not_called()  # .live.json substituted for a real transcribe() call
+        text = Path(result["summary"]).read_text()  # summary.md, not the transcript -- just proves it ran
+        self.assertTrue(text)
+        cached = json.loads((Path(result["dir"]) / ".transcript.json").read_text())
+        self.assertEqual(cached["provider"], "local")
+
+    def test_never_used_for_deepgram_even_if_present(self):
+        self._write_live_json()
+        cfg = dict(self.cfg, transcription_provider="deepgram")
+        p_transcribe, p_summarize = self._patched()
+        with p_transcribe as t, p_summarize:
+            process.process(self.call_dir, self.meta, cfg)
+        t.assert_called_once()  # full deepgram transcription still ran
+
+    def test_missing_file_falls_back_to_full_transcription(self):
+        cfg = dict(self.cfg, transcription_provider="local")
+        p_transcribe, p_summarize = self._patched(transcribe_return={
+            "provider": "local", "model": "x", "utterances": []})
+        with p_transcribe as t, p_summarize:
+            process.process(self.call_dir, self.meta, cfg)
+        t.assert_called_once()
+
+    def test_empty_utterances_falls_back(self):
+        self._write_live_json({"provider": "local", "model": "x", "utterances": []})
+        cfg = dict(self.cfg, transcription_provider="local")
+        p_transcribe, p_summarize = self._patched(transcribe_return={
+            "provider": "local", "model": "x", "utterances": []})
+        with p_transcribe as t, p_summarize:
+            process.process(self.call_dir, self.meta, cfg)
+        t.assert_called_once()
+
+    def test_unparsable_json_falls_back(self):
+        (self.call_dir / ".live.json").write_text("not json")
+        cfg = dict(self.cfg, transcription_provider="local")
+        p_transcribe, p_summarize = self._patched(transcribe_return={
+            "provider": "local", "model": "x", "utterances": []})
+        with p_transcribe as t, p_summarize:
+            process.process(self.call_dir, self.meta, cfg)
+        t.assert_called_once()
+
+    def test_more_than_ten_percent_failed_by_duration_falls_back(self):
+        # 6s failed out of 10s total spoken time -> well over the 10% cap.
+        self._write_live_json({"provider": "local", "model": "x", "note": "live transcript", "utterances": [
+            {"channel": 0, "speaker": 0, "start": 0.0, "end": 4.0, "transcript": "ok"},
+            {"channel": 0, "speaker": 0, "start": 4.0, "end": 10.0,
+             "transcript": "[transcription failed for this part]", "failed": True},
+        ]})
+        cfg = dict(self.cfg, transcription_provider="local")
+        p_transcribe, p_summarize = self._patched(transcribe_return={
+            "provider": "local", "model": "x", "utterances": []})
+        with p_transcribe as t, p_summarize:
+            process.process(self.call_dir, self.meta, cfg)
+        t.assert_called_once()
+
+    def test_a_few_failures_under_ten_percent_still_used(self):
+        # 1s failed out of 10s total -> under the 10% cap, still reused.
+        self._write_live_json({"provider": "local", "model": "x", "note": "live transcript", "utterances": [
+            {"channel": 0, "speaker": 0, "start": 0.0, "end": 9.0, "transcript": "ok"},
+            {"channel": 0, "speaker": 0, "start": 9.0, "end": 10.0,
+             "transcript": "[transcription failed for this part]", "failed": True},
+        ]})
+        cfg = dict(self.cfg, transcription_provider="local")
+        with mock.patch("spitball.process.transcribe") as t, \
+             mock.patch("spitball.process.summarize", return_value="# Call\n\n## Summary\n- x"):
+            process.process(self.call_dir, self.meta, cfg)
+        t.assert_not_called()
+
+    def test_retranscribe_ignores_live_json_too(self):
+        self._write_live_json()
+        cfg = dict(self.cfg, transcription_provider="local")
+        p_transcribe, p_summarize = self._patched(transcribe_return={
+            "provider": "local", "model": "x", "utterances": []})
+        with p_transcribe as t, p_summarize:
+            process.process(self.call_dir, self.meta, cfg, retranscribe=True)
+        t.assert_called_once()
