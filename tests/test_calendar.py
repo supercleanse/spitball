@@ -327,6 +327,24 @@ class TestRecurrence(unittest.TestCase):
         self.assertEqual(self._expand("FREQ=MONTHLY;BYMONTH=3,9;BYMONTHDAY=15", start,
                                       datetime(2026, 10, 1, tzinfo=DENVER), datetime(2026, 12, 1, tzinfo=DENVER)), [])
 
+    def test_yearly_bymonthday_or_byday_without_bymonth_means_every_month(self):
+        # Codex review 3: FREQ=YEARLY;BYMONTHDAY=1 is the 1st of EVERY month
+        # (RFC 5545: BYMONTHDAY expands in a YEARLY rule); it used to stick
+        # to dtstart's month and invent later years instead.
+        start = datetime(2026, 1, 1, 9, 0, tzinfo=DENVER)
+        ws, we = datetime(2026, 1, 1, tzinfo=DENVER), datetime(2026, 4, 15, tzinfo=DENVER)
+        self.assertEqual(self._expand("FREQ=YEARLY;BYMONTHDAY=1;COUNT=3", start, ws, we),
+                         ["2026-01-01 Thu", "2026-02-01 Sun", "2026-03-01 Sun"])
+        self.assertEqual(self._expand("FREQ=YEARLY;BYDAY=MO;BYMONTHDAY=1,2,3,4,5,6,7", start, ws, we),
+                         ["2026-01-05 Mon", "2026-02-02 Mon", "2026-03-02 Mon", "2026-04-06 Mon"])
+        self.assertEqual(len(self._expand("FREQ=YEARLY;BYDAY=SA", start, ws, we)), 15)
+        # A bare YEARLY (or YEARLY with only BYMONTH) still sticks to dtstart's day.
+        self.assertEqual(self._expand("FREQ=YEARLY", start, ws, datetime(2028, 1, 2, tzinfo=DENVER)),
+                         ["2026-01-01 Thu", "2027-01-01 Fri", "2028-01-01 Sat"])
+        # An always-empty set (BYSETPOS past the set's size) terminates at the window.
+        self.assertEqual(self._expand("FREQ=YEARLY;BYMONTH=1;BYDAY=MO;BYSETPOS=9", start, ws, we), [])
+        self.assertEqual(self._expand("FREQ=MONTHLY;BYDAY=SA;BYMONTHDAY=31;BYSETPOS=2", start, ws, we), [])
+
     def test_yearly_bysetpos_ranks_the_whole_years_set(self):
         # Last Monday of Q1: the set is every Monday of Jan+Feb+Mar together.
         start = datetime(2025, 1, 6, 9, 0, tzinfo=DENVER)
@@ -351,7 +369,7 @@ class TestRecurrence(unittest.TestCase):
             "FREQ=DAILY;BYMONTH=6": "BYMONTH with FREQ=DAILY",
             "FREQ=WEEKLY;BYDAY=MO;BYSETPOS=1": "BYSETPOS with FREQ=WEEKLY",
             "FREQ=WEEKLY;BYDAY=2MO": "ordinal BYDAY with FREQ=WEEKLY",
-            "FREQ=YEARLY;BYDAY=MO": "BYDAY with FREQ=YEARLY and no BYMONTH",
+            "FREQ=YEARLY;BYDAY=20MO": "ordinal BYDAY with FREQ=YEARLY and no BYMONTH",
             "FREQ=MONTHLY;BYSETPOS=1": "BYSETPOS without BYDAY/BYMONTHDAY",
             "FREQ=MONTHLY;RSCALE=HEBREW;BYMONTHDAY=1": "RSCALE",
             "FREQ=MONTHLY;X-CUSTOM=1": "X-CUSTOM",
@@ -360,6 +378,7 @@ class TestRecurrence(unittest.TestCase):
             self.assertEqual(cal.unsupported_rrule_reason(cal.parse_rrule(rrule)), reason, rrule)
         for rrule in ("FREQ=DAILY", "FREQ=WEEKLY;WKST=SU;BYDAY=MO,WE", "FREQ=MONTHLY;BYDAY=-1WE",
                       "FREQ=MONTHLY;BYDAY=MO,TU,WE,TH,FR;BYSETPOS=-1", "FREQ=YEARLY", "FREQ=YEARLY;BYMONTH=9;BYMONTHDAY=30",
+                      "FREQ=YEARLY;BYMONTHDAY=1", "FREQ=YEARLY;BYDAY=MO", "FREQ=YEARLY;BYDAY=MO;BYMONTHDAY=1",
                       "FREQ=MONTHLY;BYMONTHDAY=1,-1;COUNT=3;INTERVAL=2;UNTIL=20271231T000000Z"):
             self.assertEqual(cal.unsupported_rrule_reason(cal.parse_rrule(rrule)), "", rrule)
         self.assertEqual(cal.parse_rrule("FREQ=MONTHLY;BYSETPOS=1,0,-1,x")["BYSETPOS"], [1, -1])

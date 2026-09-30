@@ -2,6 +2,7 @@ import http.server
 import io
 import json
 import os
+import re
 import tempfile
 import threading
 import time
@@ -1167,7 +1168,8 @@ class TestSpeakersInPipeline(TestProcessPipeline):
         cache = json.loads((final_dir / ".transcript.json").read_text())
         self.assertEqual(cache["speakers"]["1"]["name"], "Priya N.")
         self.assertEqual(cache["speakers"]["2"]["name"], "")
-        self.assertEqual(cache["speakers_dropped"], [{"name": "Alex D.", "id": 5, "was": "Speaker 2"}])
+        self.assertEqual(cache["speakers_dropped"], [{"name": "Alex D.", "id": 5, "was": "Speaker 2",
+                                                      "reason": "that voice is gone"}])
         note = "1 hand-set name could not be carried over: Alex D. (was Speaker 2)"
         transcript = (final_dir / "transcript.md").read_text()
         self.assertIn("**[00:00:05] Speaker 2:**", transcript)
@@ -1198,6 +1200,34 @@ class TestSpeakersInPipeline(TestProcessPipeline):
         self.assertEqual(cache["speakers"]["2"]["name"], "Alex D.")
         self.assertNotIn("speakers_dropped", cache)
         self.assertEqual(notes, ["Summarizing…"])
+
+    def test_retranscribe_with_a_different_provider_drops_names_rather_than_misplacing_them(self):
+        # Codex review 3: Deepgram speaker ids and the local provider's
+        # unsplit id 0 are not the same voices; a hand-set name must not
+        # land on "everyone on the far side".
+        result, _, _, _ = self._run(None)
+        final_dir = Path(result["dir"])
+        process.rename_speaker(final_dir, 1, "Alice", self.cfg)
+        local = {"provider": "local", "model": "parakeet", "utterances": [
+            {"channel": 0, "speaker": 0, "start": 0.0, "end": 2.0, "transcript": "hello there everyone"},
+            {"channel": 1, "speaker": 0, "start": 3.0, "end": 9.0, "transcript": "hi this is both of us talking now"}],
+            "diarization": {"ran": False, "engine": "sherpa-onnx", "expected": None, "reason": "not installed"}}
+        notes = []
+        with mock.patch("spitball.calendar.for_call", return_value=None), \
+             mock.patch("spitball.process.transcribe", return_value=local), \
+             mock.patch("spitball.speakers._chat", side_effect=AssertionError("no model")), \
+             mock.patch("spitball.process.summarize", return_value="# T\n\n## Summary\n- x"):
+            process.process(final_dir, {}, dict(self.cfg, transcription_provider="local"),
+                            notify=notes.append, retranscribe=True)
+        cache = json.loads((final_dir / ".transcript.json").read_text())
+        self.assertEqual(cache["speakers"]["1"]["name"], "")
+        self.assertEqual(cache["speakers_dropped"][0]["name"], "Alice")
+        self.assertEqual(cache["speakers_dropped"][0]["reason"], "provider changed (deepgram → local)")
+        transcript = (final_dir / "transcript.md").read_text()
+        self.assertIn("**[00:00:03] Them:** hi this is both", transcript)
+        self.assertNotIn("Alice:**", transcript)
+        self.assertIn("(provider changed (deepgram → local))", transcript)
+        self.assertTrue([n for n in notes if "provider changed" in n], notes)
 
     def test_clear_goes_back_to_automatic(self):
         result, _, _, _ = self._run(None)
@@ -1262,3 +1292,96 @@ class TestSpeakersInPipeline(TestProcessPipeline):
         cache = json.loads((Path(result["dir"]) / ".transcript.json").read_text())
         self.assertEqual(sorted(cache["speakers"]), ["1", "2"])
         self.assertEqual(cache["utterances"][1]["speaker"], 3)  # the provider's ids are never rewritten
+
+
+class TestModelPayloadsNeverCarryAddresses(TestProcessPipeline):
+    """Codex review 3 class sweep: every string that leaves for a model --
+    the summary request's metadata and transcript (process.summarize) and
+    the speaker-naming request (speakers.name_with_llm), the only two
+    model entry points -- is built from a fixture stuffed with addresses
+    and the secret feed URL in every slot that could carry one, under
+    every combination of the switches that shape those payloads, and must
+    come out with no address and no feed URL in it."""
+
+    SECRET_URL = "https://calendar.google.com/calendar/ical/private-SECRET-TOKEN/basic.ics"
+
+    def _decision(self):
+        from datetime import datetime, timedelta, timezone
+        s = datetime.fromtimestamp(1790000000 - 120, tz=timezone.utc)
+        attendees = [
+            {"name": "Priya Nair", "email": "priya@example.com", "response": "accepted", "self": False, "optional": False},
+            {"name": "", "email": "nameless@example.com", "response": "accepted", "self": False, "optional": True},
+            {"name": "bob@example.com", "email": "bob@example.com", "response": "tentative", "self": False, "optional": False},
+            {"name": "Alex Demo", "email": "alex@example.com", "response": "declined", "self": False, "optional": False},
+            {"name": "", "email": "me@example.com", "response": "accepted", "self": True, "optional": False},
+        ]
+        ev = {"id": "ev-1", "uid": "ev-1", "title": "Sync with priya@example.com about the feed",
+              "start": s.isoformat(), "end": (s + timedelta(minutes=30)).isoformat(), "all_day": False,
+              "status": "confirmed", "transparency": "opaque", "kind": "default", "my_response": "accepted",
+              "organizer": {"name": "", "email": "organizer@example.com"}, "attendees": attendees,
+              "conference": {"kind": "meet", "url": "https://meet.google.com/abc-defg-hij", "code": "abc-defg-hij"},
+              "location": "mailto:room@example.com",
+              "description": ("Agenda from ops@example.com\nFeed: " + self.SECRET_URL + "\n"
+                              "webcal://calendar.google.com/calendar/ical/private-SECRET-TOKEN/basic.ics\n"
+                              "Reply to <Dana Lee> dana.lee+x@sub.example.co.uk"),
+              "recurring": False, "recurrence_id": ""}
+        return {"event": ev, "confident": True, "confidence": 100, "candidates": [], "match": ev}
+
+    def test_no_address_or_feed_url_reaches_any_model_under_any_config(self):
+        import itertools
+        email = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
+        reply = json.dumps({"Speaker 1": {"name": "Priya Nair", "confidence": "high", "evidence": "0:00 intro"},
+                            "Speaker 2": {"name": "bob@example.com", "confidence": "high", "evidence": "0:05"}})
+        for names, desc, naming, title_pref in itertools.product((True, False), repeat=4):
+            with self.subTest(names=names, description=desc, speaker_names=naming, event_title=title_pref):
+                call_dir = self.tmp_path / "Calls" / f"2026-09-28-1400-zoom-{int(names)}{int(desc)}{int(naming)}{int(title_pref)}"
+                call_dir.mkdir(parents=True)
+                (call_dir / "audio.opus").write_bytes(b"fake")
+                cfg = dict(self.cfg, calendar_enabled=True, calendar_ics_url=self.SECRET_URL,
+                           calendar_names_to_summary=names, calendar_description_to_summary=desc,
+                           speaker_names=naming, calendar_prefer_event_title=title_pref)
+                chat = mock.Mock(return_value=reply)
+                with mock.patch("spitball.calendar.for_call", return_value=self._decision()), \
+                     mock.patch("spitball.process.transcribe",
+                                return_value=_normalized_fixture("deepgram_multi_speaker.json", cfg)), \
+                     mock.patch("spitball.speakers._chat", chat), \
+                     mock.patch("spitball.process.summarize", return_value="# T\n\n## Summary\n- x") as sm:
+                    result = process.process(call_dir, dict(self.meta), cfg)
+                    final_dir = Path(result["dir"])
+                    # A hand-set name that IS an address, then a reprocess: the
+                    # local files may show it; no model copy may.
+                    process.rename_speaker(final_dir, 2, "hand@example.com", cfg)
+                    process.process(final_dir, {}, cfg)
+                payloads = []
+                for c in sm.call_args_list:
+                    payloads.append(("summary transcript", c.args[0]))
+                    payloads.append(("summary metadata", c.args[1]))
+                for c in chat.call_args_list:
+                    payloads.append(("naming system", c.args[0]))
+                    payloads.append(("naming user", c.args[1]))
+                self.assertTrue(sm.call_args_list)
+                if naming:
+                    self.assertTrue(chat.call_args_list)
+                for what, text in payloads:
+                    self.assertIsNone(email.search(text), f"{what}: {email.search(text) and email.search(text).group(0)!r}")
+                    self.assertNotIn("SECRET-TOKEN", text, what)
+                    self.assertNotIn("private-", text, what)
+                # What the model DID get, when allowed: names, a count for the nameless, never a label that is an address.
+                meta_arg = sm.call_args_list[-1].args[1]
+                if names:
+                    self.assertIn("**People on the invite:** Priya Nair, Alex Demo (declined), and 2 more with no name on the invite", meta_arg)
+                else:
+                    self.assertNotIn("People on the invite", meta_arg)
+                    self.assertNotIn("Alex Demo", meta_arg)  # only the invite list would carry the declined invitee
+                if desc:
+                    self.assertIn("Agenda from [address]", meta_arg)
+                    self.assertIn("Feed: <feed address>", meta_arg)
+                else:
+                    self.assertNotIn("Agenda", meta_arg)
+                self.assertIn("**Meeting:** Sync with [address] about the feed", meta_arg)
+                model_transcript = sm.call_args_list[-1].args[0]
+                self.assertIn("**[00:00:05] Speaker 2:**", model_transcript)   # the hand-set address renders bare for the model
+                self.assertIn("hand@example.com:**", (final_dir / "transcript.md").read_text())  # but stays in the local file
+                if naming:
+                    user = chat.call_args_list[0].args[1]
+                    self.assertIn("- Priya Nair\n(and 2 more invitees with no name on the invite)", user)

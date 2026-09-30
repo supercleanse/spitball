@@ -69,16 +69,18 @@ def _drop_echo(utts: list) -> list:
     return kept
 
 
-def build_transcript(normalized: dict, cfg: dict, named: bool = True) -> list:
+def build_transcript(normalized: dict, cfg: dict, named: bool = True, for_model: bool = False) -> list:
     """[(start_seconds, speaker_label, text)] with consecutive lines merged.
     `normalized` is the shared provider shape: {"utterances": [...]}
     (see spitball/providers/__init__.py's module docstring). Far-side labels
     come from spitball/speakers.py: "Them" for one far voice, "Speaker N"
     for several (tiny voices folded into their neighbors), and, with
-    `named`, whatever the `speakers` map resolved each one to."""
+    `named`, whatever the `speakers` map resolved each one to. `for_model`
+    is the copy a model reads: a hand-set name that is an email address
+    renders as the bare label there."""
     utts = sorted(normalized.get("utterances", []), key=lambda u: u["start"])
     utts = _drop_echo([u for u in utts if u.get("transcript", "").strip()])
-    _, fold, labels = speakers.labels_for(normalized, cfg, named)
+    _, fold, labels = speakers.labels_for(normalized, cfg, named, for_model)
     lines = []
     for u in utts:
         who = cfg["my_name"] if u["channel"] == 0 else labels.get(speakers.folded_speaker(u, fold), "Them")
@@ -301,12 +303,12 @@ def _transcript_notes(normalized: dict) -> list:
     return notes
 
 
-def _speaker_lines(normalized: dict, cfg: dict, naming_error: str = "") -> list:
+def _speaker_lines(normalized: dict, cfg: dict, naming_error: str = "", for_model: bool = False) -> list:
     """The `**Speakers:**` line, the invite-count sanity check, a note when
     the naming pass was attempted and failed, and a note for any hand-set
     name a re-transcription could not carry over."""
     order, _ = speakers.far_speaker_order(normalized.get("utterances", []), speakers.max_speakers(cfg))
-    lines = speakers.summary_lines(normalized.get("speakers") or {}, single=len(order) == 1)
+    lines = speakers.summary_lines(normalized.get("speakers") or {}, single=len(order) == 1, for_model=for_model)
     mismatch = speakers.mismatch_line(diarize.expected_far_speakers(normalized.get("meeting")), len(order))
     if mismatch:
         lines.append(mismatch)
@@ -414,11 +416,16 @@ def process(call_dir: Path, meta: dict, cfg: dict | None = None, notify=None,
     # of it obeys the Calendar settings (see _model_header). The notes ride
     # along -- a `**Speakers:**` line only carries names the naming pass
     # (`speaker_names`) or the user already put on the transcript itself.
+    # Everything model-bound is rendered as its own copy and scrubbed last
+    # (calendar.scrub_for_model): no email address, no feed address, ever.
+    model_notes = _transcript_notes(normalized) + _speaker_lines(normalized, cfg, naming["error"], for_model=True)
     summary_meta = _model_header(meta, decision, cfg)
-    if notes:
-        summary_meta += "\n" + "\n".join(notes)
+    if model_notes:
+        summary_meta += "\n" + "\n".join(model_notes)
+    summary_meta = calendar.scrub_for_model(summary_meta, cfg)
+    model_transcript = _render_lines(build_transcript(normalized, cfg, for_model=True))
     try:
-        summary = summarize(transcript, summary_meta, cfg) if lines else \
+        summary = summarize(model_transcript, summary_meta, cfg) if lines else \
             f"# {title}\n\nNo speech was detected in this recording."
         m = re.match(r"#\s+(.+)", summary.strip())
         if use_event_title:

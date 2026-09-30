@@ -268,8 +268,19 @@ invite list (`**People on the invite:**`, names only) only when
 `calendar_description_to_summary` -- then the header notes. The local
 `**Attendees:**` line is never part of it. The speaker-naming request
 (`speaker_names`, and nothing else, gates it) carries the neutral-label transcript
-and each invitee's name; never an email address -- a nameless invitee is sent as
-`Invitee N (no name on the invite)` and mapped back locally.
+and each invitee's name; never an email address -- an invitee with no name on the
+invite (or whose "name" is an address) is not a naming candidate at all, only
+counted (`and 2 more invitees with no name on the invite`), so a speaker name can
+never be an address. The same rule shapes the summary's invite list
+(`calendar.invite_names()`: names, plus a count of the nameless), and everything
+model-bound passes through `calendar.scrub_for_model()` last: any email address
+becomes `[address]` and the configured feed URL is stripped, from the title, the
+description, the `**Speakers:**` line, and the naming prompt alike. The transcript
+copy a model reads renders a hand-set name that is an address as the bare label
+(the local `transcript.md` keeps it). `tests/test_process.py`
+(`TestModelPayloadsNeverCarryAddresses`) builds every model request from an event
+with addresses in every slot, under every combination of the switches, and asserts
+none gets through.
 
 **`speakers`** (spitball/speakers.py) is who each far-side voice is, written by
 `process()` after transcription and by `spitball speakers`:
@@ -303,13 +314,26 @@ else → the bare label. Every run recomputes the non-`user` entries (an entry w
 call has no far-side speech.
 
 `reprocess --retranscribe` carries the `user` entries onto the fresh transcript by
-`id` (the provider's speaker id, or the local split's cluster id). One whose id is
-not among the new far-side ids can't be placed: it is listed under
-**`speakers_dropped`** (`[{"name": "Alex D.", "id": 5, "was": "Speaker 2"}]`), the
+`id` (the provider's speaker id, or the local split's cluster id) -- but only inside
+the same *frame*: `speakers.identity()` reads `{"provider", "split", "voices"}` off
+each transcript (`provider`; `deepgram` / the `diarization.engine` that ran / `none`
+for an unsplit local far side; the number of distinct far-side ids), and ids are
+compared only when all three agree. Deepgram's speaker 0 and an unsplit local
+speaker 0 (everyone on the far side) are not the same person, so a provider change,
+a split that came or went, or a different voice count drops every hand-set name
+with the reason. A dropped entry -- for that, or because its id simply isn't among
+the new far-side ids -- is listed under **`speakers_dropped`**
+(`[{"name": "Alex D.", "id": 5, "was": "Speaker 2", "reason": "provider changed
+(deepgram → local)"}]`, `reason` `that voice is gone` for the plain case), the
 command prints it, and the headers carry `**Note:** re-transcribing changed the
-far-side voices, so 1 hand-set name could not be carried over: …`. The record stays
-through plain reprocesses until `spitball speakers` sets that name again or the next
-`--retranscribe` replaces it. A plain `reprocess` never writes it.
+far-side voices (provider changed (deepgram → local)), so 1 hand-set name could not
+be carried over: …`. The record stays through plain reprocesses until `spitball
+speakers` sets that name again or the next `--retranscribe` replaces it. A plain
+`reprocess` never writes it. Nothing else in the cache is keyed by speaker id: the
+`speakers` block is the only cross-run state that follows a voice, `diarization`
+and `mic_denoise` are rewritten by whichever provider run produced the transcript,
+`meeting` is rewritten every run, and `.live.json` is reused only on a first run
+under the local provider (never on `--retranscribe`, never under `deepgram`).
 
 **`diarization`** is written by the local provider (or by `process()` when it
 reused `.live.json`): whether the on-device split ran. `ran: false` carries a
@@ -430,17 +454,27 @@ source's `error`; recording is never affected.
 zone; `EXDATE`, `RECURRENCE-ID` overrides, and `COUNT`/`UNTIL` honored). The
 expander implements exactly: `FREQ` `DAILY` / `WEEKLY` / `MONTHLY` / `YEARLY`;
 `INTERVAL`, `COUNT`, `UNTIL`, `WKST`; `BYDAY` (plain days for `DAILY`/`WEEKLY`,
-ordinal days such as `-1WE` for `MONTHLY`/`YEARLY`); `BYMONTHDAY` and `BYMONTH` for
-`MONTHLY`/`YEARLY` (both `BYDAY` and `BYMONTHDAY` given = their intersection, RFC
-5545); `BYSETPOS` for `MONTHLY` (over each month's set) and `YEARLY` (over the
-year's set across `BYMONTH`), e.g. `FREQ=MONTHLY;BYDAY=MO,TU,WE,TH,FR;BYSETPOS=-1`
-is the last weekday of the month. **Any other part** (`BYWEEKNO`, `BYYEARDAY`,
-`BYHOUR`/`BYMINUTE`/`BYSECOND`, `RSCALE`, an `X-` part, sub-daily `FREQ`, or a
-supported part in a combination the expander doesn't handle -- `BYMONTHDAY` on a
-`WEEKLY` rule, `BYSETPOS` without a set, `BYDAY` on a `YEARLY` rule with no
-`BYMONTH`) makes the **whole series skipped**, never expanded approximately: a
-made-up instance could confidently match a recording. Its moved overrides are
-concrete events and still count. Skips are counted: `rules_skipped` in the
+ordinal days such as `-1WE` for `MONTHLY`, and for `YEARLY` when `BYMONTH` is given);
+`BYMONTHDAY` and `BYMONTH` for `MONTHLY`/`YEARLY` (both `BYDAY` and `BYMONTHDAY`
+given = their intersection, RFC 5545; a `YEARLY` rule with `BYMONTHDAY` or `BYDAY`
+and no `BYMONTH` expands in every month of the year, so `FREQ=YEARLY;BYMONTHDAY=1`
+is the 1st of every month, while a bare `FREQ=YEARLY`, or one with only `BYMONTH`,
+keeps `DTSTART`'s day); `BYSETPOS` for `MONTHLY` (over each month's set) and
+`YEARLY` (over the year's set across `BYMONTH`), e.g.
+`FREQ=MONTHLY;BYDAY=MO,TU,WE,TH,FR;BYSETPOS=-1` is the last weekday of the month.
+**Any other part** (`BYWEEKNO`, `BYYEARDAY`, `BYHOUR`/`BYMINUTE`/`BYSECOND`,
+`RSCALE`, an `X-` part, sub-daily `FREQ`, or a supported part in a combination the
+expander doesn't handle -- `BYMONTHDAY` on a `WEEKLY` rule, `BYSETPOS` without a
+set, an ordinal `BYDAY` such as `20MO` on a `YEARLY` rule with no `BYMONTH`, which
+would mean the 20th Monday of the year) makes the **whole series skipped**, never
+expanded approximately: a made-up instance could confidently match a recording. Its
+moved overrides are concrete events and still count. What "exactly" means is pinned
+by `tests/test_rrule_oracle.py`: a matrix over every accepted `FREQ` x `BY*` x
+`INTERVAL` x `COUNT`/`UNTIL` combination, each with an `EXDATE`, on DST-crossing
+zoned starts and an all-day start, in a near and a far window, compared occurrence
+for occurrence against python-dateutil (the test runs only where dateutil is
+importable -- a throwaway venv; Spitball itself stays standard-library only). Skips
+are counted: `rules_skipped` in the
 `.meta.json` snapshot and in `calendar test --json` (with a `Skipped:` line in the
 plain report), so a feed that leans on such a rule is visible rather than silently
 thin.

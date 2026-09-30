@@ -142,11 +142,18 @@ class TestCandidates(unittest.TestCase):
     def test_far_invitees_only(self):
         self.assertEqual([c["name"] for c in speakers.candidates(MEETING)], ["Priya Nair", "Alex Demo"])
 
-    def test_address_when_no_name_and_dedup(self):
+    def test_nameless_invitee_is_counted_never_a_candidate_and_dedup(self):
+        # Codex review 3: a speaker name must never be an address (it would
+        # be rendered into the transcript the summary model reads).
         m = {"attendees": [{"name": "", "email": "x@example.com", "response": "accepted", "self": False},
                            {"name": "X", "email": "x2@example.com", "response": "accepted", "self": False},
-                           {"name": "x", "email": "x3@example.com", "response": "accepted", "self": False}]}
-        self.assertEqual([c["name"] for c in speakers.candidates(m)], ["x@example.com", "X"])
+                           {"name": "x", "email": "x3@example.com", "response": "accepted", "self": False},
+                           {"name": "y@example.com", "email": "y@example.com", "response": "accepted", "self": False},
+                           {"name": "", "email": "", "response": "accepted", "self": False}]}
+        self.assertEqual([c["name"] for c in speakers.candidates(m)], ["X"])
+        self.assertEqual(speakers.nameless_count(m), 2)  # x@ and y@ (the empty one is nobody)
+        self.assertEqual(speakers.nameless_count(None), 0)
+        self.assertEqual(speakers.nameless_count(MEETING), 0)
 
     def test_no_meeting(self):
         self.assertEqual(speakers.candidates(None), [])
@@ -163,21 +170,20 @@ class TestCandidates(unittest.TestCase):
         self.assertEqual(speakers._match_candidate("Nobody", cands), "")
         self.assertEqual(speakers._match_candidate("", cands), "")
 
-    def test_nameless_invitee_is_a_placeholder_for_the_model_that_maps_home(self):
-        # Codex P1 regression: an invitee with no name on the invite used to
-        # reach the model as their address. Now the model sees "Invitee N"
-        # and its answer maps back to the local display name (the address).
+    def test_nameless_invitee_can_never_be_named_by_the_model(self):
+        # Codex P1 then review 3: an invitee with no name on the invite used
+        # to reach the model as their address, then as a placeholder that
+        # mapped back to the address as a speaker name. Neither now.
         m = {"attendees": [{"name": "Priya Nair", "email": "priya@example.com", "response": "accepted", "self": False},
                            {"name": "", "email": "x@example.com", "response": "accepted", "self": False}]}
         cands = speakers.candidates(m)
-        self.assertEqual([(c["label"], c["named"]) for c in cands], [("Priya Nair", True), ("Invitee 2", False)])
-        self.assertEqual(speakers._match_candidate("Invitee 2", cands), "x@example.com")
-        self.assertEqual(speakers._match_candidate("invitee 2", cands), "x@example.com")
-        self.assertEqual(speakers._match_candidate("x@example.com", cands), "x@example.com")  # local name, exact
-        self.assertEqual(speakers._match_candidate("x", cands), "")  # no first-name guessing off an address
+        self.assertEqual([c["name"] for c in cands], ["Priya Nair"])
+        self.assertEqual(speakers.nameless_count(m), 1)
+        for guess in ("Invitee 2", "x@example.com", "x"):
+            self.assertEqual(speakers._match_candidate(guess, cands), "", guess)
         self.assertEqual(speakers.parse_answers(
-            json.dumps({"Speaker 1": {"name": "Invitee 2", "confidence": "high", "evidence": "0:01 intro"}}),
-            cands)["1"]["name"], "x@example.com")
+            json.dumps({"Speaker 1": {"name": "x@example.com", "confidence": "high", "evidence": "0:01 intro"}}),
+            cands), {})
 
     def test_ambiguous_first_name_is_no_match(self):
         m = {"attendees": [{"name": "Sam One", "email": "", "response": "accepted", "self": False},
@@ -278,17 +284,26 @@ class TestResolve(unittest.TestCase):
                                               "source": "llm", "evidence": "0:05 intro"})
         self.assertEqual(n["speakers"]["2"]["name"], "")
 
-    def test_llm_prompt_shows_a_nameless_invitee_as_a_placeholder(self):
+    def test_llm_prompt_counts_a_nameless_invitee_and_never_names_them(self):
         meeting = {"attendees": [MEETING["attendees"][0],
                                  {"name": "", "email": "x@example.com", "response": "accepted", "self": False}]}
         n = self._normalized(meeting=meeting)
-        chat = mock.Mock(return_value=json.dumps({"Speaker 2": {"name": "Invitee 2", "confidence": "high", "evidence": "0:15 'this is me'"}}))
+        chat = mock.Mock(return_value=json.dumps({"Speaker 2": {"name": "x@example.com", "confidence": "high", "evidence": "0:15 'this is me'"}}))
         speakers.resolve(n, _cfg(), "t", chat=chat)
         user = chat.call_args[0][1]
         self.assertIn("- Priya Nair\n", user)
-        self.assertIn("- Invitee 2 (no name on the invite)", user)
+        self.assertIn("(and 1 more invitee with no name on the invite)", user)
         self.assertNotIn("@", user)
-        self.assertEqual(n["speakers"]["2"]["name"], "x@example.com")  # mapped back locally
+        self.assertEqual(n["speakers"]["2"]["name"], "")  # an address is never a speaker name
+
+    def test_one_named_invitee_plus_a_nameless_one_is_not_a_one_to_one(self):
+        meeting = {"attendees": [MEETING["attendees"][0],
+                                 {"name": "", "email": "x@example.com", "response": "accepted", "self": False}]}
+        n = self._normalized(far=1, meeting=meeting)
+        chat = mock.Mock(return_value="{}")
+        rep = speakers.resolve(n, _cfg(), "t", chat=chat)
+        self.assertEqual(rep["method"], "llm")  # two people were invited: the model has to say which one
+        chat.assert_called_once()
 
     def test_naming_is_governed_by_speaker_names_alone(self):
         # The Calendar page's calendar_names_to_summary is about the summary
@@ -418,15 +433,21 @@ class TestCarryUserNames(unittest.TestCase):
     used to overwrite the cache with a provider result that has no
     `speakers` block, and every hand-set name went with it."""
 
-    def _old(self):
-        return {"speakers": {
+    def _fresh(self, ids, provider="deepgram", split=None):
+        n = {"provider": provider, "model": "m",
+             "utterances": [_u(1, 5 + 10 * i, 12 + 10 * i, "a good long stretch of words spoken here", speaker=s)
+                            for i, s in enumerate(ids)]}
+        if split is not None:
+            n["diarization"] = {"ran": split, "engine": "sherpa-onnx", "expected": None, "found": len(ids)}
+        return n
+
+    def _old(self, ids=(2, 5, 7), **kw):
+        n = self._fresh(list(ids), **kw)
+        n["speakers"] = {
             "1": {"id": 2, "name": "Priya N.", "confidence": "high", "source": "user", "evidence": "set by hand"},
             "2": {"id": 5, "name": "Old Guess", "confidence": "high", "source": "llm", "evidence": "e"},
-            "3": {"id": 7, "name": "Sam Hand", "confidence": "high", "source": "user", "evidence": "set by hand"}}}
-
-    def _fresh(self, ids):
-        return {"utterances": [_u(1, 5 + 10 * i, 12 + 10 * i, "a good long stretch of words spoken here", speaker=s)
-                               for i, s in enumerate(ids)]}
+            "3": {"id": 7, "name": "Sam Hand", "confidence": "high", "source": "user", "evidence": "set by hand"}}
+        return n
 
     def test_same_ids_carry_over_and_automatic_entries_do_not(self):
         n = self._fresh([2, 5, 7])
@@ -438,18 +459,56 @@ class TestCarryUserNames(unittest.TestCase):
         self.assertNotIn("speakers_dropped", n)
 
     def test_a_gone_id_is_dropped_and_recorded(self):
-        n = self._fresh([2, 9])
+        # Same provider and split, same voice count (3): ids are comparable; one is gone.
+        n = self._fresh([2, 9, 5])
         dropped = speakers.carry_user_names(self._old(), n, _cfg())
-        self.assertEqual(dropped, [{"name": "Sam Hand", "id": 7, "was": "Speaker 3"}])
+        self.assertEqual(dropped, [{"name": "Sam Hand", "id": 7, "was": "Speaker 3", "reason": "that voice is gone"}])
         self.assertEqual(n["speakers_dropped"], dropped)
-        block = speakers.normalize_map(n["speakers"], [2, 9])
+        block = speakers.normalize_map(n["speakers"], [2, 9, 5])
         self.assertEqual(block["1"]["name"], "Priya N.")
         self.assertEqual(block["2"]["name"], "")
 
     def test_single_voice_reads_them(self):
-        old = {"speakers": {"1": {"id": 0, "name": "Only One", "confidence": "high", "source": "user", "evidence": "x"}}}
+        old = self._fresh([0])
+        old["speakers"] = {"1": {"id": 0, "name": "Only One", "confidence": "high", "source": "user", "evidence": "x"}}
         n = self._fresh([3])
-        self.assertEqual(speakers.carry_user_names(old, n, _cfg()), [{"name": "Only One", "id": 0, "was": "Them"}])
+        self.assertEqual(speakers.carry_user_names(old, n, _cfg()),
+                         [{"name": "Only One", "id": 0, "was": "Them", "reason": "that voice is gone"}])
+
+    # ---- Codex review 3: ids only mean the same thing inside the same frame
+
+    def test_identity_of_a_transcript(self):
+        self.assertEqual(speakers.identity(self._fresh([2, 5])), {"provider": "deepgram", "split": "deepgram", "voices": 2})
+        self.assertEqual(speakers.identity(self._fresh([0], provider="local")), {"provider": "local", "split": "none", "voices": 1})
+        self.assertEqual(speakers.identity(self._fresh([0, 1], provider="local", split=True)),
+                         {"provider": "local", "split": "sherpa-onnx", "voices": 2})
+        self.assertEqual(speakers.identity(self._fresh([0], provider="local", split=False)),
+                         {"provider": "local", "split": "none", "voices": 1})
+        self.assertEqual(speakers.identity(None), {"provider": "", "split": "none", "voices": 0})
+        self.assertEqual(speakers.identity_mismatch(speakers.identity(self._fresh([2, 5])), speakers.identity(self._fresh([5, 2]))), "")
+
+    def test_provider_change_drops_every_hand_set_name_with_the_reason(self):
+        # Deepgram speaker 0 named by hand; re-transcribed with the local
+        # provider unsplit, whose speaker 0 is everyone on the far side.
+        old = self._fresh([0, 1])
+        old["speakers"] = {"1": {"id": 0, "name": "Alice", "confidence": "high", "source": "user", "evidence": "x"},
+                           "2": {"id": 1, "name": "", "confidence": "none", "source": "", "evidence": ""}}
+        n = self._fresh([0], provider="local")
+        dropped = speakers.carry_user_names(old, n, _cfg())
+        self.assertEqual(dropped, [{"name": "Alice", "id": 0, "was": "Speaker 1", "reason": "provider changed (deepgram → local)"}])
+        self.assertNotIn("speakers", n)  # nothing carried: "Them" stays "Them"
+        self.assertIn("(provider changed (deepgram → local))", speakers.dropped_line(dropped))
+        # A split that came or went, or a different voice count, is the same refusal.
+        old2 = self._fresh([0, 1], provider="local", split=True)
+        old2["speakers"] = {"1": {"id": 0, "name": "Alice", "confidence": "high", "source": "user", "evidence": "x"}}
+        d2 = speakers.carry_user_names(old2, self._fresh([0], provider="local"), _cfg())
+        self.assertEqual(d2[0]["reason"], "speaker split changed (sherpa-onnx → none)")
+        d3 = speakers.carry_user_names(old2, self._fresh([0, 1, 2], provider="local", split=True), _cfg())
+        self.assertEqual(d3[0]["reason"], "a different number of far-side voices (2 → 3)")
+        # Same frame: carried as before.
+        n4 = self._fresh([1, 0], provider="local", split=True)
+        self.assertEqual(speakers.carry_user_names(old2, n4, _cfg()), [])
+        self.assertEqual(speakers.normalize_map(n4["speakers"], [1, 0])["2"]["name"], "Alice")
 
     def test_nothing_to_carry(self):
         n = self._fresh([2])
@@ -473,13 +532,13 @@ class TestCarryUserNames(unittest.TestCase):
         self.assertIn("2 hand-set names could not be carried over: A (was Speaker 1), B (was Speaker 2). Set them again", two)
 
     def test_setting_a_dropped_name_again_clears_its_record(self):
-        n = self._fresh([2, 9])
+        n = self._fresh([2, 9, 5])
         speakers.carry_user_names(self._old(), n, _cfg())
         speakers.set_name(n, _cfg(), 2, "sam hand")  # case-insensitive
         self.assertNotIn("speakers_dropped", n)
         self.assertEqual(n["speakers"]["2"]["name"], "sam hand")
         # A different name leaves the record (and its note) in place.
-        n2 = self._fresh([2, 9])
+        n2 = self._fresh([2, 9, 5])
         speakers.carry_user_names(self._old(), n2, _cfg())
         speakers.set_name(n2, _cfg(), 2, "Someone Else")
         self.assertEqual(n2["speakers_dropped"][0]["name"], "Sam Hand")

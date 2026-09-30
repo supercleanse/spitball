@@ -460,9 +460,13 @@ Speakers page.
 **Naming from the invite** (`speaker_names`, on by default). When a call has a
 confident calendar match, Spitball hands the transcript (with its neutral labels) and
 the invitees' names to the summary endpoint once, before the summary, and asks which
-"Speaker N" is which invitee and why. Names only: an email address never goes along,
-and an invitee with no name on the invite is sent as a placeholder ("Invitee 2") that
-maps back on this machine. This switch alone decides whether that request happens
+"Speaker N" is which invitee and why. Names only: an email address never goes along
+in any request Spitball makes (invite lists, titles, descriptions, and speaker
+labels are scrubbed of addresses before they leave, and the secret feed address is
+stripped too); an invitee with no name on the invite is only counted ("and 1 more
+with no name on the invite") and can never be named, since a speaker name would
+otherwise end up being an address inside the transcript the summarizer reads. This
+switch alone decides whether that request happens
 (naming can't work without the names), so the Calendar page's "Send attendee names to
 the summarizer" does not gate it: turn `speaker_names` off if the summary endpoint
 isn't your own machine and the names shouldn't leave it. Only what people actually say counts: someone
@@ -483,11 +487,15 @@ the others. `--clear` goes back to automatic. If you want a fresh summary writte
 with the corrected names, run `spitball reprocess <call-dir>` afterward.
 
 `spitball reprocess <call-dir> --retranscribe` keeps hand-set names too: each one
-follows its voice onto the fresh transcript by the provider's speaker id. When a
-re-transcription comes back with different voices and a name has nowhere to go, it is
-not dropped quietly: the command says so, the transcript and summary header carry a
-`**Note:**` naming it (until you set it again or the next `--retranscribe`), and
-`.transcript.json` records it under `speakers_dropped`.
+follows its voice onto the fresh transcript by the provider's speaker id, as long as
+the new transcript comes from the same provider, the same speaker split, and the same
+number of far-side voices; ids from different providers (Deepgram's speaker 0 and the
+local provider's one unsplit "Them") don't name the same person, so after a provider
+change every hand-set name is dropped rather than put on the wrong voice. Whenever a
+name has nowhere to go, it is not dropped quietly: the command says so with the
+reason, the transcript and summary header carry a `**Note:**` naming it (until you
+set it again or the next `--retranscribe`), and `.transcript.json` records it under
+`speakers_dropped`.
 
 **Telling voices apart on this computer** (`speaker_split`, on by default, no
 effect until installed). Deepgram splits the far channel on its own. The local

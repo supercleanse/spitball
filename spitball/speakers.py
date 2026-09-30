@@ -173,10 +173,14 @@ def normalize_map(raw, order: list) -> dict:
     return out
 
 
-def label(n: int, entry: dict | None, single: bool, named: bool = True) -> str:
-    """The rendered label for far speaker number `n`."""
+def label(n: int, entry: dict | None, single: bool, named: bool = True, for_model: bool = False) -> str:
+    """The rendered label for far speaker number `n`. `for_model`: the copy
+    a model reads -- a name that is an email address (only possible by
+    hand, `spitball speakers … "x@y"`) renders as the bare label there."""
     base = "Them" if single else f"Speaker {n}"
     if not named or not entry or not entry.get("name"):
+        return base
+    if for_model and "@" in entry["name"]:
         return base
     if entry.get("source") == "user" or entry.get("confidence") == "high":
         return entry["name"]
@@ -185,27 +189,29 @@ def label(n: int, entry: dict | None, single: bool, named: bool = True) -> str:
     return base
 
 
-def labels_for(normalized: dict, cfg: dict, named: bool = True) -> tuple:
+def labels_for(normalized: dict, cfg: dict, named: bool = True, for_model: bool = False) -> tuple:
     """(order, fold, {far id: rendered label}) for build_transcript."""
     order, fold = far_speaker_order(normalized.get("utterances", []), max_speakers(cfg))
     speakers = normalize_map(normalized.get("speakers"), order) if named else {}
     single = len(order) == 1
     out = {}
     for n, spk in enumerate(order, 1):
-        out[spk] = label(n, speakers.get(str(n)), single, named)
+        out[spk] = label(n, speakers.get(str(n)), single, named, for_model)
     return order, fold, out
 
 
-def summary_lines(speakers: dict, single: bool) -> list:
+def summary_lines(speakers: dict, single: bool, for_model: bool = False) -> list:
     """`**Speakers:**` for the transcript/summary header: every far label
     and what it resolved to. Empty when nothing is named (the bare labels
     already say all there is to say)."""
+    if for_model:
+        speakers = {n: e for n, e in speakers.items() if "@" not in str(e.get("name") or "")}
     if not speakers or not any(e.get("name") for e in speakers.values()):
         return []
     parts = []
     for n in sorted(speakers, key=int):
         e = speakers[n]
-        text = label(int(n), e, single)
+        text = label(int(n), e, single, for_model=for_model)
         base = "Them" if single else f"Speaker {n}"
         if text == base and e.get("name"):
             text = f"{base} (unsure: {e['name']}?)"
@@ -224,44 +230,62 @@ def mismatch_line(expected: int | None, found: int) -> str:
 
 # ------------------------------------------------------------------ candidates
 
-def candidates(meeting: dict | None) -> list:
-    """The far-side invitees: everyone who isn't `self` and didn't decline,
-    as {"name", "email", "named", "label"}. `name` is the display name
-    (the address when the invite carries no name -- used locally only);
-    `label` is what the model is shown: the name, or "Invitee N" for a
-    nameless invitee, so no address ever reaches the model."""
+def _far_invitees(meeting: dict | None) -> list:
     if not meeting or not isinstance(meeting.get("attendees"), list):
         return []
+    return [a for a in meeting["attendees"]
+            if isinstance(a, dict) and not a.get("self") and a.get("response") != "declined"]
+
+
+def candidates(meeting: dict | None) -> list:
+    """The far-side invitees a speaker can be named as: everyone who isn't
+    `self`, didn't decline, AND has a real name on the invite, as
+    {"name", "email"}. An invitee with only an address is never a
+    candidate -- a speaker name must never be an email address, because
+    the names go into the transcript the summary model reads. Such
+    invitees are only counted (nameless_count) so the model knows the
+    invite was bigger than the list it sees."""
     out = []
     seen = set()
-    for a in meeting["attendees"]:
-        if not isinstance(a, dict) or a.get("self") or a.get("response") == "declined":
-            continue
-        real = (a.get("name") or "").strip()
-        email = (a.get("email") or "").strip()
-        name = real or email
-        if not name or name.lower() in seen:
+    for a in _far_invitees(meeting):
+        name = (a.get("name") or "").strip()
+        if not name or "@" in name or name.lower() in seen:
             continue
         seen.add(name.lower())
-        out.append({"name": name, "email": email, "named": bool(real)})
-    for i, c in enumerate(out, 1):
-        c["label"] = c["name"] if c["named"] else f"Invitee {i}"
+        out.append({"name": name, "email": (a.get("email") or "").strip()})
     return out
+
+
+def nameless_count(meeting: dict | None) -> int:
+    """How many far-side invitees have no usable name on the invite."""
+    named = {c["name"].lower() for c in candidates(meeting)}
+    n = 0
+    seen = set()
+    for a in _far_invitees(meeting):
+        name = (a.get("name") or "").strip()
+        if name and "@" not in name and name.lower() in named:
+            continue
+        key = (a.get("email") or name).strip().lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        n += 1
+    return n
 
 
 def _match_candidate(name: str, cands: list) -> str:
     """The candidate's display name for what the model wrote: an exact
-    (case-insensitive) match on the label it was shown or the display
-    name, then a unique first-name match. Never by email address -- the
-    model was never given one, so matching on it would be a guess."""
+    (case-insensitive) match, then a unique first-name match. Never by
+    email address -- the model was never given one, so matching on it
+    would be a guess."""
     key = (name or "").strip().lower()
     if not key:
         return ""
     for c in cands:
-        if c["label"].lower() == key or c["name"].lower() == key:
+        if c["name"].lower() == key:
             return c["name"]
     first = key.split()[0]
-    hits = [c for c in cands if c["named"] and c["name"].lower().split()[0] == first]
+    hits = [c for c in cands if c["name"].lower().split()[0] == first]
     return hits[0]["name"] if len(hits) == 1 else ""
 
 
@@ -289,7 +313,8 @@ def resolve(normalized: dict, cfg: dict, transcript_text: str, chat=None) -> dic
         e.update(name="", confidence="none", source="", evidence="")
     if not cfg.get("speaker_names", True) or not cands:
         return report
-    if len(cands) == 1 and len(order) == 1 and "1" in todo:
+    nameless = nameless_count(normalized.get("meeting"))
+    if len(cands) == 1 and nameless == 0 and len(order) == 1 and "1" in todo:
         todo["1"].update(name=cands[0]["name"], confidence="high", source="calendar",
                          evidence="the only other person on the invite")
         report["method"] = "calendar"
@@ -298,7 +323,8 @@ def resolve(normalized: dict, cfg: dict, transcript_text: str, chat=None) -> dic
         report["error"] = "summaries are turned off (summary_enabled)"
         return report
     try:
-        answers = name_with_llm(transcript_text, cands, cfg.get("my_name") or "Me", cfg, chat=chat)
+        answers = name_with_llm(transcript_text, cands, cfg.get("my_name") or "Me", cfg, chat=chat,
+                                nameless=nameless)
     except RuntimeError as e:
         report["error"] = str(e)
         return report
@@ -315,18 +341,23 @@ def _chat(system: str, user: str, cfg: dict, max_tokens: int) -> str:
     return process.chat_completion(system, user, cfg, max_tokens=max_tokens, temperature=0.0)
 
 
-def name_with_llm(transcript_text: str, cands: list, me: str, cfg: dict, chat=None) -> dict:
+def name_with_llm(transcript_text: str, cands: list, me: str, cfg: dict, chat=None,
+                  nameless: int = 0) -> dict:
     """One naming call. Returns {"1": {"name", "confidence", "evidence"},
     ...} for the speakers the model could place (validated against the
     invite list). Raises RuntimeError when the endpoint fails."""
+    from . import calendar as _calendar
     chat = chat or _chat
     body = transcript_text
     if len(body) > NAMING_MAX_CHARS:
         body = body[:NAMING_MAX_CHARS] + "\n\n[transcript truncated]"
-    # Names only: the address never leaves the machine. A nameless invitee
-    # is a placeholder the model can echo back and candidates() maps home.
-    invite = "\n".join(f"- {c['label']}" + ("" if c["named"] else " (no name on the invite)") for c in cands)
+    # Names only: the address never leaves the machine. Invitees with no
+    # name are a count, so the model knows not everyone is on its list.
+    invite = "\n".join(f"- {c['name']}" for c in cands)
+    if nameless:
+        invite += f"\n(and {nameless} more invitee{'s' if nameless != 1 else ''} with no name on the invite)"
     user = f"People on the invite (besides {me}):\n{invite}\n\nTranscript:\n\n{body}"
+    user = _calendar.scrub_for_model(user, cfg)
     reply = chat(NAMING_SYSTEM.replace("{me}", me), user, cfg, 800)
     return parse_answers(reply, cands)
 
@@ -371,20 +402,57 @@ def parse_answers(reply: str, cands: list) -> dict:
 
 # ------------------------------------------------------------------ re-transcription
 
+def identity(normalized: dict | None) -> dict:
+    """What a far-side speaker id MEANS in a transcript -- the frame the ids
+    live in: {"provider", "split", "voices"}. Deepgram's ids come from its
+    own diarization; the local provider's from the sherpa-onnx split
+    (`diarization.ran`) or, unsplit, one id for everyone ("Them"). Two
+    transcripts' ids are comparable only when all three agree; a Deepgram
+    speaker 0 and an unsplit local speaker 0 are not the same person."""
+    n = normalized or {}
+    provider = str(n.get("provider") or "")
+    diar = n.get("diarization") if isinstance(n.get("diarization"), dict) else None
+    if provider == "deepgram":
+        split = "deepgram"
+    elif diar and diar.get("ran"):
+        split = str(diar.get("engine") or "local-split")
+    else:
+        split = "none"
+    voices = {u.get("speaker", 0) for u in n.get("utterances", []) or []
+              if isinstance(u, dict) and u.get("channel") == 1 and (u.get("transcript") or "").strip()
+              and not u.get("failed")}
+    return {"provider": provider, "split": split, "voices": len(voices)}
+
+
+def identity_mismatch(old: dict, new: dict) -> str:
+    """"" when ids are comparable, else why not (one line, for the note)."""
+    if old.get("provider") != new.get("provider"):
+        return f"provider changed ({old.get('provider') or '?'} → {new.get('provider') or '?'})"
+    if old.get("split") != new.get("split"):
+        return f"speaker split changed ({old.get('split') or '?'} → {new.get('split') or '?'})"
+    if old.get("voices") != new.get("voices"):
+        return f"a different number of far-side voices ({old.get('voices')} → {new.get('voices')})"
+    return ""
+
+
 def carry_user_names(previous: dict | None, normalized: dict, cfg: dict) -> list:
     """After `reprocess --retranscribe`: the hand-set (`source: user`)
     entries of the old cache's `speakers` block are put onto the fresh
     transcript so normalize_map() can follow each one to its voice by
-    provider id (the same id => the same voice, for Deepgram's ids and the
-    local split's cluster ids alike). An entry whose id no longer exists
-    can't be placed: it is recorded under `speakers_dropped`
-    ([{"name", "id", "was"}]) and returned, so the header and the CLI say
-    so instead of the name quietly disappearing. Automatic (calendar/llm)
-    entries are not carried -- resolve() recomputes those anyway."""
+    provider id -- but only when the two transcripts' ids mean the same
+    thing (identity(): same provider, same split, same voice count). When
+    they don't (Deepgram -> local, a split that came or went, a different
+    voice count), or an id simply isn't there any more, the entry can't be
+    placed: it is recorded under `speakers_dropped` ([{"name", "id",
+    "was", "reason"}]) and returned, so the header and the CLI say so
+    instead of the name quietly disappearing -- or, worse, landing on
+    someone else. Automatic (calendar/llm) entries are not carried;
+    resolve() recomputes those anyway."""
     normalized.pop("speakers_dropped", None)
     block = (previous or {}).get("speakers")
     if not isinstance(block, dict) or not block:
         return []
+    mismatch = identity_mismatch(identity(previous), identity(normalized))
     order, _ = far_speaker_order(normalized.get("utterances", []), max_speakers(cfg))
     ids = set(order)
     single = len(block) == 1
@@ -398,11 +466,12 @@ def carry_user_names(previous: dict | None, normalized: dict, cfg: dict) -> list
             spk = int(e["id"])
         except (KeyError, TypeError, ValueError):
             continue
-        if spk in ids:
+        if not mismatch and spk in ids:
             carry[str(n)] = dict(e)
         else:
             dropped.append({"name": str(e["name"]).strip(), "id": spk,
-                            "was": "Them" if single else f"Speaker {n}"})
+                            "was": "Them" if single else f"Speaker {n}",
+                            "reason": mismatch or "that voice is gone"})
     if carry:
         normalized["speakers"] = carry  # re-keyed by resolve()/normalize_map()
     if dropped:
@@ -419,7 +488,10 @@ def dropped_line(dropped) -> str:
         return ""
     parts = ", ".join(f"{d['name']} (was {d.get('was') or 'a far-side speaker'})" for d in items)
     plural = len(items) != 1
-    return (f"**Note:** re-transcribing changed the far-side voices, so {len(items)} hand-set "
+    reasons = {str(d.get("reason") or "") for d in items} - {"", "that voice is gone"}
+    why = f"re-transcribing changed the far-side voices ({', '.join(sorted(reasons))})" if reasons \
+        else "re-transcribing changed the far-side voices"
+    return (f"**Note:** {why}, so {len(items)} hand-set "
             f"name{'s' if plural else ''} could not be carried over: {parts}. "
             f"Set {'them' if plural else 'it'} again with `spitball speakers <call-dir> <n> \"Name\"`.")
 

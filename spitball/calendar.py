@@ -603,8 +603,9 @@ def unsupported_rrule_reason(rule: dict) -> str:
                 return f"{k} with FREQ={freq}"
         if ordinals:
             return f"ordinal BYDAY with FREQ={freq}"
-    if freq == "YEARLY" and rule.get("BYDAY") and not rule.get("BYMONTH"):
-        return "BYDAY with FREQ=YEARLY and no BYMONTH"
+    if freq == "YEARLY" and ordinals and not rule.get("BYMONTH"):
+        # "20MO" in a YEARLY rule is the 20th Monday of the YEAR, not of a month.
+        return "ordinal BYDAY with FREQ=YEARLY and no BYMONTH"
     if rule.get("BYSETPOS") and not (rule.get("BYDAY") or rule.get("BYMONTHDAY")):
         return "BYSETPOS without BYDAY/BYMONTHDAY"
     return ""
@@ -780,11 +781,22 @@ def expand_rrule(dtstart, rule: dict, exdates: set, win_start: datetime, win_end
         y, m = dtstart.year, dtstart.month
         by_month = sorted(mo for mo in (rule.get("BYMONTH") or []) if 1 <= mo <= 12)
         # YEARLY: BYSETPOS ranks the whole year's set (every BYMONTH month
-        # together, RFC 5545); MONTHLY: each month is its own set.
+        # together, RFC 5545); MONTHLY: each month is its own set. A YEARLY
+        # rule with BYMONTHDAY or BYDAY but no BYMONTH means every month of
+        # the year (RFC 5545: those parts expand); only a bare FREQ=YEARLY
+        # (or one with just BYMONTH) sticks to dtstart's month.
         yearly_setpos = freq == "YEARLY" and bool(rule.get("BYSETPOS"))
+        if freq == "YEARLY" and not by_month and (rule.get("BYMONTHDAY") or rule.get("BYDAY")):
+            by_month = list(range(1, 13))
         stop = False
         while not stop and iterations < MAX_RULE_ITERATIONS:
             iterations += 1
+            # The window guard that doesn't depend on any occurrence being
+            # produced: a rule whose set is empty every period (an
+            # intersection with nothing in it, a BYSETPOS past the set's
+            # size) must still stop at the window's end.
+            if y > 9999 or _as_datetime(date(y, m if freq == "MONTHLY" else 1, 1)) - timedelta(days=1) > hi:
+                break
             if freq == "MONTHLY" and by_month and m not in by_month:
                 if _as_datetime(date(y, m, 1)) - timedelta(days=1) > hi:
                     break
@@ -1528,13 +1540,73 @@ def summary_context(decision: dict | None, cfg: dict) -> str:
     if when:
         lines.append(f"**When:** {when}")
     if cfg.get("calendar_names_to_summary", True):
-        names = attendee_names(ev)
+        names = invite_names(ev)
         if names:
             lines.append(f"**People on the invite:** {', '.join(names)}")
     if cfg.get("calendar_description_to_summary", False) and ev.get("description"):
         desc = re.sub(r"\n{3,}", "\n\n", ev["description"].strip())
         lines.append(f"**Event description:**\n{desc}")
-    return "\n".join(lines)
+    # The last word on anything model-bound: no address, no feed URL, whatever
+    # the title or description happened to carry.
+    return scrub_for_model("\n".join(lines), cfg)
+
+
+def invite_names(ev: dict) -> list:
+    """The invite list as the summarizer may see it: names only. An invitee
+    with no name on the invite is never shown as their address (what
+    attendee_names() does for the local header); they are counted instead
+    ("and 2 more with no name on the invite")."""
+    org = (ev.get("organizer") or {}).get("email", "")
+    out = []
+    nameless = 0
+    for a in ev.get("attendees") or []:
+        if a.get("self"):
+            continue
+        name = (a.get("name") or "").strip()
+        if not name or _EMAIL_RE.search(name):
+            if a.get("email") or name:
+                nameless += 1
+            continue
+        tags = []
+        if org and a.get("email") == org:
+            tags.append("organizer")
+        if a.get("response") == "declined":
+            tags.append("declined")
+        elif a.get("response") == "tentative":
+            tags.append("tentative")
+        if a.get("optional"):
+            tags.append("optional")
+        out.append(f"{name} ({', '.join(tags)})" if tags else name)
+    if not out and not nameless and ev.get("organizer") and not any(a.get("self") for a in ev.get("attendees") or []):
+        o = ev["organizer"]
+        name = (o.get("name") or "").strip()
+        if name and not _EMAIL_RE.search(name):
+            out.append(f"{name} (organizer)")
+    if nameless:
+        out.append(f"and {nameless} more with no name on the invite" if out
+                   else f"{nameless} invitee{'s' if nameless != 1 else ''} with no name on the invite")
+    return out
+
+
+_EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
+
+
+def scrub_addresses(text: str) -> str:
+    """Every email address in `text` -> "[address]"."""
+    return _EMAIL_RE.sub("[address]", text or "")
+
+
+def scrub_for_model(text: str, cfg: dict | None = None) -> str:
+    """What every model-bound string passes through last: email addresses
+    are replaced, and the configured feed address (the credential, in any
+    of its forms) is stripped. Only the address in config/env is checked
+    here -- never the `_command` form, so this stays free of subprocesses."""
+    text = scrub_addresses(text)
+    cfg = cfg or {}
+    url = str(cfg.get("calendar_ics_url") or os.environ.get(config.SECRET_ENV.get("calendar_ics_url", ""), "") or "")
+    if url:
+        text = _redact(text, url, _normalize_feed_url(url) or "")
+    return text
 
 
 def meeting_record(decision: dict | None) -> dict | None:
