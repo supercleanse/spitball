@@ -118,6 +118,16 @@ omarchy plugin update supercleanse.spitball
 omarchy plugin remove supercleanse.spitball
 ```
 
+That removes the plugin itself. Spitball's own settings, state, and the optional
+live-engine venv stay behind until you delete them:
+
+```bash
+rm -rf ~/.config/spitball ~/.local/state/spitball ~/.local/share/spitball
+```
+
+Your recorded calls (`~/Calls/` by default) are never touched. If you let Spitball
+switch voxtype's model, voxtype keeps that model; change it back with `voxtype setup`.
+
 ### Restart the daemon
 
 ```bash
