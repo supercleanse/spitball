@@ -123,7 +123,7 @@ from a checkout.
 | `spitball open-last` | open the last call's `summary.md` |
 | `spitball open-folder` | open the calls folder (`calls_dir`, default `~/Calls`) |
 | `spitball status [--json]` | print the state |
-| `spitball reprocess <call-dir> [--retranscribe] [--event <id> \| --no-event]` | redo transcription + summary for one call folder. Reuses the cached transcript (`.transcript.json`, or an old folder's `.deepgram.json`) unless `--retranscribe` is given, which calls the provider again. `--event <id>` pins the calendar match to one of the snapshot's candidates (ids as listed in `.meta.json` / `calendar test --json`); `--no-event` clears it. Either is stored as `calendar.override` in `.meta.json` and honored by every later run. |
+| `spitball reprocess <call-dir> [--retranscribe] [--event <id> \| --no-event]` | redo transcription + summary for one call folder. Reuses the cached transcript (`.transcript.json`, or an old folder's `.deepgram.json`) unless `--retranscribe` is given, which calls the provider again with the current settings (including `mic_denoise`, see "Mic noise reduction" below). `--event <id>` pins the calendar match to one of the snapshot's candidates (ids as listed in `.meta.json` / `calendar test --json`); `--no-event` clears it. Either is stored as `calendar.override` in `.meta.json` and honored by every later run. |
 | `spitball config get [--json]` | effective settings (defaults merged with `config.json`). Each `*_api_key` is masked to `{"set": bool, "source": "config"\|"env"\|"command"\|"none"}` -- the raw value is never printed. |
 | `spitball config set <key> <value>` | sets one setting. Value is JSON-typed (`true`/`false`/numbers parsed; anything else stays a plain string). Unknown keys and the three secret keys (see `set-secret`) are rejected. Preserves every other key already in `config.json`, known or not. Sends `reload` to the daemon afterward (ignored if it's down). |
 | `spitball config set-secret <key>` | reads the value from **stdin**, never argv, for `deepgram_api_key` / `summary_api_key` / `calendar_ics_url` (phase 2 adds more as new providers land). Empty stdin clears it. Sends `reload`. |
@@ -230,6 +230,10 @@ on the invite:
 ```json
 {
   "provider": "local", "model": "…", "utterances": [ ... ],
+  "mic_denoise": {
+    "mode": "auto", "applied": true, "filter": "arnndn",
+    "noise_floor_db": -38.2, "speech_level_db": -21.0, "threshold_db": -45.0
+  },
   "meeting": {
     "id": "weekly-sync@google.com/2026-09-30T14:00:00-06:00",
     "title": "Weekly sync",
@@ -250,6 +254,56 @@ on the invite:
 can subtract yourself to get the far side; `response` is `accepted` / `declined` /
 `tentative` / `needs_action`; `name` may be empty when the invite carries only an
 address. `spitball speakers` (phase 4) reads this block; it never rewrites it.
+
+`mic_denoise` is written by the local provider (and by the live transcriber into
+`.live.json`, from where it rides along when that file is reused as the transcript):
+what noise reduction actually ran on the mic copy. `mode` is the setting at the time;
+`applied` whether a filter ran; `filter` is `arnndn` (RNNoise) or `afftdn` (the
+fallback), or null; `noise_floor_db` / `speech_level_db` are the measured 10th / 90th
+percentile frame levels of the mic copy in dBFS (null when nothing was measured, e.g.
+`mode: off`); `threshold_db` is `mic_noise_floor_db` as clamped; an `error` key
+appears only when both filters failed and the raw copy was used. The `deepgram`
+provider never writes the block. The block describes the temp copy the transcriber
+heard; `audio.opus` is never modified.
+
+## Mic noise reduction
+
+`spitball/denoise.py` (docs/SPEC-v2.md section 3). Two `config.json` keys:
+
+| key | default | meaning |
+|:--|:--|:--|
+| `mic_denoise` | `"auto"` | `"off"`, `"auto"`, or `"on"`; anything else reads as `"auto"`. |
+| `mic_noise_floor_db` | `-45` | dBFS; `"auto"` denoises when the measured mic floor is above this. Clamped to −80…−20. |
+
+Where it runs, in both cases on a TEMPORARY copy of the mic channel (channel 0) only:
+
+- **Post-call (local provider):** `split_stereo_to_mono_wavs` writes the mic copy
+  with `highpass=f=80` on its branch (the far copy gets no filter), then
+  `denoise.prepare_mic` measures it (`audio.measure_levels`: `astats` RMS per 50 ms
+  frame, `-inf` read as −100), takes the 10th percentile as the floor, and, when the
+  mode says so, writes `channel-0-denoised.wav` and transcribes that instead.
+- **Live:** `extract_channel_clip` applies the same `highpass=f=80` to channel-0
+  tails; `LiveTranscriber._denoise_tail` feeds each tail's frame levels to a
+  `denoise.LiveGate` (a rolling 60 s window; on when the floor is above the threshold,
+  off only 3 dB below it) and denoises the tail into `live-tail-ch0-denoised.wav`
+  before segmentation and transcription.
+
+The filter is `apad=pad_dur=0.2,arnndn=m=<models/rnnoise/sh.rnnn>:mix=0.7`, output
+cut back to the input's duration with `-t` and resampled to 16 kHz. The padding is
+deliberate: ffmpeg 9's `arnndn` flushes its final partial frame against an
+uninitialized buffer and leaves ~176 NaN samples (a full-scale click once written as
+16-bit PCM) at the end of any clip whose length isn't a multiple of its 10 ms frame,
+which is every live tail. When the model file is missing, or `arnndn` fails, the
+chain is `afftdn=nr=12:nf=-40:tn=1` instead; if that fails too the raw copy is used
+and the error recorded. `anlmdn` is never used (it aborts in ffmpeg 9.0.1). The model
+path is escaped for the filtergraph (two levels), so an install path with `:` or `'`
+in it still works.
+
+On the Whisper path only (voxtype's engine is `whisper`), the local provider also
+measures each channel's frame levels and uses them for speech detection: `silencedetect`'s gate becomes
+`max(-35, floor + 10)` capped at −20 dB, and a speech window whose loudest frame is
+within 6 dB of the floor is skipped as noise-only. Parakeet keeps the plain −35 dB
+segmentation.
 
 ## Calendar events
 
@@ -395,7 +449,8 @@ the next recording starts.
 
 On stop, the live thread also writes the call folder's `<call-dir>/.live.json` (the
 normalized provider shape, `{"provider": "local", "model": ..., "utterances": [...],
-"note": "live transcript"}`) -- see `spitball/process.py`'s `process()`: if
+"note": "live transcript", "mic_denoise": {...}}` -- the last block is what noise
+reduction ran on the mic tails, see "Transcript cache") -- see `spitball/process.py`'s `process()`: if
 `transcription_provider` is `local`, it's used as the transcript instead of
 transcribing the file again, unless it's missing, empty, or more than 10% of the
 call's spoken time is marked `failed`, in which case a normal full transcription runs.

@@ -123,5 +123,29 @@ class TestQmllint(unittest.TestCase):
                     print(f"qmllint findings for {qml}:\n{text}")
 
 
+class TestVendoredRnnoiseModel(unittest.TestCase):
+    """The RNNoise model ffmpeg's arnndn reads (docs/SPEC-v2.md section 3)
+    ships with the plugin, pinned by hash, with its attribution beside it."""
+
+    MODEL = ROOT / "models" / "rnnoise" / "sh.rnnn"
+    SHA256 = "70bb6685eb0c2a1d18e2918dca3fbfbd39317010b1802eb1b6ea73a92f3fdec0"
+
+    def test_model_file_present_and_pinned(self):
+        import hashlib
+        self.assertTrue(self.MODEL.is_file(), self.MODEL)
+        self.assertEqual(hashlib.sha256(self.MODEL.read_bytes()).hexdigest(), self.SHA256)
+        self.assertTrue(self.MODEL.read_text().startswith("rnnoise-nu model file version 1"))
+
+    def test_attribution_present(self):
+        readme = (ROOT / "models" / "rnnoise" / "README.md").read_text()
+        self.assertIn("rnnoise-models", readme)
+        self.assertIn("somnolent-hogwash", readme)
+        self.assertIn(self.SHA256, readme)
+
+    def test_denoise_module_points_at_it(self):
+        from spitball import denoise
+        self.assertEqual(denoise.MODEL_PATH, self.MODEL)
+
+
 if __name__ == "__main__":
     unittest.main()

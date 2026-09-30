@@ -36,7 +36,9 @@ stops on its own when the call ends, and leaves you a transcript and a summary i
 5. **Transcribes.** By default, on-device with [voxtype](https://voxtype.io) (ships
    with Omarchy) — audio never leaves your machine. Switch to Deepgram
    (`nova-3`, multichannel, diarized) for cloud transcription instead. See
-   [Transcription providers](#transcription-providers) below.
+   [Transcription providers](#transcription-providers) below. The copy of your mic
+   the transcriber hears gets a rumble filter, and noise reduction when the room is
+   loud; the recording itself is never altered. See [Audio and noise](#audio-and-noise).
 
 6. **Summarizes.** The transcript goes to any OpenAI-compatible chat endpoint (a
    local Ollama by default) for a title, summary, decisions, and action items. No
@@ -76,7 +78,7 @@ inside a text field, Esc hands focus back to the section list first.
 | **Recording** | The calls folder, the detection and ending timings, the minimum call lengths, the Opus bitrate, which apps count as a call, and which of them is on the mic right now. |
 | **Transcription** | Local (voxtype) or Deepgram. Local: the voxtype model picker with its inline Switch confirmation and download progress, or an Install button if voxtype is missing. Deepgram: API key, model, Test, and the key command under Advanced. |
 | **Live** | The live transcript on/off, the line cutoff, the fast-engine toggle, and whether the engine is installed (with an Install button). |
-| **Audio** | Coming in this release: mic noise reduction. Shows the mic and speaker Spitball would record today. |
+| **Audio** | Mic noise reduction for the transcriber (Off / Auto / On, with a line on each), the mic and speakers Spitball would record today, and under Advanced the background level Auto trips at. See [Audio and noise](#audio-and-noise). |
 | **Speakers** | Coming in this release: naming the far side and splitting it into speakers. |
 | **Summary** | Summaries on/off, the endpoint, the model (a dropdown when the endpoint lists any), API key, Test, and the key command under Advanced. |
 | **Calendar** | Matching on/off, the source (a secret iCal/ICS address stored like an API key, or your own command), a Test button that shows what a call starting now would match, whether the event title becomes the call title, what goes to the summarizer (attendee names on by default, the description off), and under Advanced the address command, your calendar email, and the feed refresh interval. See [Calendar](#calendar). |
@@ -221,8 +223,9 @@ The folder isn't named with a title until processing finishes — it starts as
 summarization are done: the matched calendar event's title when there is a confident
 match (see [Calendar](#calendar)), otherwise the summarizer's. A few dot-files sit
 beside them: `.meta.json` (the call's facts, plus the calendar candidates snapshotted
-when recording started), `.transcript.json` (the cached transcript, plus the matched
-meeting and its attendees), and `.live.json` (the live transcript, when it ran).
+when recording started), `.transcript.json` (the cached transcript, the matched meeting
+and its attendees, and which mic noise reduction ran), and `.live.json` (the live
+transcript, when it ran).
 
 Set `export_dir` and Spitball also copies the summary and full transcript, as one
 markdown file, into that folder — handy for dropping calls straight into an Obsidian
@@ -278,6 +281,87 @@ Every provider transcribes into the same shape, cached as `.transcript.json` in 
 call folder so `spitball reprocess <dir>` doesn't re-transcribe unless you pass
 `--retranscribe`. `language` picks the spoken language: `"en"` (default), `"auto"`
 (provider-dependent detection), or an ISO code.
+
+## Audio and noise
+
+Spitball records your mic as it is. What changes is the copy the transcriber hears:
+
+- **Always:** a high-pass filter at 80 Hz on the mic copy takes out desk rumble, fan
+  hum, and handling thumps below the voice band. The far side (the monitor of your
+  speakers) is left exactly as recorded: it is already the call app's processed
+  output, and cleaning it again only loses detail.
+- **When the room is noisy:** `mic_denoise` runs RNNoise (ffmpeg's `arnndn` filter
+  with the model in `models/rnnoise/`, blended 70/30 with the original) over a
+  temporary copy of the mic channel before transcription. If the model file is
+  missing or the filter fails, ffmpeg's built-in `afftdn` runs instead.
+
+`mic_denoise` has three settings (the Audio page in Settings, or `spitball config set
+mic_denoise off|auto|on`):
+
+| Value | What happens |
+|---|---|
+| `off` | Nothing beyond the high-pass. |
+| `auto` (default) | Spitball measures the mic's background level (the quietest tenth of the call's mic audio, in 50 ms slices) and denoises only when it is above `mic_noise_floor_db`, −45 dBFS by default. A headset in a quiet room sits near −60 and is left alone; a laptop fan lands around −45 to −40; a cafe or an open office reads above −35. |
+| `on` | Always denoise the mic copy. |
+
+Why the default is a gate and not simply on: Whisper and Parakeet were trained on
+noisy audio, and more than one study has found that denoising clean audio makes their
+transcripts worse, not better (the research is summarized in `docs/SPEC-v2.md`). A
+check on this machine with Parakeet and synthetic noise found the filter neither
+helped nor hurt at the noise levels tried, so the gate is there to keep a clean mic
+exactly as it was. Judge it on your own calls: the `mic_denoise` block below tells
+you what ran, and `reprocess --retranscribe` lets you compare.
+
+The live transcript follows the same setting. Each few-second slice of the mic is
+measured as it arrives, and once the running background level crosses the threshold
+the slices are denoised the same way (with 3 dB of hysteresis so a call hovering at
+the threshold doesn't flip between lines).
+
+What ran is recorded in `.transcript.json` (and `.live.json`) as a `mic_denoise`
+block: the mode, whether it applied, which filter, the measured background and
+speaking levels in dBFS, and the threshold. `spitball reprocess <dir> --retranscribe`
+transcribes again with the current setting, so you can compare a call with it off and
+on. The Deepgram provider uploads the recording as it is; the setting does not apply
+to it (Deepgram's own advice is not to preprocess).
+
+**Whisper and silence.** Whisper is known to invent text over audio that has no
+speech in it. When voxtype is on a Whisper model, Spitball segments both channels
+with a stricter speech check: the pause detector's gate rises with the measured
+background, so steady noise still splits into pauses, and any window with nothing
+louder than the room in it is skipped. Parakeet doesn't hallucinate that way and keeps the plain
+segmentation.
+
+### Echo from laptop speakers
+
+Noise reduction cannot remove the other side's voice from your mic. It is speech, and
+the filter keeps speech. On built-in speakers that bleed makes both channels repeat
+each other; Spitball drops mic lines that duplicate far-side lines in time and
+wording, but the real fix is echo cancellation at the source, which needs the
+speaker signal as a reference. PipeWire ships exactly that. Create
+`~/.config/pipewire/pipewire.conf.d/echo-cancel.conf`:
+
+```
+context.modules = [
+  { name = libpipewire-module-echo-cancel
+    args = {
+      library.name = aec/libspa-aec-webrtc
+      aec.args = { webrtc.noise_suppression = true }
+      source.props = { node.name = "echo-cancel-source" node.description = "Echo-canceled mic" }
+      sink.props   = { node.name = "echo-cancel-sink"   node.description = "Echo-canceled speakers" }
+    }
+  }
+]
+```
+
+Then `systemctl --user restart pipewire pipewire-pulse wireplumber` and make the new
+source and sink your defaults (`wpctl status` lists them, `wpctl set-default <id>`
+picks one). Spitball records the default source, so it gets the cleaned mic with no
+change on its side, and so does your call app. (Zoom, Meet, Teams, and Discord cancel
+echo inside the app already; the module matters for the recording, which taps the
+mic before the app does.) [EasyEffects](https://github.com/wwmm/easyeffects)
+(`pacman -S easyeffects`) wraps the same WebRTC echo canceler, RNNoise, and
+DeepFilterNet behind a GUI and works with Spitball the same way: whatever it makes
+the default source is what gets recorded. Headphones avoid the problem entirely.
 
 ## Calendar
 
@@ -369,6 +453,8 @@ default, and you only need to set the ones you want to change.
 | `min_call_s` | `60` | Discard an auto-detected recording shorter than this. |
 | `min_manual_s` | `10` | Discard a manually-started recording shorter than this. |
 | `opus_bitrate` | `32k` | ffmpeg's Opus encoding bitrate. |
+| `mic_denoise` | `"auto"` | Noise reduction on the copy of the mic the transcriber hears: `"off"`, `"auto"` (only when the measured background is above `mic_noise_floor_db`), or `"on"`. Never touches the recording or the far side. See [Audio and noise](#audio-and-noise). |
+| `mic_noise_floor_db` | `-45` | The background level (dBFS) above which `"auto"` denoises. Lower it to denoise more often. |
 | `calendar_enabled` | `false` | Match each call to a calendar event (see [Calendar](#calendar)). |
 | `calendar_source` | `"ics"` | `"ics"` (the secret address below) or `"command"` (`calendar_command`). |
 | `calendar_ics_url` | `""` | The secret iCal/ICS/webcal address. A secret: `set-secret` only, masked in `config get`. |
@@ -467,7 +553,14 @@ last line as the error — usually a PipeWire device that's gone missing. Confir
 side's voice, so both channels partially repeat each other. Spitball filters
 mic-channel text that overlaps far-side text in time and wording, but it isn't
 perfect — headphones avoid the problem at the source and give Deepgram a cleaner
-signal to diarize.
+signal to diarize, and PipeWire's echo cancellation fixes it for real; see
+[Echo from laptop speakers](#echo-from-laptop-speakers).
+
+**Words nobody said, in the quiet parts.** That is Whisper filling silence or noise
+with text. Spitball's Whisper-path speech check skips windows with nothing above the
+room's level in them, and `mic_denoise` lowers what the model hears in a noisy room;
+switching voxtype to Parakeet (Transcription page) avoids it altogether. Check the
+`mic_denoise` block in `.transcript.json` to see what ran.
 
 ## CLI
 
@@ -522,7 +615,9 @@ omarchy restart shell
 ```
 
 Tests run through `tests/run.sh`; pass `--live` to include anything that talks to a
-real system (PipeWire, an actual model endpoint) instead of just fixtures. The
+real system (PipeWire, an actual model endpoint) instead of just fixtures. Audio
+tests synthesize their own clips with ffmpeg at run time (nothing under `tests/`
+ships audio); `models/rnnoise/sh.rnnn` is the one binary asset in the repository. The
 settings overlay can be rendered without touching your desktop:
 `tests/offscreen/render.sh --fake-data <out-dir>` runs Quickshell offscreen
 against a fake CLI and writes one PNG per page. The layout is `SettingsWindow.qml`
@@ -534,4 +629,6 @@ entry to `SETTINGS_SECTIONS` in `Model.js` and a page file that extends
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE). `models/rnnoise/sh.rnnn` is redistributed unchanged
+from [rnnoise-models](https://github.com/GregorR/rnnoise-models); its provenance and
+terms are in `models/rnnoise/README.md`.

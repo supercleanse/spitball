@@ -580,9 +580,9 @@ test("settingsSections: the ten sections, in the spec's order, each with a label
   }
 });
 
-test("settingsSections: Audio and Speakers are the placeholders (Calendar landed in phase 2)", () => {
+test("settingsSections: Speakers is the one placeholder left (Calendar landed in phase 2, Audio in phase 3)", () => {
   const placeholders = Model.settingsSections().filter(x => x.placeholder).map(x => x.id);
-  assert.equal(JSON.stringify(placeholders), JSON.stringify(["audio", "speakers"]));
+  assert.equal(JSON.stringify(placeholders), JSON.stringify(["speakers"]));
 });
 
 test("settingsSections: every page file exists under settings/", () => {
@@ -665,8 +665,8 @@ test("settingsSectionBadge: Transcription says Set up whenever the bar's gear wo
 });
 
 test("settingsSectionBadge: placeholders say Soon, everything else is blank", () => {
-  assert.equal(Model.settingsSectionBadge("audio", null, null), "Soon");
   assert.equal(Model.settingsSectionBadge("speakers", null, null), "Soon");
+  assert.equal(Model.settingsSectionBadge("audio", null, null), "");
   assert.equal(Model.settingsSectionBadge("calendar", null, null), "");
   assert.equal(Model.settingsSectionBadge("general", null, null), "");
   assert.equal(Model.settingsSectionBadge("nope", null, null), "");
@@ -796,4 +796,57 @@ test("calendarTestText: CLI failure, source failure, match, and no-match lines",
     "✓ Command OK; no events at that time");
   assert.equal(Model.calendarTestText(true, { ok: true, source: "ics", cached: true, match: null, events_nearby: 1 }),
     "✓ Feed OK (cached); 1 event(s) nearby, no confident match");
+});
+
+// ---------------------------------------------------------------- audio page: mic_denoise
+
+test("micDenoiseOptions: off / auto / on, in that order, with labels", () => {
+  const o = Model.micDenoiseOptions();
+  assert.equal(JSON.stringify(o.map(x => x.value)), JSON.stringify(["off", "auto", "on"]));
+  assert.equal(JSON.stringify(o.map(x => x.label)), JSON.stringify(["Off", "Auto", "On"]));
+});
+
+test("micDenoiseChoice: unknown, missing, or odd-cased values read as auto", () => {
+  assert.equal(Model.micDenoiseChoice("off"), "off");
+  assert.equal(Model.micDenoiseChoice(" ON "), "on");
+  assert.equal(Model.micDenoiseChoice("auto"), "auto");
+  assert.equal(Model.micDenoiseChoice("loud"), "auto");
+  assert.equal(Model.micDenoiseChoice(""), "auto");
+  assert.equal(Model.micDenoiseChoice(undefined), "auto");
+  assert.equal(Model.micDenoiseChoice(null), "auto");
+});
+
+test("micDenoiseNote: one line per mode, never empty", () => {
+  for (const v of ["off", "auto", "on"]) {
+    const note = Model.micDenoiseNote(v);
+    assert.ok(note.length > 20, v);
+    assert.equal(note.indexOf("\n"), -1, v);
+  }
+  assert.equal(Model.micDenoiseNote("garbage"), Model.micDenoiseNote("auto"));
+});
+
+test("micDenoiseNotes: all three rows, exactly one selected", () => {
+  const rows = Model.micDenoiseNotes("on");
+  assert.equal(rows.length, 3);
+  assert.equal(JSON.stringify(rows.map(r => r.selected)), JSON.stringify([false, false, true]));
+  assert.equal(rows[2].label, "On");
+  assert.equal(rows[2].note, Model.micDenoiseNote("on"));
+  assert.equal(JSON.stringify(Model.micDenoiseNotes(undefined).map(r => r.selected)),
+    JSON.stringify([false, true, false]));
+});
+
+test("micNoiseFloorDb: integer dBFS clamped to -80..-20, default -45", () => {
+  assert.equal(Model.micNoiseFloorDb(-45), -45);
+  assert.equal(Model.micNoiseFloorDb("-52"), -52);
+  assert.equal(Model.micNoiseFloorDb(-38.6), -39);
+  assert.equal(Model.micNoiseFloorDb(-200), -80);
+  assert.equal(Model.micNoiseFloorDb(5), -20);
+  assert.equal(Model.micNoiseFloorDb("abc"), -45);
+  assert.equal(Model.micNoiseFloorDb(undefined), -45);
+});
+
+test("settingsSections: Audio is no longer a placeholder", () => {
+  const audio = Model.settingsSections().find(x => x.id === "audio");
+  assert.equal(audio.placeholder, false);
+  assert.equal(audio.page, "AudioPage.qml");
 });

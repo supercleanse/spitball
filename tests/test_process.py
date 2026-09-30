@@ -626,6 +626,51 @@ class TestProcessPipeline(unittest.TestCase):
         self.assertIn("Summarizing…", seen)
 
 
+class TestMicDenoiseMetadata(TestProcessPipeline):
+    """The provider's `mic_denoise` block (docs/SPEC-v2.md section 3) rides
+    into `.transcript.json`, whether it came from a fresh transcription or a
+    reused `.live.json`, and `reprocess --retranscribe` hands the provider
+    the current setting."""
+
+    BLOCK = {"mode": "auto", "applied": True, "filter": "arnndn",
+             "noise_floor_db": -38.2, "threshold_db": -45.0, "speech_level_db": -21.0}
+
+    def test_block_is_cached_in_transcript_json(self):
+        normalized = dict(self.dg_fixture, mic_denoise=self.BLOCK)
+        p_transcribe, p_summarize = self._patched(transcribe_return=normalized)
+        with p_transcribe, p_summarize:
+            result = process.process(self.call_dir, self.meta, self.cfg)
+        cached = json.loads((Path(result["dir"]) / ".transcript.json").read_text())
+        self.assertEqual(cached["mic_denoise"], self.BLOCK)
+
+    def test_retranscribe_passes_the_current_setting_to_the_provider(self):
+        p_transcribe, p_summarize = self._patched()
+        with p_transcribe, p_summarize:
+            result = process.process(self.call_dir, self.meta, self.cfg)
+        final_dir = Path(result["dir"])
+        cfg = dict(self.cfg, mic_denoise="on", mic_noise_floor_db=-52)
+        with mock.patch("spitball.process.transcribe", return_value=self.dg_fixture) as t, \
+             mock.patch("spitball.process.summarize", return_value="# T\n\n## Summary\n- x"):
+            process.process(final_dir, {}, cfg, retranscribe=True)
+        t.assert_called_once()
+        passed_cfg = t.call_args[0][1]
+        self.assertEqual(passed_cfg["mic_denoise"], "on")
+        self.assertEqual(passed_cfg["mic_noise_floor_db"], -52)
+
+    def test_live_json_block_survives_reuse(self):
+        live = {"provider": "local", "model": "m", "note": "live transcript",
+                "utterances": [{"channel": 0, "speaker": 0, "start": 0.0, "end": 5.0, "transcript": "hi"}],
+                "mic_denoise": dict(self.BLOCK, mode="on")}
+        (self.call_dir / ".live.json").write_text(json.dumps(live))
+        with mock.patch("spitball.process.transcribe") as t, \
+             mock.patch("spitball.process.summarize", return_value="# T\n\n## Summary\n- x"):
+            result = process.process(self.call_dir, self.meta, self.cfg)
+        t.assert_not_called()
+        cached = json.loads((Path(result["dir"]) / ".transcript.json").read_text())
+        self.assertEqual(cached["mic_denoise"]["mode"], "on")
+        self.assertTrue(cached["mic_denoise"]["applied"])
+
+
 if __name__ == "__main__":
     unittest.main()
 

@@ -244,6 +244,29 @@ class TestConfigReloadReachesDaemon(unittest.TestCase):
         self.assertEqual(d.cfg["my_name"], "Morgan")
 
 
+class TestMicDenoiseKeys(ConfigCliTestCase):
+    """docs/SPEC-v2.md section 3's two keys: plain settings (no secret), a
+    string mode and an integer threshold, round-tripped through the CLI."""
+
+    def test_defaults(self):
+        code, out, _ = self.run_main(["config", "get", "--json"])
+        self.assertEqual(code, 0)
+        parsed = json.loads(out)
+        self.assertEqual(parsed["mic_denoise"], "auto")
+        self.assertEqual(parsed["mic_noise_floor_db"], -45)
+
+    def test_set_and_unset_round_trip(self):
+        self.assertEqual(self.run_main(["config", "set", "mic_denoise", "on"])[0], 0)
+        self.assertEqual(self.run_main(["config", "set", "mic_noise_floor_db", "-52"])[0], 0)
+        parsed = json.loads(self.run_main(["config", "get", "--json"])[1])
+        self.assertEqual(parsed["mic_denoise"], "on")
+        self.assertEqual(parsed["mic_noise_floor_db"], -52)
+        self.assertIsInstance(parsed["mic_noise_floor_db"], int)
+        self.assertEqual(self.run_main(["config", "unset", "mic_denoise"])[0], 0)
+        parsed = json.loads(self.run_main(["config", "get", "--json"])[1])
+        self.assertEqual(parsed["mic_denoise"], "auto")
+
+
 if __name__ == "__main__":
     unittest.main()
 

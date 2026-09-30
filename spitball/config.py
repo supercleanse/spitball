@@ -111,6 +111,16 @@ DEFAULTS = {
     "min_call_s": 60,
     "min_manual_s": 10,
     "opus_bitrate": "32k",
+    # Mic noise reduction for the transcriber (spitball/denoise.py,
+    # docs/SPEC-v2.md §3): "off", "auto", or "on". Applied to a temporary copy
+    # of the mic channel only -- the far channel and the recording itself are
+    # never touched. "auto" measures the mic's background level and denoises
+    # only when it is above mic_noise_floor_db (dBFS): a quiet headset call
+    # stays as recorded, a fan or a cafe gets RNNoise (ffmpeg arnndn, model in
+    # models/rnnoise/, afftdn as the fallback). Which mode actually ran is
+    # recorded in .transcript.json / .live.json.
+    "mic_denoise": "auto",
+    "mic_noise_floor_db": -45,
     # Calendar (spitball/calendar.py, docs/SPEC-v2.md §2): match each call to
     # the meeting it belongs to, then name the folder after it, head the
     # transcript with the meeting + attendees, and tell the summarizer who

@@ -48,6 +48,7 @@ from pathlib import Path
 
 from . import audio as audio_mod
 from . import config
+from . import denoise
 from . import live_engine
 from .process import _drop_echo
 from .providers import local as local_provider
@@ -119,6 +120,7 @@ class LiveTranscriber:
             self._unavailable_reason = NOT_AVAILABLE_MESSAGE
 
         self._lock = threading.RLock()
+        self._gate = denoise.LiveGate(cfg)      # mic noise reduction decision for channel 0's tail clips
         self._utterances: list[dict] = []       # absolute-time, unfiltered (echo removal applied at publish)
         self._resolved = {c: 0.0 for c in CHANNELS}  # per channel: everything before this is fully resolved
         self._last_duration = 0.0
@@ -239,6 +241,26 @@ class LiveTranscriber:
                 self._partials[channel] = partial
             self._partial_len[channel] = run_len
 
+    def _denoise_tail(self, raw_tail: Path, tmp: Path) -> Path:
+        """The mic tail the rest of the tick should read: the raw (already
+        high-passed) clip, or a denoised temp copy of it when `mic_denoise`
+        says so (spitball/denoise.py). For "auto" the gate first learns the
+        mic's floor from this clip's frame levels; ~20 ms per tick, plus
+        ~80 ms for RNNoise on a 12 s clip when it's on. The recording is
+        never touched; any filter failure just keeps the raw clip."""
+        gate = self._gate
+        levels = audio_mod.measure_levels(raw_tail) if gate.measures else None
+        if not gate.feed(levels):
+            return raw_tail
+        denoised = tmp / "live-tail-ch0-denoised.wav"
+        try:
+            gate.applied(denoise.apply(raw_tail, denoised))
+        except RuntimeError as e:
+            gate.failed(str(e))
+            denoised.unlink(missing_ok=True)
+            return raw_tail
+        return denoised
+
     def _tick(self, tmp: Path, final: bool) -> None:
         duration = audio_mod.ffprobe_duration(self.audio_path)
         if duration <= 0:
@@ -254,14 +276,17 @@ class LiveTranscriber:
         if duration - resolved < MIN_NEW_AUDIO_S:
             return
 
-        tail = tmp / f"live-tail-ch{channel}.wav"
+        raw_tail = tmp / f"live-tail-ch{channel}.wav"
+        tail = raw_tail
         try:
-            audio_mod.extract_channel_clip(self.audio_path, channel, resolved, duration, tail)
-            tail_duration = audio_mod.ffprobe_duration(tail)
+            audio_mod.extract_channel_clip(self.audio_path, channel, resolved, duration, raw_tail)
+            tail_duration = audio_mod.ffprobe_duration(raw_tail)
         except Exception:
             return  # transient ffmpeg hiccup on the growing file -- retry next tick
         if tail_duration <= 0:
             return
+        if channel == 0:
+            tail = self._denoise_tail(raw_tail, tmp)
 
         silences = audio_mod.detect_silence(tail, min_silence_s=MIN_SILENCE_S)
         segments = audio_mod.raw_speech_segments(tail_duration, silences, min_segment_s=MIN_SEGMENT_S)
@@ -300,6 +325,7 @@ class LiveTranscriber:
                 new_resolved = resolved + end_local  # a forced cut short of tail_duration stays open past here
                 break
 
+        raw_tail.unlink(missing_ok=True)
         tail.unlink(missing_ok=True)
         with self._lock:
             self._utterances.extend(new_utts)
@@ -347,5 +373,9 @@ class LiveTranscriber:
             "model": local_provider.info().get("model") or "",
             "utterances": utts,
             "note": "live transcript",
+            # Which mic noise reduction actually ran during the call
+            # (CONTRACT.md "Transcript cache"); rides into .transcript.json
+            # when process() reuses this file as the transcript.
+            "mic_denoise": self._gate.record(),
         }
         config.atomic_write(self.call_dir / CALL_LIVE_FILENAME, json.dumps(data))

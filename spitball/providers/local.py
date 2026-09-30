@@ -73,6 +73,7 @@ from pathlib import Path
 
 from .. import audio as audio_mod
 from .. import config
+from .. import denoise
 
 NOT_INSTALLED_MESSAGE = "Install dictation (voxtype) or pick a cloud service"
 VOXTYPE_LIB_DIR = Path("/usr/lib/voxtype")
@@ -201,13 +202,34 @@ def info() -> dict:
 
 # --------------------------------------------------------------- transcribe
 
-def _transcribe_channel(wav: Path, channel: int, tmp: Path) -> list:
+def _transcribe_channel(wav: Path, channel: int, tmp: Path, vad: bool = False) -> list:
+    """Segments one channel into speech windows and transcribes each.
+
+    `vad=True` is the Whisper path's tighter speech detection (docs/SPEC-v2.md
+    section 3): Whisper hallucinates text over audio with no speech in it, so
+    (1) when steady background noise sits above `silencedetect`'s fixed
+    -35 dB gate -- which otherwise leaves the channel with no detectable
+    pauses and cuts it into 30 s blocks of noise -- the gate is raised to
+    10 dB above the measured floor, and (2) any window whose loudest 50 ms
+    frame stays within 6 dB of the floor is skipped as noise-only. Both come
+    from one cheap `astats` pass (audio.measure_levels), no extra tools.
+    Parakeet is far less prone to hallucinating, so it keeps the plain
+    -35 dB segmentation (`vad=False`)."""
     duration = audio_mod.ffprobe_duration(wav)
-    silences = audio_mod.detect_silence(wav)
+    levels: list[float] = []
+    floor = None
+    noise_db = denoise.SILENCE_GATE_DB
+    if vad:
+        levels = audio_mod.measure_levels(wav)
+        floor = denoise.noise_floor_db(levels)
+        noise_db = denoise.adaptive_silence_db(floor)
+    silences = audio_mod.detect_silence(wav, noise_db=noise_db)
     windows = audio_mod.speech_windows(duration, silences)
     utterances = []
     for i, (start, end) in enumerate(windows):
         if end - start < 0.4:
+            continue
+        if vad and not denoise.has_speech(levels, start, end, floor):
             continue
         utterances += _transcribe_window(wav, channel, start, end, tmp, f"ch{channel}-w{i}")
     return utterances
@@ -244,11 +266,21 @@ def transcribe(audio: Path, cfg: dict) -> dict:
     if not shutil.which("voxtype"):
         raise RuntimeError("voxtype not installed: install Omarchy's dictation (voxtype), "
                            "or switch transcription_provider to a cloud service")
+    meta = info()
+    whisper = meta.get("engine") == "whisper"
     with tempfile.TemporaryDirectory() as tmp_str:
         tmp = Path(tmp_str)
+        # The mic copy gets the rumble high-pass in the split; the far copy is
+        # left exactly as recorded. audio.opus itself is never rewritten.
         left, right = audio_mod.split_stereo_to_mono_wavs(audio, tmp)
-        utterances = _transcribe_channel(left, 0, tmp) + _transcribe_channel(right, 1, tmp)
-    return {"provider": "local", "model": info().get("model") or "", "utterances": utterances}
+        # Mic noise reduction (spitball/denoise.py): a further temp copy of
+        # the mic channel, made only when the setting (and, for "auto", the
+        # measured noise floor) says so. `mic_denoise` records what ran.
+        mic, mic_record = denoise.prepare_mic(left, cfg, tmp / "channel-0-denoised.wav")
+        utterances = (_transcribe_channel(mic, 0, tmp, vad=whisper)
+                      + _transcribe_channel(right, 1, tmp, vad=whisper))
+    return {"provider": "local", "model": meta.get("model") or "", "utterances": utterances,
+            "mic_denoise": mic_record}
 
 
 def ready(cfg: dict) -> str:

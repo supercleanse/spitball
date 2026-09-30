@@ -38,6 +38,8 @@ SETTINGS = {
     "min_call_s": 60,
     "min_manual_s": 10,
     "opus_bitrate": "32k",
+    "mic_denoise": "auto",
+    "mic_noise_floor_db": -45,
     "calendar_enabled": True,
     "calendar_source": "ics",
     "calendar_ics_url": {"set": True, "source": "config"},

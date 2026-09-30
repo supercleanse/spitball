@@ -9,6 +9,7 @@ bin/spitball-upgrade-parakeet script.
 import io
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -16,6 +17,8 @@ from pathlib import Path
 from unittest import mock
 
 from spitball.providers import local
+
+_REAL_RUN = subprocess.run
 
 
 class TestCleanStdout(unittest.TestCase):
@@ -541,6 +544,127 @@ class TestRunSetModelWorker(ModelStateTestCase):
         state = local.read_model_state()
         self.assertEqual(state["state"], "error")
         self.assertIn("boom", state["message"])
+
+
+@unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "ffmpeg/ffprobe not installed")
+class TestMicDenoiseInTranscribe(unittest.TestCase):
+    """docs/SPEC-v2.md section 3: the local provider denoises a temp copy of
+    the mic channel per `mic_denoise`, records what ran, and (on Whisper)
+    segments with the tighter speech detection. voxtype is faked; ffmpeg is
+    real."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name)
+        self.audio = self.dir / "audio.opus"
+        # Channel 0: a 2 s tone at full scale (floor -3 dBFS: "noisy" by any
+        # threshold); channel 1: a quieter tone. No pauses anywhere.
+        os.system(
+            "ffmpeg -hide_banner -loglevel error "
+            f"-f lavfi -i \"sine=frequency=440:duration=2\" "
+            f"-f lavfi -i \"sine=frequency=880:duration=2\" "
+            "-filter_complex \"[0:a][1:a]amerge=inputs=2[a]\" -map \"[a]\" -ac 2 "
+            f"{self.audio}")
+        self.calls = []
+
+    def _fake_run(self, cmd, **kw):
+        if cmd[0] == "voxtype":
+            self.calls.append(Path(cmd[-1]))
+            return mock.Mock(stdout="Loading audio file: x\n\ntext\n", returncode=0)
+        return _REAL_RUN(cmd, **kw)
+
+    def _transcribe(self, cfg, engine="parakeet"):
+        with mock.patch("shutil.which", return_value="/usr/bin/voxtype"), \
+             mock.patch("spitball.providers.local.subprocess.run", side_effect=self._fake_run), \
+             mock.patch("spitball.providers.local.info",
+                        return_value={"engine": engine, "model": "m"}):
+            return local.transcribe(self.audio, cfg)
+
+    def test_default_auto_records_the_decision(self):
+        result = self._transcribe({})
+        rec = result["mic_denoise"]
+        self.assertEqual(rec["mode"], "auto")
+        self.assertTrue(rec["applied"])          # a full-scale tone sits far above -45
+        self.assertEqual(rec["filter"], "arnndn")
+        self.assertGreater(rec["noise_floor_db"], -45.0)
+        self.assertEqual(rec["threshold_db"], -45.0)
+        self.assertEqual({u["channel"] for u in result["utterances"]}, {0, 1})
+
+    def test_off_never_touches_the_mic_copy(self):
+        with mock.patch("spitball.denoise.apply") as apply:
+            result = self._transcribe({"mic_denoise": "off"})
+        apply.assert_not_called()
+        self.assertEqual(result["mic_denoise"]["mode"], "off")
+        self.assertFalse(result["mic_denoise"]["applied"])
+        self.assertIsNone(result["mic_denoise"]["filter"])
+
+    def test_on_transcribes_the_denoised_copy(self):
+        seen = {}
+
+        def fake_apply(src, dst, model_path=None):
+            seen["src"], seen["dst"] = src, dst
+            shutil.copy(src, dst)
+            return "arnndn"
+
+        with mock.patch("spitball.denoise.apply", side_effect=fake_apply):
+            result = self._transcribe({"mic_denoise": "on"})
+        self.assertEqual(seen["src"].name, "channel-0.wav")
+        self.assertEqual(seen["dst"].name, "channel-0-denoised.wav")
+        self.assertTrue(result["mic_denoise"]["applied"])
+        # Channel 0's clips came out of the denoised copy, channel 1's never did.
+        self.assertTrue(any(c.name.startswith("ch0-") for c in self.calls))
+        self.assertTrue(any(c.name.startswith("ch1-") for c in self.calls))
+
+    def test_auto_below_threshold_leaves_it_alone(self):
+        with mock.patch("spitball.denoise.apply") as apply:
+            result = self._transcribe({"mic_denoise": "auto", "mic_noise_floor_db": -20})
+        apply.assert_not_called()
+        self.assertFalse(result["mic_denoise"]["applied"])
+        self.assertEqual(result["mic_denoise"]["threshold_db"], -20.0)
+
+    def test_setting_is_read_on_every_call(self):
+        # What `spitball reprocess --retranscribe` relies on: the provider
+        # reads cfg each time, so flipping the key changes the next run.
+        off = self._transcribe({"mic_denoise": "off"})["mic_denoise"]
+        on = self._transcribe({"mic_denoise": "on"})["mic_denoise"]
+        self.assertEqual((off["applied"], on["applied"]), (False, True))
+
+    def test_recording_is_never_rewritten(self):
+        before = self.audio.read_bytes()
+        self._transcribe({"mic_denoise": "on"})
+        self.assertEqual(self.audio.read_bytes(), before)
+
+    def test_whisper_path_skips_noise_only_windows(self):
+        # Channel 0: a 2 s tone near -9 dBFS RMS (ffmpeg's sine is 1/8 full
+        # scale, hence +12 dB), then 35 s of steady pink noise near -30 dBFS
+        # -- above silencedetect's -35 dB gate, so the plain segmentation
+        # (Parakeet) cuts it into 30 s blocks and transcribes noise. The
+        # Whisper path raises the gate to the floor and drops windows with
+        # nothing above the room in them.
+        audio_path = self.dir / "noisy.opus"
+        os.system(
+            "ffmpeg -hide_banner -loglevel error -y "
+            "-filter_complex \""
+            "sine=frequency=440:duration=2:sample_rate=16000,volume=12dB[t];"
+            "anoisesrc=color=pink:sample_rate=16000:amplitude=0.2:seed=5,atrim=duration=35[n];"
+            "[t][n]concat=n=2:v=0:a=1[mic];"
+            "anullsrc=r=16000:cl=mono,atrim=duration=37[far];"
+            "[mic][far]amerge=inputs=2[a]\" -map \"[a]\" -ac 2 -c:a libopus "
+            f"{audio_path}")
+        self.audio = audio_path
+        cfg = {"mic_denoise": "off"}  # isolate the segmentation from the denoiser
+        self._transcribe(cfg, engine="parakeet")
+        parakeet_calls = [c for c in self.calls if c.name.startswith("ch0-")]
+        self.calls = []
+        result = self._transcribe(cfg, engine="whisper")
+        whisper_calls = [c for c in self.calls if c.name.startswith("ch0-")]
+        self.assertGreaterEqual(len(parakeet_calls), 2, parakeet_calls)
+        self.assertEqual(len(whisper_calls), 1, whisper_calls)
+        mic_utts = [u for u in result["utterances"] if u["channel"] == 0]
+        self.assertEqual(len(mic_utts), 1)
+        self.assertLessEqual(mic_utts[0]["start"], 0.2)
+        self.assertGreaterEqual(mic_utts[0]["end"], 1.8)
 
 
 if __name__ == "__main__":

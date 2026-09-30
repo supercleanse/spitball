@@ -21,8 +21,17 @@ Four features, in order, per `docs/SPEC-v2.md`:
    `spitball calendar test`; fills the Calendar page. Not done, by design:
    Google OAuth (no shipped client ID), CalDAV, an `event_title` field in
    `state.json` for the bar/Live popup.
-3. **Noise** -- `highpass` on the mic split plus `mic_denoise: off|auto|on`
-   (RNNoise via ffmpeg `arnndn`, `afftdn` fallback); fills the Audio page.
+3. **Noise** (done) -- `highpass=f=80` on the mic copy (split and live tails),
+   `mic_denoise: off|auto|on` (`spitball/denoise.py`: RNNoise via ffmpeg `arnndn`
+   with the model vendored in `models/rnnoise/`, `mix=0.7`, `afftdn` fallback, a
+   temp copy of the mic channel only, on both the post-call and live paths, `auto`
+   gated on the measured noise floor), the `mic_denoise` block in
+   `.transcript.json`/`.live.json`, a stricter speech check on the Whisper path
+   (adaptive `silencedetect` gate + noise-only windows skipped), the README's
+   PipeWire echo-cancel / EasyEffects notes; fills the Audio page. Not done, by
+   design: Silero VAD (needs onnxruntime + a 2 MB model, i.e. the optional venv),
+   GTCRN/DeepFilterNet (research option C), a Spitball-owned PipeWire filter
+   (option D), denoising for the Deepgram upload.
 4. **Speakers** -- attendee-based naming plus an on-device far-channel split
    in the live-engine venv, and `spitball speakers <dir>`; fills the Speakers
    page.

@@ -435,15 +435,15 @@ function liveShouldAutoScroll(contentY, viewHeight, contentHeight, thresholdPx) 
 // one entry here plus one settings/<Page>.qml file.
 //
 // `placeholder: true` marks a page that ships as "Coming in this release"
-// (Audio, Speakers -- filled by later phases; Calendar landed in phase 2);
-// the nav shows it with a "Soon" badge until the flag is dropped.
+// (Speakers -- phase 4; Calendar landed in phase 2, Audio in phase 3); the
+// nav shows it with a "Soon" badge until the flag is dropped.
 
 var SETTINGS_SECTIONS = [
   { id: "general",       label: "General",       page: "GeneralPage.qml" },
   { id: "recording",     label: "Recording",     page: "RecordingPage.qml" },
   { id: "transcription", label: "Transcription", page: "TranscriptionPage.qml" },
   { id: "live",          label: "Live",          page: "LivePage.qml" },
-  { id: "audio",         label: "Audio",         page: "AudioPage.qml", placeholder: true },
+  { id: "audio",         label: "Audio",         page: "AudioPage.qml" },
   { id: "speakers",      label: "Speakers",      page: "SpeakersPage.qml", placeholder: true },
   { id: "summary",       label: "Summary",       page: "SummaryPage.qml" },
   { id: "calendar",      label: "Calendar",      page: "CalendarPage.qml" },
@@ -472,6 +472,64 @@ function calendarSourceOptions() {
 // as the built-in ICS source, matching config.DEFAULTS.
 function calendarSourceChoice(value) {
   return String(value || "") === "command" ? "command" : "ics"
+}
+
+// ------------------------------------------------------------ audio page
+// `mic_denoise` (docs/SPEC-v2.md §3, spitball/denoise.py): noise reduction
+// on the copy of the mic channel the transcriber hears. Never the far
+// channel, never the recording itself. One line of explanation per mode.
+var MIC_DENOISE_MODES = [
+  { value: "off",  label: "Off",
+    note: "The transcriber hears your mic as recorded, apart from a rumble filter below 80 Hz." },
+  { value: "auto", label: "Auto",
+    note: "Measures your mic's background level and denoises only when it is louder than the threshold under Advanced. A quiet headset call is left alone." },
+  { value: "on",   label: "On",
+    note: "Always denoises your mic for the transcriber. For a fan, a cafe, or kids in the next room; on a clean mic it can cost soft words." }
+]
+
+function micDenoiseOptions() {
+  var out = []
+  for (var i = 0; i < MIC_DENOISE_MODES.length; i++) {
+    out.push({ value: MIC_DENOISE_MODES[i].value, label: MIC_DENOISE_MODES[i].label })
+  }
+  return out
+}
+
+// Anything unknown (including no key at all) reads as "auto", matching
+// config.DEFAULTS and spitball/denoise.py's mode().
+function micDenoiseChoice(value) {
+  var v = String(value === undefined || value === null ? "" : value).trim().toLowerCase()
+  for (var i = 0; i < MIC_DENOISE_MODES.length; i++) {
+    if (MIC_DENOISE_MODES[i].value === v) return v
+  }
+  return "auto"
+}
+
+function micDenoiseNote(value) {
+  var v = micDenoiseChoice(value)
+  for (var i = 0; i < MIC_DENOISE_MODES.length; i++) {
+    if (MIC_DENOISE_MODES[i].value === v) return MIC_DENOISE_MODES[i].note
+  }
+  return ""
+}
+
+// Every mode's explanation, for the Audio page's list under the chips:
+// [{value, label, note, selected}], `selected` for the current setting.
+function micDenoiseNotes(value) {
+  var v = micDenoiseChoice(value)
+  var out = []
+  for (var i = 0; i < MIC_DENOISE_MODES.length; i++) {
+    var m = MIC_DENOISE_MODES[i]
+    out.push({ value: m.value, label: m.label, note: m.note, selected: m.value === v })
+  }
+  return out
+}
+
+// `mic_noise_floor_db` as an integer dBFS in the range the backend clamps to.
+function micNoiseFloorDb(value) {
+  var n = Number(value)
+  if (!isFinite(n)) n = -45
+  return Math.max(-80, Math.min(-20, Math.round(n)))
 }
 
 // The Test button's result line, from `spitball calendar test --json`
