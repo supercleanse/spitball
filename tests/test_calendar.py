@@ -724,6 +724,28 @@ class TestIcsSource(unittest.TestCase):
         self.assertNotIn("SECRET", json.dumps(rep))
         self.assertIn("HTTP 403", rep["message"])
 
+    def test_scrub_for_model_redacts_the_url_before_scrubbing_addresses(self):
+        # Codex review 4: a feed address with an unescaped "@" in its path
+        # was altered by the address scrub first, and the token survived.
+        raw = "webcal://calendar.google.com/calendar/ical/alice@example.com/private-SECRET-TOKEN/basic.ics"
+        enc = raw.replace("@", "%40")
+        https = "https://" + raw[len("webcal://"):]
+        for configured in (raw, enc, https, https.replace("@", "%40")):
+            cfg = {"calendar_ics_url": configured}
+            for text in (raw, enc, https, https.replace("@", "%40"), raw[len("webcal://"):], enc[len("webcal://"):],
+                         f"Feed: {https} and again {enc} plus alice@example.com"):
+                with self.subTest(configured=configured, text=text):
+                    out = cal.scrub_for_model(text, cfg)
+                    self.assertNotIn("SECRET", out)
+                    self.assertNotIn("@", out)
+                    self.assertNotIn("%40", out)
+                    self.assertIn("<feed address>", out)
+        # A private-<token> segment is blanked even when nothing is configured.
+        out = cal.scrub_for_model("see https://calendar.google.com/calendar/ical/x/private-abcdef123456/basic.ics", {})
+        self.assertNotIn("abcdef123456", out)
+        self.assertIn("private-<token>", out)
+        self.assertEqual(cal.scrub_for_model("a private-x note", {}), "a private-x note")  # too short to be a token
+
     def test_redact_strips_every_form_of_the_address(self):
         url = "webcal://calendar.google.com/calendar/ical/private-SECRET/basic.ics"
         norm = cal._normalize_feed_url(url)

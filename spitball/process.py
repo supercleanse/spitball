@@ -10,6 +10,7 @@ import difflib
 import json
 import re
 import shutil
+import stat
 import time
 import urllib.error
 import urllib.request
@@ -209,21 +210,55 @@ def check_summary(cfg: dict | None = None) -> dict:
 
 # ------------------------------------------------------------------ pipeline
 
-def _load_cached_transcript(call_dir: Path, cfg: dict) -> dict | None:
-    """The current cache is `.transcript.json` (the normalized shape, any
-    provider). Folders made before this feature only have `.deepgram.json`
-    (Deepgram's raw shape) -- read and normalize it on the fly so old call
-    folders keep reprocessing without a re-transcribe."""
+def _write_json(path: Path, obj) -> None:
+    """A dot-file write (.meta.json, .transcript.json) that is atomic -- a
+    temp file beside it, then os.replace -- so a crash or a second writer
+    mid-write never leaves a truncated cache behind. The file's existing
+    mode is kept."""
+    try:
+        mode = stat.S_IMODE(path.stat().st_mode)
+    except OSError:
+        mode = 0o644
+    config.atomic_write(path, json.dumps(obj), mode=mode)
+
+
+def _read_cached_transcript(call_dir: Path, cfg: dict) -> tuple:
+    """(normalized | None, error). The current cache is `.transcript.json`
+    (the normalized shape, any provider). Folders made before this feature
+    only have `.deepgram.json` (Deepgram's raw shape) -- read and normalize
+    it on the fly so old call folders keep reprocessing without a
+    re-transcribe. A cache that exists but can't be read or parsed is
+    (None, "<why>") rather than an exception, so the caller decides: a
+    re-transcription proceeds without it, everything else refuses."""
     tpath = call_dir / ".transcript.json"
     if tpath.exists():
-        return json.loads(tpath.read_text())
+        try:
+            data = json.loads(tpath.read_text())
+        except (OSError, ValueError) as e:
+            return None, f"{tpath.name} is unreadable ({e.__class__.__name__})"
+        if not isinstance(data, dict) or not isinstance(data.get("utterances"), list):
+            return None, f"{tpath.name} is not a transcript cache"
+        return data, ""
     dg_path = call_dir / ".deepgram.json"
     if dg_path.exists():
         from .providers import deepgram
-        normalized = deepgram.normalize(json.loads(dg_path.read_text()), cfg)
-        tpath.write_text(json.dumps(normalized))  # migrate once; future reprocesses skip the old file
-        return normalized
-    return None
+        try:
+            normalized = deepgram.normalize(json.loads(dg_path.read_text()), cfg)
+        except (OSError, ValueError, KeyError, TypeError) as e:
+            return None, f"{dg_path.name} is unreadable ({e.__class__.__name__})"
+        _write_json(tpath, normalized)  # migrate once; future reprocesses skip the old file
+        return normalized, ""
+    return None, ""
+
+
+def _load_cached_transcript(call_dir: Path, cfg: dict) -> dict | None:
+    """The cache, or None when there is none. An unreadable cache raises a
+    RuntimeError that says how to get past it (`reprocess --retranscribe`
+    rebuilds it from the audio)."""
+    normalized, error = _read_cached_transcript(call_dir, cfg)
+    if error:
+        raise RuntimeError(f"{error}; run `spitball reprocess \"{call_dir}\" --retranscribe` to rebuild it")
+    return normalized
 
 
 def _load_live_transcript(call_dir: Path, cfg: dict) -> dict | None:
@@ -300,6 +335,9 @@ def _transcript_notes(normalized: dict) -> list:
     if failed:
         notes.append(f"**Note:** {failed} part{'s' if failed != 1 else ''} of the audio couldn't be "
                      "transcribed and are marked in the text.")
+    if normalized.get("previous_cache_error"):
+        notes.append(f"**Note:** the earlier transcript cache was unreadable ({normalized['previous_cache_error']}), "
+                     "so this is a fresh transcription; any hand-set speaker names from before could not be carried over.")
     return notes
 
 
@@ -341,7 +379,7 @@ def process(call_dir: Path, meta: dict, cfg: dict | None = None, notify=None,
     audio = call_dir / "audio.opus"
     meta_path = call_dir / ".meta.json"
     if meta:
-        meta_path.write_text(json.dumps(meta))
+        _write_json(meta_path, meta)
     else:
         meta = json.loads(meta_path.read_text())
 
@@ -351,7 +389,7 @@ def process(call_dir: Path, meta: dict, cfg: dict | None = None, notify=None,
     # events into .meta.json at record start; the decision is made here,
     # once the duration is known. Never raises; None when the calendar is off.
     decision = calendar.for_call(meta, cfg, meta["duration"])
-    meta_path.write_text(json.dumps(meta))  # the snapshot/decision travels with the folder
+    _write_json(meta_path, meta)  # the snapshot/decision travels with the folder
     event = decision["event"] if decision else None
     header = _base_header(meta, decision)
     use_event_title = bool(event) and bool(cfg.get("calendar_prefer_event_title", True))
@@ -364,7 +402,15 @@ def process(call_dir: Path, meta: dict, cfg: dict | None = None, notify=None,
 
     # The old cache is read even on a re-transcription: its hand-set
     # speaker names (`spitball speakers`) are carried onto the fresh result.
-    previous = _load_cached_transcript(call_dir, cfg)
+    # An unreadable cache (a truncated .transcript.json) is what a
+    # re-transcription exists to get past, so there it only means "no
+    # previous speaker names", said out loud; a plain reprocess refuses.
+    previous, cache_error = _read_cached_transcript(call_dir, cfg)
+    if cache_error and not retranscribe:
+        raise RuntimeError(f"{cache_error}; run `spitball reprocess \"{call_dir}\" --retranscribe` to rebuild it")
+    if cache_error and notify:
+        notify(f"The earlier transcript cache was unreadable ({cache_error}); re-transcribing without it, "
+               "so any hand-set speaker names from it could not be carried over.")
     cached = None if retranscribe else previous
     if cached is not None:
         normalized = cached
@@ -390,18 +436,20 @@ def process(call_dir: Path, meta: dict, cfg: dict | None = None, notify=None,
             dropped = speakers.carry_user_names(previous, normalized, cfg)
             if dropped and notify:
                 notify(speakers.dropped_line(dropped).replace("**Note:** ", ""))
+        if cache_error:
+            normalized["previous_cache_error"] = cache_error  # surfaces as a header note (_transcript_notes)
     if meeting:
         normalized["meeting"] = meeting
     else:
         normalized.pop("meeting", None)
-    (call_dir / ".transcript.json").write_text(json.dumps(normalized))
+    _write_json(call_dir / ".transcript.json", normalized)
 
     # Speaker naming (spitball/speakers.py): who each far-side voice is,
     # from the invitees' names and what people say. Reads the transcript
     # with neutral labels; user renames from an earlier run survive.
     neutral = _render_lines(build_transcript(normalized, cfg, named=False))
     naming = speakers.resolve(normalized, cfg, neutral)
-    (call_dir / ".transcript.json").write_text(json.dumps(normalized))
+    _write_json(call_dir / ".transcript.json", normalized)
 
     notes = _transcript_notes(normalized) + _speaker_lines(normalized, cfg, naming["error"])
     if notes:
@@ -446,7 +494,7 @@ def process(call_dir: Path, meta: dict, cfg: dict | None = None, notify=None,
         if not final_dir.exists():
             call_dir.rename(final_dir)
             meta["titled"] = True
-            (final_dir / ".meta.json").write_text(json.dumps(meta))
+            _write_json(final_dir / ".meta.json", meta)
         else:
             final_dir = call_dir
 
@@ -513,7 +561,7 @@ def rename_speaker(call_dir: Path, n: int, name: str, cfg: dict | None = None) -
     old = _label_map(normalized, cfg)
     speakers.set_name(normalized, cfg, n, name)
     new = _label_map(normalized, cfg)
-    (call_dir / ".transcript.json").write_text(json.dumps(normalized))
+    _write_json(call_dir / ".transcript.json", normalized)
     rerender(call_dir, cfg, label_change=(old, new))
     return speakers.listing(normalized, cfg)
 
@@ -537,7 +585,7 @@ def set_calendar_override(call_dir: Path, event_id: str | None) -> None:
     if not isinstance(cal, dict):
         cal = meta["calendar"] = {}
     cal["override"] = {"event": event_id}
-    meta_path.write_text(json.dumps(meta))
+    _write_json(meta_path, meta)
 
 
 def audio_seconds(audio: Path) -> float:

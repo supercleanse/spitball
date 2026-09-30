@@ -32,6 +32,7 @@ import re
 import subprocess
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -1601,12 +1602,27 @@ def scrub_for_model(text: str, cfg: dict | None = None) -> str:
     are replaced, and the configured feed address (the credential, in any
     of its forms) is stripped. Only the address in config/env is checked
     here -- never the `_command` form, so this stays free of subprocesses."""
-    text = scrub_addresses(text)
     cfg = cfg or {}
     url = str(cfg.get("calendar_ics_url") or os.environ.get(config.SECRET_ENV.get("calendar_ics_url", ""), "") or "")
     if url:
-        text = _redact(text, url, _normalize_feed_url(url) or "")
-    return text
+        # The URL first, before anything alters the text it has to match:
+        # a feed address with an unescaped "@" in its path would otherwise
+        # be changed by the address scrub and its private token survive.
+        # Matched in every spelling: as given, normalized, percent-decoded,
+        # and with "@" encoded, each with or without its scheme (_redact).
+        forms = []
+        for u in (url, _normalize_feed_url(url) or ""):
+            if not u:
+                continue
+            forms += [u, urllib.parse.unquote(u), u.replace("@", "%40"), urllib.parse.unquote(u).replace("@", "%40")]
+        text = _redact(text, *forms)
+    text = _PRIVATE_SEGMENT_RE.sub("private-<token>", text)  # belt and braces, configured or not
+    return scrub_addresses(text)
+
+
+# A Google-style secret path segment ("/ical/<who>/private-<token>/basic.ics"),
+# blanked wherever it appears even when no feed address is configured.
+_PRIVATE_SEGMENT_RE = re.compile(r"private-[A-Za-z0-9_\-]{6,}")
 
 
 def meeting_record(decision: dict | None) -> dict | None:

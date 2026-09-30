@@ -3,6 +3,7 @@ import io
 import json
 import os
 import re
+import stat
 import tempfile
 import threading
 import time
@@ -1186,6 +1187,44 @@ class TestSpeakersInPipeline(TestProcessPipeline):
         process.rename_speaker(final_dir, 2, "Alex D.", self.cfg)
         self.assertNotIn("carried over", (final_dir / "transcript.md").read_text())
         self.assertNotIn("speakers_dropped", json.loads((final_dir / ".transcript.json").read_text()))
+
+    def test_retranscribe_gets_past_a_corrupt_cache_and_says_so(self):
+        # Codex review 4: a truncated .transcript.json made --retranscribe
+        # fail before it could rebuild the very file that was broken.
+        result, _, _, _ = self._run(None)
+        final_dir = Path(result["dir"])
+        process.rename_speaker(final_dir, 1, "Alice", self.cfg)
+        tpath = final_dir / ".transcript.json"
+        tpath.write_text(tpath.read_text()[:40])  # truncated mid-write
+        os.chmod(tpath, 0o600)
+        # A plain reprocess (and the speakers CLI) refuse with the way out.
+        with self.assertRaises(RuntimeError) as ctx:
+            process.process(final_dir, {}, self.cfg)
+        self.assertIn("--retranscribe", str(ctx.exception))
+        self.assertIn("unreadable", str(ctx.exception))
+        with self.assertRaises(RuntimeError):
+            process.list_speakers(final_dir, self.cfg)
+        notes = []
+        with mock.patch("spitball.calendar.for_call", return_value=None), \
+             mock.patch("spitball.process.transcribe", return_value=self._retranscribed([2, 5])) as t, \
+             mock.patch("spitball.speakers._chat", side_effect=AssertionError("no model")), \
+             mock.patch("spitball.process.summarize", return_value="# T\n\n## Summary\n- x"):
+            process.process(final_dir, {}, self.cfg, notify=notes.append, retranscribe=True)
+        t.assert_called_once()
+        cache = json.loads(tpath.read_text())
+        self.assertEqual(cache["speakers"]["1"]["name"], "")  # nothing to carry from a cache we couldn't read
+        self.assertIn("JSONDecodeError", cache["previous_cache_error"])
+        self.assertTrue([n for n in notes if "unreadable" in n and "re-transcribing without it" in n], notes)
+        self.assertIn("**Note:** the earlier transcript cache was unreadable (.transcript.json is unreadable (JSONDecodeError))",
+                      (final_dir / "transcript.md").read_text())
+        # The rewrite was atomic and kept the file's mode; no temp file is left behind.
+        self.assertEqual(stat.S_IMODE(tpath.stat().st_mode), 0o600)
+        self.assertEqual([p.name for p in final_dir.iterdir() if p.name.endswith(".tmp")], [])
+        self.assertEqual(stat.S_IMODE((final_dir / ".meta.json").stat().st_mode) & 0o777, stat.S_IMODE((final_dir / ".meta.json").stat().st_mode))
+        # A cache that is JSON but not a transcript is refused the same way.
+        tpath.write_text('{"not": "a transcript"}')
+        with self.assertRaises(RuntimeError):
+            process.process(final_dir, {}, self.cfg)
 
     def test_plain_reprocess_never_reports_dropped_names(self):
         result, _, _, _ = self._run(None)

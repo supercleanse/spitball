@@ -329,7 +329,13 @@ command prints it, and the headers carry `**Note:** re-transcribing changed the
 far-side voices (provider changed (deepgram → local)), so 1 hand-set name could not
 be carried over: …`. The record stays through plain reprocesses until `spitball
 speakers` sets that name again or the next `--retranscribe` replaces it. A plain
-`reprocess` never writes it. Nothing else in the cache is keyed by speaker id: the
+`reprocess` never writes it. An unreadable `.transcript.json` (truncated, not JSON,
+not a transcript) makes a plain `reprocess` and `spitball speakers` refuse with a
+message pointing at `--retranscribe`, which proceeds without it, says so on the CLI,
+and records `previous_cache_error` in the new cache (a `**Note:**` header line),
+since no hand-set names could be carried. Both dot-files are written atomically (a
+temp file beside them, then `os.replace`, mode kept), so a crash mid-write cannot
+leave that state behind. Nothing else in the cache is keyed by speaker id: the
 `speakers` block is the only cross-run state that follows a voice, `diarization`
 and `mic_denoise` are rewritten by whichever provider run produced the transcript,
 `meeting` is rewritten every run, and `.live.json` is reused only on a first run
