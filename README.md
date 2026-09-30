@@ -132,8 +132,22 @@ a bad state.
 Already on a stock Omarchy install: `python3`, `ffmpeg`, `pactl` (part of
 `libpulse`), `notify-send`, and [voxtype](https://voxtype.io) (Omarchy's own
 dictation tool — Spitball's default transcription provider runs on it, on-device,
-with no key and no setup). Spitball's own code is Python standard library only —
-no `pip install`, no virtualenv.
+with no key and no setup). Spitball's own code is Python standard library only and
+runs on the system `python3`, with no `pip install` needed.
+
+Optional, for the fast live transcript: `spitball live setup` creates a small
+virtualenv at `~/.local/share/spitball/live-engine/venv` (about 130 MB) and installs
+[onnx-asr](https://github.com/istupakov/onnx-asr), onnxruntime, numpy, and
+sentencepiece into it from PyPI. It uses [uv](https://docs.astral.sh/uv/) when it's
+on your PATH, otherwise `python3 -m venv` and pip. Nothing outside that folder is
+installed, and deleting the folder removes it. Without it, the live transcript still
+works, just a few seconds slower (see [Live transcript](#live-transcript)).
+
+Switching voxtype between its Whisper and Parakeet engines from Settings asks for
+your password (a graphical `pkexec` prompt, or `sudo` in a terminal as a fallback),
+because voxtype's own `voxtype setup onnx` needs root. Spitball then restarts the
+voxtype user service (`systemctl --user restart voxtype`). Nothing else Spitball does
+needs elevated rights.
 
 Want cloud transcription instead? Switch `transcription_provider` to `deepgram`
 and set a **Deepgram API key** — new accounts get free credit to start, and
