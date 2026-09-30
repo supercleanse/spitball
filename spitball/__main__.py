@@ -19,15 +19,20 @@ USAGE = """usage: spitball <command>
   open-last                 open the last call's summary
   open-folder               open the calls folder
   status [--json]           show the current state
-  reprocess <call-dir> [--retranscribe]
-                             redo transcription + summary for one call
+  reprocess <call-dir> [--retranscribe] [--event <id> | --no-event]
+                             redo transcription + summary for one call; --event/--no-event
+                             pin or clear its calendar match by hand
   config get [--json]       show effective settings (secrets masked)
   config set <key> <value>  set one setting (JSON-typed)
-  config set-secret <key>   set a secret from stdin (deepgram_api_key, summary_api_key)
+  config set-secret <key>   set a secret from stdin (deepgram_api_key, summary_api_key,
+                             calendar_ics_url)
   config unset <key>        remove a setting override, back to its default
   check transcription [--provider P] [--json]
                              test the configured (or given) transcription provider
   check summary [--json]    test the summary endpoint
+  calendar test [--at TIME] [--app APP] [--meet CODE] [--refresh] [--json]
+                             which calendar event a call starting now (or at TIME:
+                             "14:30", "2026-09-30 14:30", ISO 8601, or epoch) would match
   local info [--json]       what voxtype is currently configured with
   local models [--json]     every whisper/parakeet model voxtype knows about
   local set-model <name>    switch voxtype to that model in the background (progress in model.json)
@@ -210,6 +215,31 @@ def _local_cmd(rest: list) -> int:
     return 2
 
 
+def _calendar_cmd(rest: list) -> int:
+    sub = rest[0] if rest else ""
+    from . import calendar
+
+    if sub == "test":
+        cfg = config.load()
+        try:
+            at = calendar.parse_at(_flag_value(rest, "--at") or "now")
+        except (ValueError, TypeError) as e:
+            print(f"bad --at value ({e}); use \"14:30\", \"2026-09-30 14:30\", ISO 8601, or epoch seconds",
+                  file=sys.stderr)
+            return 2
+        meet = _flag_value(rest, "--meet")
+        rep = calendar.test_report(cfg, at, app=_flag_value(rest, "--app") or "",
+                                   meet_codes=[meet.lower()] if meet else [], refresh="--refresh" in rest)
+        if "--json" in rest:
+            print(json.dumps(rep))
+        else:
+            print(calendar.format_test_report(rep))
+        return 0 if rep.get("ok") else 1
+
+    print(USAGE)
+    return 2
+
+
 def _live_cmd(rest: list) -> int:
     sub = rest[0] if rest else ""
     from . import live_engine
@@ -253,19 +283,26 @@ def main(argv=None) -> int:
         return 0
     if cmd == "reprocess":
         retranscribe = "--retranscribe" in rest
-        dirs = [a for a in rest if a != "--retranscribe"]
-        if not dirs:
+        event_id = _flag_value(rest, "--event")
+        no_event = "--no-event" in rest
+        skip = {"--retranscribe", "--no-event", "--event"}
+        dirs = [a for i, a in enumerate(rest) if a not in skip and (i == 0 or rest[i - 1] != "--event")]
+        if not dirs or (event_id is not None and no_event):
             print(USAGE)
             return 2
         from . import process
-        r = process.process(Path(dirs[0]).expanduser().resolve(), {}, notify=print,
-                             retranscribe=retranscribe)
+        call_dir = Path(dirs[0]).expanduser().resolve()
+        if event_id is not None or no_event:
+            process.set_calendar_override(call_dir, None if no_event else event_id)
+        r = process.process(call_dir, {}, notify=print, retranscribe=retranscribe)
         print(f"{r['title']}\n{r['summary']}")
         return 0
     if cmd == "config":
         return _config_cmd(rest)
     if cmd == "check":
         return _check_cmd(rest)
+    if cmd == "calendar":
+        return _calendar_cmd(rest)
     if cmd == "local":
         return _local_cmd(rest)
     if cmd == "live":

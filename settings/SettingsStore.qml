@@ -365,6 +365,8 @@ QtObject {
   property string deepgramTestMsg: ""
   property bool summaryTesting: false
   property string summaryTestMsg: ""
+  property bool calendarTesting: false
+  property string calendarTestMsg: ""
 
   function checkResultText(ok, data) {
     if (!ok || !data) return "✗ Couldn't reach spitball"
@@ -387,6 +389,19 @@ QtObject {
       root.summaryTesting = false
       root.summaryTestMsg = root.checkResultText(ok, data)
       if (ok && data && Array.isArray(data.models) && data.models.length) root.summaryModels = data.models
+    })
+  }
+
+  // `spitball calendar test --json`: fetches (or reuses the cached) feed, or
+  // runs calendar_command, and reports the match for a call starting now.
+  // A real network call for the ICS source; nothing opens a window, so no
+  // layering dance is needed.
+  function testCalendar() {
+    root.calendarTesting = true
+    root.calendarTestMsg = ""
+    root.runCliJson(["calendar", "test", "--json"], function(ok, data) {
+      root.calendarTesting = false
+      root.calendarTestMsg = Model.calendarTestText(ok, data)
     })
   }
 

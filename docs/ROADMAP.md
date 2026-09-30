@@ -13,8 +13,14 @@ Four features, in order, per `docs/SPEC-v2.md`:
 
 1. **Settings overlay** (done) -- the centered layer-shell settings window with a
    section nav, replacing the bar dropdown; every config key has a control.
-2. **Calendar** -- match calls to events from a secret ICS feed or a
-   `calendar_command`; fills the Calendar page.
+2. **Calendar** (done) -- match calls to events from a secret ICS feed or a
+   `calendar_command` (`spitball/calendar.py`: stdlib ICS parser + bounded
+   RRULE expander, cached feed, deterministic matcher keyed on the Meet code
+   from window titles); names the folder, heads the transcript, feeds the
+   summarizer, stores `meeting.attendees` in `.transcript.json` for phase 4;
+   `spitball calendar test`; fills the Calendar page. Not done, by design:
+   Google OAuth (no shipped client ID), CalDAV, an `event_title` field in
+   `state.json` for the bar/Live popup.
 3. **Noise** -- `highpass` on the mic split plus `mic_denoise: off|auto|on`
    (RNNoise via ffmpeg `arnndn`, `afftdn` fallback); fills the Audio page.
 4. **Speakers** -- attendee-based naming plus an on-device far-channel split

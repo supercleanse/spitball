@@ -634,3 +634,105 @@ class TestRecover(DaemonTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestCalendarSnapshotWiring(DaemonTestCase):
+    """Daemon.start() writes app/started_at to .meta.json right away and,
+    with calendar_enabled, spawns one background lookup that merges its
+    snapshot into that file -- only while the same call is still recording.
+    stop() keeps the snapshot when it adds the duration. calendar.snapshot()
+    is mocked: no feed, no hyprctl, nothing outside the temp dir."""
+
+    SNAP = {"source": "ics", "fetched_at": 1, "cached": True, "error": "", "app": "Zoom", "started_at": 1790000000.0,
+            "meet_codes": [], "events": [{"id": "e1", "title": "Weekly sync"}], "match": None}
+
+    def test_start_writes_meta_and_snapshot_lands_before_stop(self):
+        d = new_daemon(self.tmp, calendar_enabled=True, min_manual_s=1)
+        rec = make_fake_recording(alive=True, stop_duration=100.0, started_at=1790000000.0)
+        gate = Gate()
+        with track_threads() as threads, \
+             mock.patch("spitball.daemon.Recording", return_value=rec), \
+             mock.patch("spitball.daemon.calendar.snapshot", side_effect=gate.wait_then(lambda *a, **k: dict(self.SNAP))) as snap:
+            d.handle("start")
+            call_dir = d.rec_dir
+            meta = json.loads((call_dir / ".meta.json").read_text())
+            self.assertEqual(meta, {"app": "", "started_at": 1790000000.0})
+            self.assertTrue(gate.entered.wait(5))
+            gate.release.set()
+            [t for t in threads if t.name == "calendar"][0].join(5)
+            snap.assert_called_once_with(d.cfg, 1790000000.0, "")
+            meta = json.loads((call_dir / ".meta.json").read_text())
+            self.assertEqual(meta["calendar"]["events"][0]["title"], "Weekly sync")
+            with mock.patch("spitball.process.process", return_value={"dir": str(call_dir), "title": "T",
+                                                                       "summary": str(call_dir / "summary.md"),
+                                                                       "ended_at": 1}) as proc:
+                d.handle("stop")
+                [t for t in threads if t.name != "calendar"][-1].join(5)
+            passed = proc.call_args.args[1]
+            self.assertEqual(passed["duration"], 100.0)
+            self.assertEqual(passed["calendar"]["events"][0]["title"], "Weekly sync")
+            self.assertEqual(json.loads((call_dir / ".meta.json").read_text())["calendar"]["source"], "ics")
+
+    def test_slow_snapshot_after_stop_is_dropped(self):
+        d = new_daemon(self.tmp, calendar_enabled=True, min_manual_s=1)
+        rec = make_fake_recording(alive=True, stop_duration=100.0, started_at=1790000000.0)
+        gate = Gate()
+        with track_threads() as threads, \
+             mock.patch("spitball.daemon.Recording", return_value=rec), \
+             mock.patch("spitball.daemon.calendar.snapshot", side_effect=gate.wait_then(lambda *a, **k: dict(self.SNAP))):
+            d.handle("start")
+            call_dir = d.rec_dir
+            self.assertTrue(gate.entered.wait(5))
+            with mock.patch("spitball.process.process", return_value={"dir": str(call_dir), "title": "T",
+                                                                       "summary": str(call_dir / "summary.md"),
+                                                                       "ended_at": 1}):
+                d.handle("stop")  # the lookup is still in flight
+                [t for t in threads if t.name != "calendar"][-1].join(5)
+            gate.release.set()
+            [t for t in threads if t.name == "calendar"][0].join(5)
+        meta = json.loads((call_dir / ".meta.json").read_text())
+        self.assertNotIn("calendar", meta)  # process() would look it up itself
+        self.assertEqual(meta["duration"], 100.0)
+
+    def test_disabled_means_no_thread(self):
+        d = new_daemon(self.tmp, calendar_enabled=False)
+        rec = make_fake_recording(alive=True)
+        with track_threads() as threads, mock.patch("spitball.daemon.Recording", return_value=rec), \
+             mock.patch("spitball.daemon.calendar.snapshot") as snap:
+            d.handle("start")
+        self.assertEqual([t for t in threads if t.name == "calendar"], [])
+        snap.assert_not_called()
+
+    def test_snapshot_exception_never_reaches_the_daemon(self):
+        d = new_daemon(self.tmp, calendar_enabled=True)
+        rec = make_fake_recording(alive=True)
+        with track_threads() as threads, mock.patch("spitball.daemon.Recording", return_value=rec), \
+             mock.patch("spitball.daemon.calendar.snapshot", side_effect=RuntimeError("boom")):
+            d.handle("start")
+            [t for t in threads if t.name == "calendar"][0].join(5)
+        self.assertEqual(d.state, "recording")
+        meta = json.loads((d.rec_dir / ".meta.json").read_text())
+        self.assertIn("boom", meta["calendar"]["error"])
+        self.assertEqual(meta["calendar"]["events"], [])
+
+    def test_recover_fills_duration_for_a_start_only_meta(self):
+        d = new_daemon(self.tmp, min_manual_s=1)
+        calls = Path(d.cfg["calls_dir"])
+        call_dir = calls / "2026-09-30-1400-zoom"
+        call_dir.mkdir(parents=True)
+        (call_dir / "audio.opus").write_bytes(b"x")
+        (call_dir / ".meta.json").write_text(json.dumps({"app": "Zoom", "started_at": 1790000000.0,
+                                                          "calendar": {"events": [], "source": "ics"}}))
+        with track_threads() as threads, mock.patch("spitball.daemon.subprocess.run", return_value=mock.Mock(stdout="")), \
+             mock.patch("spitball.process.audio_seconds", return_value=42.0), \
+             mock.patch("spitball.process.process", return_value={"dir": str(call_dir), "title": "T",
+                                                                   "summary": str(call_dir / "summary.md"),
+                                                                   "ended_at": 1}) as proc:
+            d.recover()
+            for t in threads:
+                t.join(5)
+        meta = proc.call_args.args[1]
+        self.assertEqual(meta["duration"], 42.0)
+        self.assertEqual(meta["app"], "Zoom")
+        self.assertEqual(meta["calendar"]["source"], "ics")
+        self.assertEqual(json.loads((call_dir / ".meta.json").read_text())["duration"], 42.0)

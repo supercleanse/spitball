@@ -14,7 +14,7 @@ import time
 import traceback
 from pathlib import Path
 
-from . import config, detect, live, process, providers
+from . import calendar, config, detect, live, process, providers
 from .recorder import Recording
 
 
@@ -136,8 +136,44 @@ class Daemon:
             self.live = live.LiveTranscriber(self.rec_dir, self.rec_dir / "audio.opus",
                                               self.rec.started_at, self.cfg)
             self.live.start()
+            # The facts known at start, so a crash mid-call still leaves a
+            # .meta.json (recover() fills in the duration) and the calendar
+            # snapshot below has something to merge into.
+            (self.rec_dir / ".meta.json").write_text(json.dumps({"app": self.app,
+                                                                 "started_at": self.rec.started_at}))
             self._set("recording", f"Recording {self.app or 'audio'}")
+            if self.cfg.get("calendar_enabled"):
+                threading.Thread(target=self._calendar_snapshot,
+                                 args=(self.rec_dir, self.app, self.rec.started_at),
+                                 daemon=True, name="calendar").start()
             return {"ok": True}
+
+    def _calendar_snapshot(self, call_dir: Path, app: str, started_at: float):
+        """Background: which calendar events could this call be? Fetches the
+        feed (cached), reads Meet codes from window titles, and stores the
+        candidates into the call's .meta.json -- only if that call is still
+        the one recording when it finishes. Off the lock for the slow part,
+        so detection, recording, and stop never wait on it; every failure is
+        recorded in the snapshot rather than raised."""
+        try:
+            snap = calendar.snapshot(self.cfg, started_at, app)
+        except Exception as e:  # calendar.snapshot never raises, but this thread must never die loudly
+            snap = {"error": f"calendar lookup failed ({e.__class__.__name__}: {e})", "events": [],
+                    "started_at": started_at, "app": app, "meet_codes": [], "source": "off",
+                    "fetched_at": 0, "cached": False, "match": None}
+        with self.lock:
+            if self.rec is None or self.rec_dir != call_dir:
+                return  # the call already ended; process() will look it up itself
+            meta_path = call_dir / ".meta.json"
+            try:
+                meta = json.loads(meta_path.read_text())
+            except (OSError, ValueError):
+                meta = {"app": app, "started_at": started_at}
+            meta["calendar"] = snap
+            try:
+                meta_path.write_text(json.dumps(meta))
+            except OSError:
+                pass
 
     def stop(self) -> dict:
         with self.lock:
@@ -163,7 +199,8 @@ class Daemon:
                 notify("Recording discarded", f"Shorter than {int(minimum)} seconds.")
                 self._idle_state()
                 return {"ok": True, "note": "discarded (too short)"}
-            meta = {"app": app, "started_at": rec.started_at, "duration": duration}
+            meta = self._read_meta(call_dir)  # keeps the calendar snapshot written at start
+            meta.update({"app": app, "started_at": rec.started_at, "duration": duration})
             # Written before processing starts, so a restart mid-processing can resume it.
             (call_dir / ".meta.json").write_text(json.dumps(meta))
             self.processing += 1
@@ -171,6 +208,14 @@ class Daemon:
             threading.Thread(target=self._process, args=(call_dir, meta), daemon=True).start()
             self._idle_state()
             return {"ok": True}
+
+    @staticmethod
+    def _read_meta(call_dir: Path) -> dict:
+        try:
+            data = json.loads((call_dir / ".meta.json").read_text())
+            return data if isinstance(data, dict) else {}
+        except (OSError, ValueError):
+            return {}
 
     def _process(self, call_dir: Path, meta: dict):
         def progress(msg):
@@ -319,14 +364,18 @@ class Daemon:
             if not d.is_dir() or not audio.exists() or (d / "summary.md").exists():
                 continue
             meta_path = d / ".meta.json"
-            if meta_path.exists():
-                meta = json.loads(meta_path.read_text())
-            else:  # the daemon died mid-recording: rebuild the facts from the file
+            meta = self._read_meta(d) if meta_path.exists() else {}
+            if "duration" not in meta:
+                # The daemon died mid-recording. start() writes app/started_at
+                # (and maybe a calendar snapshot) at record start; the
+                # duration has to come from the file itself.
                 duration = process.audio_seconds(audio)
                 if duration < self.cfg["min_manual_s"]:
                     process.discard(d)
                     continue
-                meta = {"app": "", "started_at": audio.stat().st_mtime - duration, "duration": duration}
+                meta.setdefault("app", "")
+                meta.setdefault("started_at", audio.stat().st_mtime - duration)
+                meta["duration"] = duration
                 meta_path.write_text(json.dumps(meta))
             with self.lock:
                 self.processing += 1

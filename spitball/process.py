@@ -16,7 +16,7 @@ import urllib.request
 from datetime import datetime
 from pathlib import Path
 
-from . import config, providers
+from . import calendar, config, providers
 from .providers.deepgram import DEEPGRAM_URL  # re-exported: some callers/tests reference it here
 
 MAX_TRANSCRIPT_CHARS = 180_000  # about 3 hours of talk
@@ -114,7 +114,10 @@ Write "None." if there were none.
 - Anything left unresolved. Write "None." if there were none.
 
 Use people's names when the transcript makes them clear. {me} is the speaker
-labeled "{me}". Do not invent facts, names, or dates that are not in the transcript."""
+labeled "{me}". If the notes above the transcript list the people on the
+invite, those are the likely names of the other speakers: use them when the
+transcript supports it, and never assume everyone invited was on the call.
+Do not invent facts, names, or dates that are not in the transcript."""
 
 
 def _post_json(url: str, body: dict | None, key: str, timeout: int) -> dict:
@@ -256,6 +259,17 @@ def process(call_dir: Path, meta: dict, cfg: dict | None = None, notify=None,
               f"**App:** {meta.get('app') or 'Manual'}  \n"
               f"**Length:** {_hms(meta['duration'])}")
 
+    # Calendar (spitball/calendar.py): the daemon snapshots the candidate
+    # events into .meta.json at record start; the decision is made here,
+    # once the duration is known. Never raises; None when the calendar is off.
+    decision = calendar.for_call(meta, cfg, meta["duration"])
+    meta_path.write_text(json.dumps(meta))  # the snapshot/decision travels with the folder
+    event = decision["event"] if decision else None
+    cal_lines = calendar.header_lines(decision)
+    if cal_lines:
+        header += "  \n" + "  \n".join(cal_lines)
+    use_event_title = bool(event) and bool(cfg.get("calendar_prefer_event_title", True))
+
     cached = None if retranscribe else _load_cached_transcript(call_dir, cfg)
     if cached is not None:
         normalized = cached
@@ -267,7 +281,15 @@ def process(call_dir: Path, meta: dict, cfg: dict | None = None, notify=None,
             if notify:
                 notify("Transcribing…")
             normalized = transcribe(audio, cfg)
-        (call_dir / ".transcript.json").write_text(json.dumps(normalized))
+    # `meeting` (CONTRACT.md "Transcript cache"): the matched event's title,
+    # time, and attendees, for later phases (speaker naming reads
+    # `attendees`). Rewritten on every run so a changed match is reflected.
+    meeting = calendar.meeting_record(decision)
+    if meeting:
+        normalized["meeting"] = meeting
+    else:
+        normalized.pop("meeting", None)
+    (call_dir / ".transcript.json").write_text(json.dumps(normalized))
     if normalized.get("note"):  # e.g. the local provider's Whisper-while-Parakeet-downloads fallback
         header += f"  \n**Note:** {normalized['note']}"
     failed = sum(1 for u in normalized.get("utterances", []) if u.get("failed"))
@@ -279,12 +301,21 @@ def process(call_dir: Path, meta: dict, cfg: dict | None = None, notify=None,
 
     if notify:
         notify("Summarizing…")
-    title = f"Call on {started:%B %-d}"
+    title = event["title"] if use_event_title else f"Call on {started:%B %-d}"
+    summary_meta = header.replace("  \n", "\n")
+    context = calendar.summary_context(decision, cfg)
+    if context:
+        summary_meta += "\n" + context
     try:
-        summary = summarize(transcript, header.replace("  \n", "\n"), cfg) if lines else \
+        summary = summarize(transcript, summary_meta, cfg) if lines else \
             f"# {title}\n\nNo speech was detected in this recording."
         m = re.match(r"#\s+(.+)", summary.strip())
-        if m:
+        if use_event_title:
+            # The event's title wins everywhere (folder, transcript, summary)
+            # so the three agree; the model's own heading is dropped.
+            body = summary.strip()[m.end():].lstrip("\n") if m else summary.strip()
+            summary = f"# {title}\n\n{body}"
+        elif m:
             title = m.group(1).strip()
     except Exception as e:  # model down or not set up: keep the transcript, say how to retry
         summary = (f"# {title}\n\nSummary unavailable: {e}\n\n"
@@ -312,6 +343,23 @@ def process(call_dir: Path, meta: dict, cfg: dict | None = None, notify=None,
             f"## Transcript\n\n{transcript}\n")
     return {"dir": str(final_dir), "title": title, "summary": str(final_dir / "summary.md"),
             "ended_at": int(meta["started_at"] + meta["duration"])}
+
+
+def set_calendar_override(call_dir: Path, event_id: str | None) -> None:
+    """`spitball reprocess <dir> --event <id>` / `--no-event`: pin the
+    calendar match to one of the snapshot's candidates (by id, as `spitball
+    calendar test --json` and .meta.json list them) or to none. Stored in
+    .meta.json under calendar.override and honored by every later run."""
+    meta_path = call_dir / ".meta.json"
+    try:
+        meta = json.loads(meta_path.read_text())
+    except (OSError, ValueError):
+        meta = {}
+    cal = meta.get("calendar")
+    if not isinstance(cal, dict):
+        cal = meta["calendar"] = {}
+    cal["override"] = {"event": event_id}
+    meta_path.write_text(json.dumps(meta))
 
 
 def audio_seconds(audio: Path) -> float:

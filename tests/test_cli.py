@@ -229,3 +229,96 @@ class TestReprocess(CliTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestCalendarCommand(CliTestCase):
+    """`spitball calendar test`: reads config.json (isolated), runs the
+    configured source (a `calendar_command` here -- no network), prints the
+    match. Exit 0 when the source works, 1 when it doesn't or isn't set."""
+
+    CMD = ("python3 -c \"import json; print(json.dumps([{'title': 'Weekly sync', "
+           "'start': '2026-09-30T14:00:00-06:00', 'end': '2026-09-30T14:30:00-06:00', "
+           "'attendees': [{'name': 'Alex Demo', 'email': 'alex@example.com'}], "
+           "'conference': 'https://meet.google.com/abc-defg-hij'}]))\"")
+
+    def _write_config(self, **keys):
+        self.config.CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        self.config.CONFIG_FILE.write_text(json.dumps(keys))
+
+    def test_nothing_configured_exits_1_with_json(self):
+        code, out, _ = self.run_main(["calendar", "test", "--json"])
+        self.assertEqual(code, 1)
+        data = json.loads(out)
+        self.assertFalse(data["ok"])
+        self.assertEqual(data["source"], "off")
+        self.assertIn("secret iCal address", data["message"])
+
+    def test_match_at_a_given_time_with_meet_code(self):
+        self._write_config(calendar_source="command", calendar_command=self.CMD)
+        code, out, _ = self.run_main(["calendar", "test", "--at", "2026-09-30T20:03:00Z", "--meet", "ABC-DEFG-HIJ",
+                                      "--app", "Chrome", "--json"])
+        self.assertEqual(code, 0, out)
+        data = json.loads(out)
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["match"]["title"], "Weekly sync")
+        self.assertTrue(data["confident"])
+        self.assertGreaterEqual(data["confidence"], 100)
+        self.assertEqual(data["events_nearby"], 1)
+        code, out, _ = self.run_main(["calendar", "test", "--at", "2026-09-30T20:03:00Z", "--meet", "abc-defg-hij"])
+        self.assertEqual(code, 0)
+        self.assertIn("Match: Weekly sync", out)
+        self.assertIn("Attendees: Alex Demo", out)
+        # Without the Meet code a lone 1:1 with no response of mine stays a weak match.
+        code, out, _ = self.run_main(["calendar", "test", "--at", "2026-09-30T20:03:00Z"])
+        self.assertEqual(code, 0)
+        self.assertIn("Match: none", out)
+        self.assertIn("Candidates:", out)
+
+    def test_no_events_is_still_ok(self):
+        self._write_config(calendar_source="command", calendar_command=self.CMD)
+        code, out, _ = self.run_main(["calendar", "test", "--at", "2027-01-01T20:03:00Z", "--json"])
+        self.assertEqual(code, 0)
+        data = json.loads(out)
+        self.assertTrue(data["ok"])
+        self.assertIsNone(data["match"])
+        self.assertEqual(data["summary"], "no events at that time")
+
+    def test_bad_at_value(self):
+        code, _, err = self.run_main(["calendar", "test", "--at", "sometime"])
+        self.assertEqual(code, 2)
+        self.assertIn("bad --at", err)
+
+    def test_broken_command_exits_1(self):
+        self._write_config(calendar_source="command", calendar_command="exit 7")
+        code, out, _ = self.run_main(["calendar", "test", "--json"])
+        self.assertEqual(code, 1)
+        self.assertIn("exited 7", json.loads(out)["message"])
+
+    def test_unknown_subcommand_prints_usage(self):
+        code, out, _ = self.run_main(["calendar", "wat"])
+        self.assertEqual(code, 2)
+        self.assertIn("usage:", out)
+
+
+class TestReprocessCalendarFlags(CliTestCase):
+    def test_no_event_and_event_flags_set_the_override(self):
+        call_dir = self.tmp / "call"
+        call_dir.mkdir()
+        (call_dir / ".meta.json").write_text(json.dumps({"app": "", "started_at": 1, "duration": 2}))
+        with mock.patch("spitball.process.process", return_value={"title": "T", "summary": "s"}) as proc:
+            code, _, _ = self.run_main(["reprocess", str(call_dir), "--no-event"])
+        self.assertEqual(code, 0)
+        proc.assert_called_once()
+        self.assertEqual(proc.call_args.args[0], call_dir.resolve())
+        self.assertEqual(json.loads((call_dir / ".meta.json").read_text())["calendar"]["override"], {"event": None})
+        with mock.patch("spitball.process.process", return_value={"title": "T", "summary": "s"}) as proc:
+            code, _, _ = self.run_main(["reprocess", "--event", "abc@x", str(call_dir), "--retranscribe"])
+        self.assertEqual(code, 0)
+        self.assertEqual(proc.call_args.args[0], call_dir.resolve())
+        self.assertTrue(proc.call_args.kwargs["retranscribe"])
+        self.assertEqual(json.loads((call_dir / ".meta.json").read_text())["calendar"]["override"], {"event": "abc@x"})
+
+    def test_event_and_no_event_together_is_usage(self):
+        code, out, _ = self.run_main(["reprocess", "/tmp/x", "--event", "a", "--no-event"])
+        self.assertEqual(code, 2)
+        self.assertIn("usage:", out)

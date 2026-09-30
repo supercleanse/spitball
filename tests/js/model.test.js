@@ -580,9 +580,9 @@ test("settingsSections: the ten sections, in the spec's order, each with a label
   }
 });
 
-test("settingsSections: Audio, Speakers and Calendar are the placeholders (later phases fill them)", () => {
+test("settingsSections: Audio and Speakers are the placeholders (Calendar landed in phase 2)", () => {
   const placeholders = Model.settingsSections().filter(x => x.placeholder).map(x => x.id);
-  assert.equal(JSON.stringify(placeholders), JSON.stringify(["audio", "speakers", "calendar"]));
+  assert.equal(JSON.stringify(placeholders), JSON.stringify(["audio", "speakers"]));
 });
 
 test("settingsSections: every page file exists under settings/", () => {
@@ -667,7 +667,7 @@ test("settingsSectionBadge: Transcription says Set up whenever the bar's gear wo
 test("settingsSectionBadge: placeholders say Soon, everything else is blank", () => {
   assert.equal(Model.settingsSectionBadge("audio", null, null), "Soon");
   assert.equal(Model.settingsSectionBadge("speakers", null, null), "Soon");
-  assert.equal(Model.settingsSectionBadge("calendar", null, null), "Soon");
+  assert.equal(Model.settingsSectionBadge("calendar", null, null), "");
   assert.equal(Model.settingsSectionBadge("general", null, null), "");
   assert.equal(Model.settingsSectionBadge("nope", null, null), "");
   assert.equal(Model.settingsSectionBadge(undefined, null, null), "");
@@ -760,4 +760,40 @@ test("presentAppsLine: lists the apps on the mic, or says none", () => {
   assert.equal(Model.presentAppsLine([]), "No call app is using the microphone right now.");
   assert.equal(Model.presentAppsLine(null), "No call app is using the microphone right now.");
   assert.equal(Model.presentAppsLine([""]), "No call app is using the microphone right now.");
+});
+
+// ---------------------------------------------------------------- settings overlay: calendar
+
+test("calendarSourceOptions: ics then command, fresh objects each call", () => {
+  const a = Model.calendarSourceOptions();
+  assert.equal(JSON.stringify(a.map(o => o.value)), JSON.stringify(["ics", "command"]));
+  for (const o of a) assert.equal(typeof o.label, "string");
+  a[0].label = "Mutated";
+  assert.notEqual(Model.calendarSourceOptions()[0].label, "Mutated");
+});
+
+test("calendarSourceChoice: only 'command' is command; everything else is ics", () => {
+  assert.equal(Model.calendarSourceChoice("command"), "command");
+  assert.equal(Model.calendarSourceChoice("ics"), "ics");
+  assert.equal(Model.calendarSourceChoice(""), "ics");
+  assert.equal(Model.calendarSourceChoice(undefined), "ics");
+  assert.equal(Model.calendarSourceChoice("caldav"), "ics");
+});
+
+test("calendarTestText: CLI failure, source failure, match, and no-match lines", () => {
+  assert.equal(Model.calendarTestText(false, null), "✗ Couldn't reach spitball");
+  assert.equal(Model.calendarTestText(true, null), "✗ Couldn't reach spitball");
+  assert.equal(Model.calendarTestText(true, { ok: false, message: "calendar feed: HTTP 404" }),
+    "✗ calendar feed: HTTP 404");
+  assert.equal(Model.calendarTestText(true, { ok: false, error: "no feed address set" }),
+    "✗ no feed address set");
+  assert.equal(Model.calendarTestText(true, { ok: true, source: "ics", match: { title: "Weekly sync" }, confidence: 75 }),
+    "✓ Matched \u201cWeekly sync\u201d (score 75)");
+  assert.equal(Model.calendarTestText(true, { ok: true, source: "ics", match: null, events_nearby: 2,
+    summary: "no confident match (2 candidates, best score 30)" }),
+    "✓ Feed OK; no confident match (2 candidates, best score 30)");
+  assert.equal(Model.calendarTestText(true, { ok: true, source: "command", cached: false, match: null, events_nearby: 0 }),
+    "✓ Command OK; no events at that time");
+  assert.equal(Model.calendarTestText(true, { ok: true, source: "ics", cached: true, match: null, events_nearby: 1 }),
+    "✓ Feed OK (cached); 1 event(s) nearby, no confident match");
 });

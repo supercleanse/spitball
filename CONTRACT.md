@@ -90,6 +90,7 @@ occupies (idle/offline, nothing more important going on). See Widget.qml's
 | `$XDG_RUNTIME_DIR/spitball/ctl.sock` | The Unix control socket (mode `0600`). |
 | `~/.local/state/spitball/persist.json` | Durable bits that survive a daemon restart: `last_call`. (`auto_record` lived here before it moved into `config.json`; a pre-existing value migrates over once, then this file stops carrying it.) |
 | `~/.config/spitball/config.json` | User settings (optional; see README's Configuration section for every key). |
+| `~/.local/state/spitball/calendar/feed.ics`, `feed.json` | The cached calendar feed (mode `0600`, directory `0700`) and its metadata (`fetched_at`, `etag`, `last_modified`, `bytes`, and `key`, a SHA-256 prefix of the feed URL -- never the URL itself). See "Calendar events" below. |
 
 All three env vars `SPITBALL_RUNTIME_DIR`, `SPITBALL_STATE_DIR`, `SPITBALL_CONFIG`
 override the corresponding path — used by the test suite so it never touches a live
@@ -122,13 +123,14 @@ from a checkout.
 | `spitball open-last` | open the last call's `summary.md` |
 | `spitball open-folder` | open the calls folder (`calls_dir`, default `~/Calls`) |
 | `spitball status [--json]` | print the state |
-| `spitball reprocess <call-dir> [--retranscribe]` | redo transcription + summary for one call folder. Reuses the cached transcript (`.transcript.json`, or an old folder's `.deepgram.json`) unless `--retranscribe` is given, which calls the provider again. |
+| `spitball reprocess <call-dir> [--retranscribe] [--event <id> \| --no-event]` | redo transcription + summary for one call folder. Reuses the cached transcript (`.transcript.json`, or an old folder's `.deepgram.json`) unless `--retranscribe` is given, which calls the provider again. `--event <id>` pins the calendar match to one of the snapshot's candidates (ids as listed in `.meta.json` / `calendar test --json`); `--no-event` clears it. Either is stored as `calendar.override` in `.meta.json` and honored by every later run. |
 | `spitball config get [--json]` | effective settings (defaults merged with `config.json`). Each `*_api_key` is masked to `{"set": bool, "source": "config"\|"env"\|"command"\|"none"}` -- the raw value is never printed. |
 | `spitball config set <key> <value>` | sets one setting. Value is JSON-typed (`true`/`false`/numbers parsed; anything else stays a plain string). Unknown keys and the three secret keys (see `set-secret`) are rejected. Preserves every other key already in `config.json`, known or not. Sends `reload` to the daemon afterward (ignored if it's down). |
-| `spitball config set-secret <key>` | reads the value from **stdin**, never argv, for `deepgram_api_key` / `summary_api_key` (phase 2 adds more as new providers land). Empty stdin clears it. Sends `reload`. |
+| `spitball config set-secret <key>` | reads the value from **stdin**, never argv, for `deepgram_api_key` / `summary_api_key` / `calendar_ics_url` (phase 2 adds more as new providers land). Empty stdin clears it. Sends `reload`. |
 | `spitball config unset <key>` | removes a key, back to its default. Sends `reload`. |
 | `spitball check transcription [--provider P] [--json]` | `{"ok": bool, "message": "…"}` -- tests the configured (or given) transcription provider for real: deepgram does an authenticated `GET /v1/projects`; local checks voxtype is on PATH. |
 | `spitball check summary [--json]` | `{"ok": bool, "message": "…", "models": [...]}` from `GET {summary_base_url}/models`. |
+| `spitball calendar test [--at TIME] [--app APP] [--meet CODE] [--refresh] [--json]` | the calendar source's health plus the match for a call starting now (or at `TIME`: `"14:30"`, `"2026-09-30 14:30"`, ISO 8601, or epoch seconds). `--app` / `--meet` supply what a real call would have (the app on the mic, a Meet code from a window title); `--refresh` re-downloads the feed regardless of its age. Works whether or not `calendar_enabled` is on. `--json`: `{"ok", "enabled", "source": "ics"\|"command"\|"off", "message", "error", "events_nearby", "match": <event>\|null, "confident", "confidence", "candidates": [{"id", "title", "start", "end", "score", "filtered", "reasons"}], "summary", "at", "fetched_at", "cached"}`. `ok` is about the source (fetched, or served from the cache); no match is still `ok`. Exit 1 when the source fails or nothing is configured. |
 | `spitball local info [--json]` | what voxtype is actually configured with right now: `{"installed": bool, "engine": "whisper"\|"parakeet"\|"", "model": "...", "onnx": bool, "can_upgrade_parakeet": bool, "message": "..."}`. Spitball never manages this itself -- it's read straight from `voxtype config get`. |
 | `spitball local models [--json]` | every whisper/parakeet model voxtype knows how to download (from `voxtype info models --json`), each `{"name", "engine", "installed", "size_mb", "languages", "recommended", "active"}`. Spitball never downloads any of these -- see `set-model`. |
 | `spitball local set-model <name>` | starts switching voxtype to `name` **in the background** and returns immediately -- see "Model switch file" above. Normally: a detached child re-execs `spitball local _set-model-worker <name>` after a graphical `pkexec voxtype setup onnx --enable/--disable` prompt (only if the engine is actually changing) and `voxtype setup --download --model <name> --activate --progress-format json`, whose NDJSON events feed model.json directly, then, for a parakeet model, `voxtype config set parakeet.streaming true|false` (true only for a streaming-capable model, which also gets the three `streaming_*_secs` window sizes written into voxtype's `[parakeet]` table if missing). Falls back to opening a floating terminal running `bin/spitball-upgrade-parakeet` (the original interactive approach) when `pkexec` is missing or Omarchy's shell doesn't answer `shell ping` (no way to draw a graphical prompt) -- model.json then gets `state: "terminal"` and no further progress. Exit 1 only if neither path could be started at all (no pkexec/agent AND no terminal launcher). Spitball's own process never runs `sudo` or `pkexec` itself, or edits voxtype's config directly. |
@@ -177,6 +179,146 @@ control socket above, and report `daemon not reachable` if nothing answers.
   mid-conversation, so Stop is only ever an explicit menu item or the Live popup's
   button.
 
+## Call folder metadata
+
+`<call-dir>/.meta.json` is written by the daemon at record start (`app`,
+`started_at`), completed at stop (`duration`), and updated by `process()` (`titled`
+once the folder has been renamed, and the calendar decision). `spitball reprocess`
+and crash recovery read it back; a start-only file (the daemon died mid-call) gets its
+`duration` from the audio file.
+
+```json
+{
+  "app": "Chrome",
+  "started_at": 1790000000.0,
+  "duration": 1802.4,
+  "titled": true,
+  "calendar": {
+    "source": "ics",
+    "fetched_at": 1790000001,
+    "cached": true,
+    "error": "",
+    "app": "Chrome",
+    "started_at": 1790000000.0,
+    "meet_codes": ["abc-defg-hij"],
+    "events": [ ...normalized events whose time touches the call... ],
+    "match": {"id": "…", "title": "Weekly sync", "confidence": 170, "confident": true},
+    "override": {"event": "…"}
+  }
+}
+```
+
+`calendar` is present only when the calendar was on (at record start, or at a later
+`process()`/`reprocess` when no snapshot existed yet). `events` is the candidate
+snapshot: every event (see "Calendar events" below) whose span runs from 15 minutes
+before `started_at` to 10 minutes after it, captured once so `reprocess` and offline
+runs see the same picture; `meet_codes` are the Google Meet codes visible in window
+titles at that moment (`hyprctl clients -j`, read-only; titles themselves are never
+stored); `error` is a short reason when the source failed (the recording is never
+affected); `match` is the decision the last `process()` made; `override` exists only
+after `reprocess --event/--no-event`.
+
+## Transcript cache
+
+`<call-dir>/.transcript.json` is the normalized provider shape (`{"provider",
+"model", "utterances": [...]}`, see `spitball/providers/__init__.py`), cached so
+`reprocess` never re-transcribes unless asked. When a call has a confident calendar
+match, `process()` adds a `meeting` block (and removes it again when a later run has
+no match), for the speaker-naming phase and anything else that wants to know who was
+on the invite:
+
+```json
+{
+  "provider": "local", "model": "…", "utterances": [ ... ],
+  "meeting": {
+    "id": "weekly-sync@google.com/2026-09-30T14:00:00-06:00",
+    "title": "Weekly sync",
+    "start": "2026-09-30T14:00:00-06:00",
+    "end": "2026-09-30T14:30:00-06:00",
+    "organizer": {"name": "Alex Demo", "email": "alex@example.com"},
+    "attendees": [
+      {"name": "Alex Demo", "email": "alex@example.com", "response": "accepted", "self": false, "optional": false},
+      {"name": "", "email": "me@example.com", "response": "accepted", "self": true, "optional": false}
+    ],
+    "conference": {"kind": "meet", "url": "https://meet.google.com/abc-defg-hij", "code": "abc-defg-hij"},
+    "confidence": 170
+  }
+}
+```
+
+`attendees` includes you (`self: true`, when the feed identifies you) so a consumer
+can subtract yourself to get the far side; `response` is `accepted` / `declined` /
+`tentative` / `needs_action`; `name` may be empty when the invite carries only an
+address. `spitball speakers` (phase 4) reads this block; it never rewrites it.
+
+## Calendar events
+
+`spitball/calendar.py` normalizes every source to one event shape. This is what
+`.meta.json`'s `events`, `calendar test --json`'s `match`, and a `calendar_command`
+all speak:
+
+```json
+{
+  "id": "uid@google.com/2026-09-30T14:00:00-06:00",
+  "uid": "uid@google.com",
+  "title": "Weekly sync",
+  "start": "2026-09-30T14:00:00-06:00",
+  "end": "2026-09-30T14:30:00-06:00",
+  "all_day": false,
+  "status": "confirmed",
+  "transparency": "opaque",
+  "kind": "default",
+  "my_response": "accepted",
+  "organizer": {"name": "Alex Demo", "email": "alex@example.com"},
+  "attendees": [{"name": "…", "email": "…", "response": "accepted", "self": false, "optional": false}],
+  "conference": {"kind": "meet", "url": "https://meet.google.com/abc-defg-hij", "code": "abc-defg-hij"},
+  "location": "",
+  "description": "…",
+  "recurring": true,
+  "recurrence_id": "2026-09-30T14:00:00-06:00"
+}
+```
+
+| field | meaning |
+|:--|:--|
+| `id` | stable per instance: the UID, plus `/<original instance start>` for an instance of a recurring series |
+| `start`, `end` | ISO 8601 with a UTC offset (the event's own zone); a bare `YYYY-MM-DD` for all-day events |
+| `all_day` | `true` for date-only events (never matched) |
+| `status` | `confirmed` \| `tentative` \| `cancelled` (a canceled event is never matched) |
+| `transparency` | `opaque` \| `transparent` (marked free; never matched) |
+| `kind` | `default`, or one of the kinds that are never matched: `focus`, `out_of_office`, `working_location`, `birthday` -- from the title (Google's feed has no event-type field) and Outlook's busy status |
+| `my_response` | your own reply: `accepted` \| `declined` \| `tentative` \| `needs_action` \| `""` (unknown). Declined is never matched. From the ATTENDEE line whose address is `calendar_my_email`, or, when that's empty, the address that appears on most invites in the feed; the organizer counts as accepted. |
+| `attendees` | every human invitee (rooms/resources dropped), each with `self` |
+| `conference` | the meeting link, or `null`: `kind` `meet` \| `zoom` \| `teams` \| `webex`, and `code` -- the Meet code (`abc-defg-hij`) or Zoom meeting id -- from `X-GOOGLE-CONFERENCE`, LOCATION, URL, Teams' `X-MICROSOFT-SKYPETEAMSMEETINGURL`, or the description |
+| `description` | capped at 4,000 characters |
+
+**`calendar_command` contract.** With `calendar_source: "command"`, Spitball runs
+`calendar_command` through the shell with `SPITBALL_WINDOW_START` /
+`SPITBALL_WINDOW_END` (ISO 8601) in the environment and reads a JSON array of events
+(or `{"events": [...]}`) from stdout. Each event needs at least `title` and `start`;
+`end` defaults to an hour later. Times may be ISO 8601 (an offset is respected; naive
+means local) or epoch seconds; a bare `YYYY-MM-DD` marks an all-day event.
+`attendees` may be objects as above, `"Name <email>"` strings, or bare names;
+`organizer` an object or a name; `conference` an object, a URL string, or omitted
+(`hangoutLink`, `location`, and `description` are then searched for a link).
+Google-API-style names are accepted too (`summary`, `displayName`,
+`responseStatus`, `eventType`, `hangoutLink`). Events outside the window are
+dropped. A non-zero exit, a timeout (20 s), or non-JSON output is reported as the
+source's `error`; recording is never affected.
+
+**Matching.** Candidates are events whose span runs from 15 minutes before the
+recording started to 10 minutes after; hard filters drop all-day, canceled,
+transparent, non-default `kind`, and declined events; the rest score: +100 for a Meet
+code that matches a window title (−50 for a different one, which also forfeits the
+host credit), +30 when the meeting link's host fits the app on the mic (+15 for a
+Zoom/Teams/Webex link with a browser, −30 for a clear conflict such as a Meet link
+with Zoom on the mic), +20 when the recording started during the event, +10 per other
+non-declined invitee up to three, +10 accepted / +5 no reply, −1.5 per minute the
+start is more than 5 minutes from the event's start (capped at −30), and, once the
+duration is known, up to +20 for the share of the recording that fell inside the
+event. The best candidate must score at least 40 and beat the runner-up by 15 or
+there is no match (`confident: false`); `confidence` is the best score either way.
+
 ## Settings overlay
 
 Settings is not a bar dropdown: `SettingsWindow.qml` is a full-screen transparent
@@ -195,6 +337,7 @@ item passes `general`, every setup prompt passes `transcription`). IPC target
 Every value shown comes from `spitball config get --json`; every change goes through
 `config set` / `config set-secret` (stdin) / `config unset` immediately, and the
 other read-only commands in the CLI table (`local info/models`, `live status`,
+`calendar test`,
 `check`, `status`) fill the pages. `settings/SettingsStore.qml` owns all of those
 round trips; pages never spawn processes. Every key in `config.json` has a control.
 

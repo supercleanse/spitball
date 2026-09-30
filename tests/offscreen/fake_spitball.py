@@ -38,6 +38,27 @@ SETTINGS = {
     "min_call_s": 60,
     "min_manual_s": 10,
     "opus_bitrate": "32k",
+    "calendar_enabled": True,
+    "calendar_source": "ics",
+    "calendar_ics_url": {"set": True, "source": "config"},
+    "calendar_ics_url_command": "",
+    "calendar_command": "",
+    "calendar_cache_ttl_s": 900,
+    "calendar_prefer_event_title": True,
+    "calendar_names_to_summary": True,
+    "calendar_description_to_summary": False,
+    "calendar_my_email": "",
+}
+
+# Synthetic: a made-up event, never anything from a real feed.
+CALENDAR_TEST = {
+    "ok": True, "enabled": True, "source": "ics", "message": "feed OK; matched “Weekly sync” (score 75)",
+    "error": "", "events_nearby": 2, "cached": False,
+    "match": {"id": "demo-1", "title": "Weekly sync", "start": "2026-09-30T14:00:00-06:00",
+              "end": "2026-09-30T14:30:00-06:00", "attendees": [
+                  {"name": "Alex Demo", "email": "alex@example.com", "response": "accepted", "self": False}]},
+    "confident": True, "confidence": 75, "summary": "matched “Weekly sync” (score 75)",
+    "candidates": [{"id": "demo-1", "title": "Weekly sync", "score": 75, "filtered": "", "reasons": []}],
 }
 
 LOCAL_INFO = {"installed": True, "engine": "parakeet", "model": "parakeet-unified-en-0.6b",
@@ -99,6 +120,11 @@ def main(argv):
         if sub == "status":
             print(json.dumps(LIVE_STATUS)); return 0
         return 0
+    if cmd == "calendar":
+        sub = rest[0] if rest else ""
+        if sub == "test":
+            print(json.dumps(CALENDAR_TEST)); return 0
+        return 2
     if cmd == "status":
         print(json.dumps(STATUS)); return 0
     if cmd == "pick-folder":

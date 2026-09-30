@@ -246,3 +246,32 @@ class TestConfigReloadReachesDaemon(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestCalendarSecret(ConfigCliTestCase):
+    def test_calendar_ics_url_is_a_secret(self):
+        code, _, err = self.run_main(["config", "set", "calendar_ics_url", "https://x/y.ics"])
+        self.assertEqual(code, 1)
+        self.assertIn("set-secret", err)
+        code, _, _ = self.run_main(["config", "set-secret", "calendar_ics_url"], stdin_text="https://x/private-abc/basic.ics\n")
+        self.assertEqual(code, 0)
+        code, out, _ = self.run_main(["config", "get", "--json"])
+        data = json.loads(out)
+        self.assertEqual(data["calendar_ics_url"], {"set": True, "source": "config"})
+        self.assertNotIn("private-abc", out)
+        self.assertEqual(stat.S_IMODE(self.config.CONFIG_FILE.stat().st_mode), 0o600)
+
+    def test_calendar_keys_have_defaults_and_set_round_trips(self):
+        code, out, _ = self.run_main(["config", "get", "--json"])
+        data = json.loads(out)
+        self.assertFalse(data["calendar_enabled"])
+        self.assertEqual(data["calendar_source"], "ics")
+        self.assertEqual(data["calendar_cache_ttl_s"], 900)
+        self.assertTrue(data["calendar_prefer_event_title"])
+        self.assertTrue(data["calendar_names_to_summary"])
+        self.assertFalse(data["calendar_description_to_summary"])
+        for key, raw, want in (("calendar_enabled", "true", True), ("calendar_source", "command", "command"),
+                               ("calendar_command", "khal-json", "khal-json"), ("calendar_cache_ttl_s", "60", 60),
+                               ("calendar_my_email", "me@example.com", "me@example.com")):
+            self.assertEqual(self.run_main(["config", "set", key, raw])[0], 0)
+            self.assertEqual(json.loads(self.run_main(["config", "get", "--json"])[1])[key], want)

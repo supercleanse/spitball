@@ -435,8 +435,8 @@ function liveShouldAutoScroll(contentY, viewHeight, contentHeight, thresholdPx) 
 // one entry here plus one settings/<Page>.qml file.
 //
 // `placeholder: true` marks a page that ships as "Coming in this release"
-// (Audio, Speakers, Calendar -- filled by later phases); the nav shows it
-// with a "Soon" badge until the flag is dropped.
+// (Audio, Speakers -- filled by later phases; Calendar landed in phase 2);
+// the nav shows it with a "Soon" badge until the flag is dropped.
 
 var SETTINGS_SECTIONS = [
   { id: "general",       label: "General",       page: "GeneralPage.qml" },
@@ -446,10 +446,51 @@ var SETTINGS_SECTIONS = [
   { id: "audio",         label: "Audio",         page: "AudioPage.qml", placeholder: true },
   { id: "speakers",      label: "Speakers",      page: "SpeakersPage.qml", placeholder: true },
   { id: "summary",       label: "Summary",       page: "SummaryPage.qml" },
-  { id: "calendar",      label: "Calendar",      page: "CalendarPage.qml", placeholder: true },
+  { id: "calendar",      label: "Calendar",      page: "CalendarPage.qml" },
   { id: "storage",       label: "Storage",       page: "StoragePage.qml" },
   { id: "about",         label: "About",         page: "AboutPage.qml" }
 ]
+
+// ------------------------------------------------------------ calendar page
+// `calendar_source` picks where events come from (docs/SPEC-v2.md §2): the
+// secret iCal/ICS address (fetched + cached by spitball/calendar.py) or the
+// user's own command printing normalized JSON events.
+var CALENDAR_SOURCES = [
+  { value: "ics",     label: "Secret iCal/ICS address" },
+  { value: "command", label: "Your own command" }
+]
+
+function calendarSourceOptions() {
+  var out = []
+  for (var i = 0; i < CALENDAR_SOURCES.length; i++) {
+    out.push({ value: CALENDAR_SOURCES[i].value, label: CALENDAR_SOURCES[i].label })
+  }
+  return out
+}
+
+// Anything unknown (including the old-config case of no key at all) reads
+// as the built-in ICS source, matching config.DEFAULTS.
+function calendarSourceChoice(value) {
+  return String(value || "") === "command" ? "command" : "ics"
+}
+
+// The Test button's result line, from `spitball calendar test --json`
+// ({ok, source, message, match, confidence, confident, summary,
+// events_nearby}). `ok` is about the source; a match is reported on top of
+// it, never required for a ✓.
+function calendarTestText(ok, data) {
+  if (!ok || !data || typeof data !== "object") return "✗ Couldn't reach spitball"
+  if (!data.ok) return "✗ " + (data.message || data.error || "Failed")
+  var m = data.match
+  if (m && m.title) {
+    return "✓ Matched “" + String(m.title) + "” (score " + Number(data.confidence || 0) + ")"
+  }
+  var n = Number(data.events_nearby || 0)
+  var src = data.source === "command" ? "Command OK" : "Feed OK"
+  if (data.cached) src += " (cached)"
+  var tail = data.summary ? String(data.summary) : (n ? n + " event(s) nearby, no confident match" : "no events at that time")
+  return "✓ " + src + "; " + tail
+}
 
 // A fresh copy each call (one new object per entry), so a caller can't
 // mutate the source list.

@@ -738,3 +738,161 @@ class TestLiveTranscriptReuse(TestProcessPipeline):
         with p_transcribe as t, p_summarize:
             process.process(self.call_dir, self.meta, cfg, retranscribe=True)
         t.assert_called_once()
+
+
+class TestCalendarInPipeline(TestProcessPipeline):
+    """The calendar's hooks in process() (docs/SPEC-v2.md §2): a confident
+    match names the folder after the event, heads transcript.md/summary.md
+    with the meeting + attendees, stores `meeting` in .transcript.json, and
+    feeds the invite list to the summarizer; a weak match changes nothing
+    but a header line; off means byte-for-byte the old behavior."""
+
+    T = 1790000000  # the pipeline's started_at; events are placed relative to it
+
+    def _event(self, title="Weekly sync", offset_s=-120, minutes=30, attendees=2, **extra):
+        from datetime import datetime, timedelta, timezone
+        from spitball import calendar as cal
+        s = datetime.fromtimestamp(self.T + offset_s, tz=timezone.utc)
+        people = [{"name": f"Person {i}", "email": f"p{i}@example.com", "response": "accepted",
+                   "self": False, "optional": False} for i in range(attendees)]
+        people.append({"name": "", "email": "owner@example.com", "response": "accepted", "self": True,
+                       "optional": False})
+        ev = {"id": f"{title}@x", "uid": title, "title": title, "start": cal.to_iso(s),
+              "end": cal.to_iso(s + timedelta(minutes=minutes)), "all_day": False, "status": "confirmed",
+              "transparency": "opaque", "kind": "default", "my_response": "accepted",
+              "organizer": {"name": "Person 0", "email": "p0@example.com"}, "attendees": people,
+              "conference": {"kind": "meet", "url": "https://meet.google.com/abc-defg-hij", "code": "abc-defg-hij"},
+              "location": "", "description": "Agenda: numbers", "recurring": False, "recurrence_id": ""}
+        ev.update(extra)
+        return ev
+
+    def _meta(self, events, meet_codes=(), **over):
+        meta = dict(self.meta)
+        meta["calendar"] = {"source": "ics", "fetched_at": 1, "cached": False, "error": "", "app": "Chrome",
+                            "started_at": self.T, "meet_codes": list(meet_codes), "events": events, "match": None}
+        meta.update(over)
+        return meta
+
+    def test_confident_match_names_folder_headers_and_transcript_json(self):
+        cfg = dict(self.cfg, calendar_enabled=True)
+        p_transcribe, p_summarize = self._patched()
+        with p_transcribe, p_summarize as summ:
+            result = process.process(self.call_dir, self._meta([self._event()], ["abc-defg-hij"]), cfg)
+        final_dir = Path(result["dir"])
+        self.assertTrue(final_dir.name.endswith("-zoom-weekly-sync"), final_dir.name)
+        self.assertEqual(result["title"], "Weekly sync")
+        transcript = (final_dir / "transcript.md").read_text()
+        self.assertTrue(transcript.startswith("# Weekly sync: transcript\n"))
+        self.assertIn("**Meeting:** Weekly sync  \n**When:** ", transcript)
+        self.assertIn("**Attendees:** Person 0 (organizer), Person 1", transcript)
+        summary = (final_dir / "summary.md").read_text()
+        self.assertTrue(summary.startswith("# Weekly sync\n\n## Summary\n- talked"), summary[:80])
+        self.assertNotIn("Weekly Sync With Morgan", summary)  # the model's heading is replaced
+        self.assertIn("**Meeting:** Weekly sync", summary)
+        meta_text = summ.call_args.args[1]
+        self.assertIn("**People on the invite:** Person 0 (organizer), Person 1", meta_text)
+        self.assertNotIn("Agenda: numbers", meta_text)  # description off by default
+        cache = json.loads((final_dir / ".transcript.json").read_text())
+        self.assertEqual(cache["meeting"]["title"], "Weekly sync")
+        self.assertEqual([a["name"] for a in cache["meeting"]["attendees"]], ["Person 0", "Person 1", ""])
+        self.assertTrue(cache["meeting"]["attendees"][2]["self"])
+        saved = json.loads((final_dir / ".meta.json").read_text())
+        self.assertEqual(saved["calendar"]["match"]["title"], "Weekly sync")
+        self.assertTrue(saved["titled"])
+
+    def test_prefer_event_title_off_keeps_model_title_but_adds_header(self):
+        cfg = dict(self.cfg, calendar_enabled=True, calendar_prefer_event_title=False)
+        p_transcribe, p_summarize = self._patched()
+        with p_transcribe, p_summarize:
+            result = process.process(self.call_dir, self._meta([self._event()], ["abc-defg-hij"]), cfg)
+        final_dir = Path(result["dir"])
+        self.assertTrue(final_dir.name.endswith("-weekly-sync-with-morgan"))
+        self.assertEqual(result["title"], "Weekly Sync With Morgan")
+        self.assertIn("**Meeting:** Weekly sync", (final_dir / "transcript.md").read_text())
+        self.assertIn("meeting", json.loads((final_dir / ".transcript.json").read_text()))
+
+    def test_weak_match_never_renames_and_says_so(self):
+        cfg = dict(self.cfg, calendar_enabled=True)
+        events = [self._event("Weekly sync"), self._event("Design review")]  # a tie
+        p_transcribe, p_summarize = self._patched()
+        with p_transcribe, p_summarize as summ:
+            result = process.process(self.call_dir, self._meta(events), cfg)
+        final_dir = Path(result["dir"])
+        self.assertTrue(final_dir.name.endswith("-weekly-sync-with-morgan"))
+        transcript = (final_dir / "transcript.md").read_text()
+        self.assertIn("**Calendar:** no confident match (2 candidates)", transcript)
+        self.assertNotIn("**Meeting:**", transcript)
+        self.assertNotIn("People on the invite", summ.call_args.args[1])
+        self.assertNotIn("meeting", json.loads((final_dir / ".transcript.json").read_text()))
+        self.assertFalse(json.loads((final_dir / ".meta.json").read_text())["calendar"]["match"]["confident"])
+
+    def test_description_sent_only_when_enabled(self):
+        cfg = dict(self.cfg, calendar_enabled=True, calendar_description_to_summary=True)
+        p_transcribe, p_summarize = self._patched()
+        with p_transcribe, p_summarize as summ:
+            process.process(self.call_dir, self._meta([self._event()], ["abc-defg-hij"]), cfg)
+        self.assertIn("**Event description:**\nAgenda: numbers", summ.call_args.args[1])
+
+    def test_no_snapshot_and_calendar_off_is_unchanged(self):
+        p_transcribe, p_summarize = self._patched()
+        with p_transcribe, p_summarize as summ:
+            result = process.process(self.call_dir, self.meta, self.cfg)
+        final_dir = Path(result["dir"])
+        self.assertNotIn("Calendar", (final_dir / "transcript.md").read_text())
+        self.assertNotIn("Meeting", summ.call_args.args[1])
+        self.assertNotIn("calendar", json.loads((final_dir / ".meta.json").read_text()))
+        self.assertNotIn("meeting", json.loads((final_dir / ".transcript.json").read_text()))
+
+    def test_no_snapshot_but_enabled_looks_up_now(self):
+        from spitball import calendar as cal
+        cfg = dict(self.cfg, calendar_enabled=True, calendar_source="command",
+                   calendar_command="echo '[]'")
+        p_transcribe, p_summarize = self._patched()
+        with p_transcribe, p_summarize, mock.patch("spitball.calendar.snapshot", wraps=cal.snapshot) as snap:
+            result = process.process(self.call_dir, self.meta, cfg)
+        snap.assert_called_once()
+        saved = json.loads((Path(result["dir"]) / ".meta.json").read_text())
+        self.assertEqual(saved["calendar"]["source"], "command")
+        self.assertEqual(saved["calendar"]["events"], [])
+
+    def test_reprocess_keeps_the_snapshot_and_override_pins_the_event(self):
+        cfg = dict(self.cfg, calendar_enabled=True)
+        events = [self._event("Weekly sync"), self._event("Design review")]
+        p_transcribe, p_summarize = self._patched()
+        with p_transcribe, p_summarize:
+            result = process.process(self.call_dir, self._meta(events), cfg)
+        final_dir = Path(result["dir"])
+        process.set_calendar_override(final_dir, "Design review@x")
+        p_transcribe2, p_summarize2 = self._patched()
+        with p_transcribe2 as t2, p_summarize2:
+            result2 = process.process(final_dir, {}, cfg)
+        t2.assert_not_called()
+        self.assertEqual(result2["dir"], str(final_dir))  # renamed once, never again
+        self.assertEqual(result2["title"], "Design review")
+        transcript = (final_dir / "transcript.md").read_text()
+        self.assertIn("**Meeting:** Design review", transcript)
+        self.assertTrue(transcript.startswith("# Design review: transcript"))
+        process.set_calendar_override(final_dir, None)
+        p_transcribe3, p_summarize3 = self._patched()
+        with p_transcribe3, p_summarize3:
+            result3 = process.process(final_dir, {}, cfg)
+        self.assertEqual(result3["title"], "Weekly Sync With Morgan")
+        self.assertNotIn("**Meeting:**", (final_dir / "transcript.md").read_text())
+
+    def test_calendar_snapshot_error_never_breaks_processing(self):
+        cfg = dict(self.cfg, calendar_enabled=True)
+        meta = self._meta([], error="calendar feed unreachable (boom)")
+        meta["calendar"]["error"] = "calendar feed unreachable (boom)"
+        p_transcribe, p_summarize = self._patched()
+        with p_transcribe, p_summarize:
+            result = process.process(self.call_dir, meta, cfg)
+        self.assertEqual(result["title"], "Weekly Sync With Morgan")
+        self.assertNotIn("Calendar", (Path(result["dir"]) / "transcript.md").read_text())
+
+    def test_summary_without_heading_still_gets_event_title(self):
+        cfg = dict(self.cfg, calendar_enabled=True)
+        p_transcribe, p_summarize = self._patched(summarize_return="## Summary\n- no heading from the model")
+        with p_transcribe, p_summarize:
+            result = process.process(self.call_dir, self._meta([self._event()], ["abc-defg-hij"]), cfg)
+        summary = (Path(result["dir"]) / "summary.md").read_text()
+        self.assertTrue(summary.startswith("# Weekly sync\n\n## Summary\n- no heading"))

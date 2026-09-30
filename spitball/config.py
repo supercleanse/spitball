@@ -111,18 +111,52 @@ DEFAULTS = {
     "min_call_s": 60,
     "min_manual_s": 10,
     "opus_bitrate": "32k",
+    # Calendar (spitball/calendar.py, docs/SPEC-v2.md §2): match each call to
+    # the meeting it belongs to, then name the folder after it, head the
+    # transcript with the meeting + attendees, and tell the summarizer who
+    # was invited. Off by default; a calendar failure never blocks recording.
+    "calendar_enabled": False,
+    # "ics": a secret iCal/ICS/webcal address (Google Calendar -> Settings ->
+    # the calendar -> "Secret address in iCal format"), fetched and cached.
+    # "command": run `calendar_command` and read normalized JSON events from
+    # its stdout (shape in CONTRACT.md).
+    "calendar_source": "ics",
+    # The feed address IS a credential (anyone holding it can read the
+    # calendar until it is reset), so it's a secret: set-secret only, masked
+    # in `config get`, never logged. `_command` is the password-manager route.
+    "calendar_ics_url": "",
+    "calendar_ics_url_command": "",
+    "calendar_command": "",
+    # Re-download the feed once it's older than this (seconds). The whole
+    # calendar arrives on every fetch (a long-lived calendar is several MB),
+    # so a call never waits on it twice in a row.
+    "calendar_cache_ttl_s": 900,
+    # On a confident match, the event title becomes the call's title (folder
+    # slug, transcript heading, summary heading). Off keeps the summarizer's
+    # own title and adds only the meeting header. A weak match never renames.
+    "calendar_prefer_event_title": True,
+    # Attendee names go to the summarizer (wherever summary_base_url points --
+    # local by default) so it can attribute statements; the description goes
+    # only when explicitly turned on, since it can carry private text.
+    "calendar_names_to_summary": True,
+    "calendar_description_to_summary": False,
+    # Your own address on the calendar, to read your response (declined
+    # invites are skipped). Empty = detect it: the address on nearly every
+    # invite in the feed is the owner's.
+    "calendar_my_email": "",
 }
 
 # The secrets the settings panel/CLI ever handles. Never settable via
 # `config set` (that would put them on argv/in shell history) -- only via
 # `config set-secret`, which reads the value from stdin. (Grows again in
 # phase 2 as more transcription providers add their own key.)
-SECRET_KEYS = ("deepgram_api_key", "summary_api_key")
+SECRET_KEYS = ("deepgram_api_key", "summary_api_key", "calendar_ics_url")
 
 # Secret key -> the environment variable that overrides it (empty = none).
 SECRET_ENV = {
     "deepgram_api_key": "DEEPGRAM_API_KEY",
     "summary_api_key": "",
+    "calendar_ics_url": "",
 }
 
 

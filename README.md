@@ -43,6 +43,12 @@ stops on its own when the call ends, and leaves you a transcript and a summary i
    model configured or reachable just means a transcript instead of a summary;
    `spitball reprocess <dir>` fills the summary in later.
 
+7. **Knows which meeting it was** (optional). Paste your calendar's secret iCal
+   address and Spitball matches each call to the event it belongs to: the folder
+   takes the event's title, the transcript starts with the meeting and its
+   attendees, and the summarizer is told who was invited. See
+   [Calendar](#calendar).
+
 Any click on the widget, left or right, opens its menu: start recording, show the
 live transcript and stop while recording, dismiss the current detection, toggle
 auto-record, open the last call's summary, open the calls folder, or open Settings.
@@ -73,7 +79,7 @@ inside a text field, Esc hands focus back to the section list first.
 | **Audio** | Coming in this release: mic noise reduction. Shows the mic and speaker Spitball would record today. |
 | **Speakers** | Coming in this release: naming the far side and splitting it into speakers. |
 | **Summary** | Summaries on/off, the endpoint, the model (a dropdown when the endpoint lists any), API key, Test, and the key command under Advanced. |
-| **Calendar** | Coming in this release: matching calls to calendar events. |
+| **Calendar** | Matching on/off, the source (a secret iCal/ICS address stored like an API key, or your own command), a Test button that shows what a call starting now would match, whether the event title becomes the call title, what goes to the summarizer (attendee names on by default, the description off), and under Advanced the address command, your calendar email, and the feed refresh interval. See [Calendar](#calendar). |
 | **Storage** | The notes-copy folder (`export_dir`) and a way into the calls folder. |
 | **About** | Version, install path, a status snapshot, and the docs. |
 
@@ -211,8 +217,12 @@ Each call gets its own folder, `~/Calls/<YYYY-MM-DD-HHMM>-<app>-<title-slug>/`:
 | `summary.md` | Title, summary, decisions, action items, open questions. |
 
 The folder isn't named with a title until processing finishes — it starts as
-`<timestamp>-<app>` and gets a slug of the generated title appended once transcription
-and summarization are done.
+`<timestamp>-<app>` and gets a slug of the title appended once transcription and
+summarization are done: the matched calendar event's title when there is a confident
+match (see [Calendar](#calendar)), otherwise the summarizer's. A few dot-files sit
+beside them: `.meta.json` (the call's facts, plus the calendar candidates snapshotted
+when recording started), `.transcript.json` (the cached transcript, plus the matched
+meeting and its attendees), and `.live.json` (the live transcript, when it ran).
 
 Set `export_dir` and Spitball also copies the summary and full transcript, as one
 markdown file, into that folder — handy for dropping calls straight into an Obsidian
@@ -269,6 +279,66 @@ call folder so `spitball reprocess <dir>` doesn't re-transcribe unless you pass
 `--retranscribe`. `language` picks the spoken language: `"en"` (default), `"auto"`
 (provider-dependent detection), or an ISO code.
 
+## Calendar
+
+Turn on **Match calls to calendar events** on the Calendar page and Spitball works out
+which meeting each call was. There's no Google sign-in and no OAuth client to set up:
+
+1. In Google Calendar, open Settings → your calendar → **Integrate calendar** and copy
+   the **Secret address in iCal format**. Any other ICS/webcal address works the same
+   way (Outlook's "Publish calendar", Fastmail, Nextcloud, Proton…), with whatever
+   attendee detail that provider puts in its feed.
+2. Paste it into **Secret iCal address** and click **Test**.
+
+The address is a credential: anyone holding it can read that calendar until you
+reset it in the same settings page. So Spitball stores it like an API key
+(`spitball config set-secret calendar_ics_url`, masked everywhere, never logged),
+and a `calendar_ics_url_command` variant fetches it from a password manager instead.
+The feed (your whole calendar, several MB for an old one) is downloaded at most once
+per `calendar_cache_ttl_s` (15 minutes) into `~/.local/state/spitball/calendar/`, mode
+600, and a stale copy is used when the download fails.
+
+**What a confident match does.** The call folder is named after the event
+(`2026-09-30-1400-chrome-weekly-sync`), `transcript.md` and `summary.md` open with
+`**Meeting:**`, `**When:**`, and `**Attendees:**` lines, the summarizer is told who
+was on the invite (and, only if you turn it on, the event description), and the
+attendee list is kept in `.transcript.json` for speaker naming. Turn off **Use the
+event title as the call title** to keep the summarizer's own title and add only the
+header. A weak match never renames anything: the header just says
+`**Calendar:** no confident match (2 candidates)`.
+
+**How matching works.** When recording starts, the daemon snapshots every event whose
+time touches the call (from 15 minutes before its start to 10 minutes after its end)
+into the call's `.meta.json`, along with any Google Meet code visible in a window
+title (Chromium titles a Meet tab "Meet – abc-defg-hij"). All-day events, canceled
+ones, ones marked free, focus time, out-of-office, working-location and birthday
+entries, and invites you declined are dropped. The rest are scored: a Meet code that
+matches the event's link is decisive; otherwise it's whether the meeting link fits
+the app on the mic (a Meet link with a browser, a Zoom link with Zoom), whether the
+recording started during the event and how far from its start, how many other people
+were invited, whether you accepted, and, once the call has ended, how much of the
+recording fell inside the event, which is what settles back-to-back meetings. The
+best event has to clear a threshold and beat the runner-up by a margin, or there is
+no match. Recurring series are expanded on the spot (weekly, daily, monthly,
+yearly, `INTERVAL`, `COUNT`, `UNTIL`, `BYDAY` including "last Wednesday", `EXDATE`,
+moved and canceled instances) in the event's own time zone.
+
+Calendar trouble (no network, a reset address, a slow feed) never delays or blocks a
+recording: the lookup runs in the background, and a failure is just noted in
+`.meta.json`. `spitball calendar test` shows the match for a call starting now,
+`--at 14:30` (or a full date/time) for another moment, `--meet abc-defg-hij` /
+`--app Zoom` to add the context a real call would have, and `--json` for the raw
+picture. Got it wrong? `spitball reprocess <dir> --event <id>` pins one of the
+snapshot's candidates (ids are in `.meta.json` and the `--json` output) and
+`--no-event` clears the match; both re-render the transcript and summary.
+
+**Your own source.** Set **Source** to *Your own command* (`calendar_source:
+"command"`) and `calendar_command` to any shell command that prints a JSON array of
+events — the shape is in [CONTRACT.md](CONTRACT.md#calendar-events); only `title`,
+`start`, and `end` are required. The command gets the window as
+`SPITBALL_WINDOW_START`/`SPITBALL_WINDOW_END`. This is how khal/vdirsyncer, gcalcli,
+a CalDAV script, or an Evolution Data Server one-liner plugs into the same matcher.
+
 ## Configuration
 
 Settings live in `~/.config/spitball/config.json`, an optional file — every key has a
@@ -299,6 +369,16 @@ default, and you only need to set the ones you want to change.
 | `min_call_s` | `60` | Discard an auto-detected recording shorter than this. |
 | `min_manual_s` | `10` | Discard a manually-started recording shorter than this. |
 | `opus_bitrate` | `32k` | ffmpeg's Opus encoding bitrate. |
+| `calendar_enabled` | `false` | Match each call to a calendar event (see [Calendar](#calendar)). |
+| `calendar_source` | `"ics"` | `"ics"` (the secret address below) or `"command"` (`calendar_command`). |
+| `calendar_ics_url` | `""` | The secret iCal/ICS/webcal address. A secret: `set-secret` only, masked in `config get`. |
+| `calendar_ics_url_command` | `""` | A shell command whose stdout is that address, for a password manager. |
+| `calendar_command` | `""` | A shell command printing a JSON array of events (shape in CONTRACT.md); used when `calendar_source` is `"command"`. |
+| `calendar_cache_ttl_s` | `900` | Re-download the feed once the cached copy is older than this many seconds. |
+| `calendar_prefer_event_title` | `true` | On a confident match, the event's title becomes the call's title (folder, transcript, summary). `false` keeps the summarizer's title and adds only the meeting header. |
+| `calendar_names_to_summary` | `true` | Tell the summarizer who was on the invite. |
+| `calendar_description_to_summary` | `false` | Also send the event description to the summarizer. Off by default: it can carry private text. |
+| `calendar_my_email` | `""` | Your address on the calendar, so your own response is read (declined invites are skipped). Empty: the address on nearly every invite in the feed is taken as yours. |
 
 The Deepgram key can also come from the `DEEPGRAM_API_KEY` environment variable,
 which wins over both config keys — useful if you'd rather manage it outside the
@@ -319,13 +399,14 @@ spitball config unset export_dir                 # back to the default
 `config set`/`set-secret`/`unset` write atomically, make `config.json` mode `600`
 once it holds a secret, and reload the running daemon automatically (falls back to
 nothing happening — no crash — if the daemon isn't up). `set` rejects unknown keys
-and the secret keys themselves (`deepgram_api_key`, `summary_api_key`) — those go
-through `set-secret`, which reads the value from stdin so it never lands in your
-shell history or `ps` output.
+and the secret keys themselves (`deepgram_api_key`, `summary_api_key`,
+`calendar_ics_url`) — those go through `set-secret`, which reads the value from stdin
+so it never lands in your shell history or `ps` output.
 
 `spitball check transcription --json` and `spitball check summary --json` test the
 configured provider/endpoint for real (a live network call) and report `{"ok", "message"}`
-(summary also lists `"models"`).
+(summary also lists `"models"`). `spitball calendar test --json` does the same for the
+calendar source and adds the match for a call starting now.
 
 ## Crash recovery
 
@@ -344,6 +425,15 @@ of Deepgram's model-improvement program — see
 submitted audio. The transcript then goes wherever `summary_base_url` points, which
 is a local model on your own machine by default and stays there unless you point it
 somewhere else.
+
+With the calendar on, the feed is read into `~/.local/state/spitball/calendar/` (mode
+600) and the events around each call are written into that call's `.meta.json`. The
+names of the people on the invite go to the summary endpoint along with the
+transcript (`calendar_names_to_summary`, on by default — turn it off if that endpoint
+is not your own machine); the event description goes only if you turn
+`calendar_description_to_summary` on. Attendee email addresses stay in the dot-files
+and never appear in `transcript.md` or `summary.md` unless an attendee has no name on
+the invite.
 
 Recording laws vary by place — some require only your own consent, others require
 everyone on the call to consent. Check your jurisdiction, and tell people you're
@@ -397,9 +487,10 @@ ln -s ~/.config/omarchy/plugins/supercleanse.spitball/bin/spitball ~/.local/bin/
 | `spitball open-last` | Open the last call's `summary.md`. |
 | `spitball open-folder` | Open `~/Calls` in the file manager. |
 | `spitball status [--json]` | Print the current state. |
-| `spitball reprocess <call-dir> [--retranscribe]` | Redo transcription and summary for one call folder. `--retranscribe` ignores the cached transcript and calls the provider again. |
+| `spitball reprocess <call-dir> [--retranscribe] [--event <id> \| --no-event]` | Redo transcription and summary for one call folder. `--retranscribe` ignores the cached transcript and calls the provider again; `--event`/`--no-event` pin or clear the calendar match by hand. |
 | `spitball config get\|set\|set-secret\|unset` | Read/edit settings. See [Configuration](#configuration). |
 | `spitball check transcription\|summary [--json]` | Test the configured transcription provider or summary endpoint for real. |
+| `spitball calendar test [--at TIME] [--app APP] [--meet CODE] [--refresh] [--json]` | Which calendar event a call starting now (or at `TIME`) would match, with every candidate and its score. See [Calendar](#calendar). |
 | `spitball local info\|models\|set-model` | What voxtype is configured with, every model it can download, or switch it to one. See [Transcription providers](#transcription-providers). |
 | `spitball live setup\|status [--json]` | Install the fast live-transcript engine, or show whether it's on and which model it loads. See [Live transcript](#live-transcript). |
 | `spitball pick-folder [--title T]` | Native folder chooser; prints the chosen path (used by the settings panel). |
