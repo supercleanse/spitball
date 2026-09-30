@@ -98,17 +98,16 @@ QtObject {
     proc.running = true
   }
 
-  // Same, but parses stdout as JSON. `cb(ok, data, errorText)` -- `ok` is
-  // false on a nonzero exit OR unparsable stdout, so callers never need to
-  // JSON.parse anything themselves.
+  // Same, but parses stdout as JSON. `cb(ok, data, errorText)` -- `ok`
+  // means spitball answered with JSON, so callers never JSON.parse
+  // anything themselves. A nonzero exit with JSON on stdout is still ok:
+  // `calendar test`, `check …`, and `status` exit 1 for an expected failure
+  // and put the actionable explanation in that JSON (`data.ok` is false);
+  // see Model.cliJsonResult.
   function runCliJson(args, cb) {
     root.runCli(args, function(code, stdoutText, stderrText) {
-      if (code !== 0) { cb(false, null, stderrText || "exit " + code); return }
-      try {
-        cb(true, JSON.parse(stdoutText), "")
-      } catch (e) {
-        cb(false, null, "bad JSON from CLI")
-      }
+      var r = Model.cliJsonResult(code, stdoutText, stderrText)
+      cb(r.ok, r.data, r.error)
     })
   }
 
@@ -379,6 +378,9 @@ QtObject {
   property string summaryTestMsg: ""
   property bool calendarTesting: false
   property string calendarTestMsg: ""
+  // The last test read the feed but couldn't tell which address is yours
+  // (Model.calendarOwnerUnknown): the page nudges for calendar_my_email.
+  property bool calendarOwnerUnknown: false
 
   function checkResultText(ok, data) {
     if (!ok || !data) return "✗ Couldn't reach spitball"
@@ -414,6 +416,7 @@ QtObject {
     root.runCliJson(["calendar", "test", "--json"], function(ok, data) {
       root.calendarTesting = false
       root.calendarTestMsg = Model.calendarTestText(ok, data)
+      root.calendarOwnerUnknown = Model.calendarOwnerUnknown(ok, data)
     })
   }
 

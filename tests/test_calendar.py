@@ -288,6 +288,134 @@ class TestRecurrence(unittest.TestCase):
         got = cal.expand_rrule(start, rule, ex, ws, we, timedelta(minutes=30))
         self.assertEqual(got, [start, start + timedelta(days=2)])
 
+    # ---- Codex review 2, P2: BYSETPOS and the unsupported-part audit
+
+    def _expand(self, rrule, dtstart, ws, we):
+        rule = cal.parse_rrule(rrule)
+        self.assertEqual(cal.unsupported_rrule_reason(rule), "", rrule)
+        got = cal.expand_rrule(dtstart, rule, set(), ws, we, timedelta(minutes=30))
+        return [f"{d:%Y-%m-%d %a}" for d in got]
+
+    def test_monthly_bysetpos_last_and_first_weekday(self):
+        # Outlook's "last weekday of the month" used to emit every weekday.
+        start = datetime(2026, 1, 30, 9, 0, tzinfo=DENVER)
+        ws, we = datetime(2026, 9, 1, tzinfo=DENVER), datetime(2026, 11, 1, tzinfo=DENVER)
+        self.assertEqual(self._expand("FREQ=MONTHLY;BYDAY=MO,TU,WE,TH,FR;BYSETPOS=-1", start, ws, we),
+                         ["2026-09-30 Wed", "2026-10-30 Fri"])
+        self.assertEqual(self._expand("FREQ=MONTHLY;BYDAY=MO,TU,WE,TH,FR;BYSETPOS=1", start, ws, we),
+                         ["2026-09-01 Tue", "2026-10-01 Thu"])
+        self.assertEqual(self._expand("FREQ=MONTHLY;BYDAY=MO,TU,WE,TH,FR;BYSETPOS=1,-1", start, ws, we),
+                         ["2026-09-01 Tue", "2026-09-30 Wed", "2026-10-01 Thu", "2026-10-30 Fri"])
+        # Second-to-last weekday; a position past the set's size selects nothing.
+        self.assertEqual(self._expand("FREQ=MONTHLY;BYDAY=MO,TU,WE,TH,FR;BYSETPOS=-2", start, ws, we),
+                         ["2026-09-29 Tue", "2026-10-29 Thu"])
+        self.assertEqual(self._expand("FREQ=MONTHLY;BYDAY=SA;BYSETPOS=9", start, ws, we), [])
+
+    def test_monthly_byday_and_bymonthday_intersect(self):
+        # "First Monday" written the RFC way: Mondays that fall on the 1st-7th.
+        start = datetime(2026, 1, 5, 9, 0, tzinfo=DENVER)
+        ws, we = datetime(2026, 9, 1, tzinfo=DENVER), datetime(2026, 11, 1, tzinfo=DENVER)
+        self.assertEqual(self._expand("FREQ=MONTHLY;BYDAY=MO;BYMONTHDAY=1,2,3,4,5,6,7", start, ws, we),
+                         ["2026-09-07 Mon", "2026-10-05 Mon"])
+        self.assertEqual(self._expand("FREQ=MONTHLY;BYMONTHDAY=-1", start, ws, we), ["2026-09-30 Wed", "2026-10-31 Sat"])
+
+    def test_monthly_bymonth_limits_the_months(self):
+        start = datetime(2026, 3, 15, 9, 0, tzinfo=DENVER)
+        self.assertEqual(self._expand("FREQ=MONTHLY;BYMONTH=3,9;BYMONTHDAY=15", start,
+                                      datetime(2026, 8, 1, tzinfo=DENVER), datetime(2026, 10, 1, tzinfo=DENVER)),
+                         ["2026-09-15 Tue"])
+        self.assertEqual(self._expand("FREQ=MONTHLY;BYMONTH=3,9;BYMONTHDAY=15", start,
+                                      datetime(2026, 10, 1, tzinfo=DENVER), datetime(2026, 12, 1, tzinfo=DENVER)), [])
+
+    def test_yearly_bysetpos_ranks_the_whole_years_set(self):
+        # Last Monday of Q1: the set is every Monday of Jan+Feb+Mar together.
+        start = datetime(2025, 1, 6, 9, 0, tzinfo=DENVER)
+        ws, we = datetime(2026, 1, 1, tzinfo=DENVER), datetime(2026, 12, 31, tzinfo=DENVER)
+        self.assertEqual(self._expand("FREQ=YEARLY;BYMONTH=1,2,3;BYDAY=MO;BYSETPOS=-1", start, ws, we),
+                         ["2026-03-30 Mon"])
+        self.assertEqual(self._expand("FREQ=YEARLY;BYMONTH=1,2,3;BYDAY=MO;BYSETPOS=1", start, ws, we),
+                         ["2026-01-05 Mon"])
+        # Without BYSETPOS every such Monday in those months, unchanged.
+        self.assertEqual(len(self._expand("FREQ=YEARLY;BYMONTH=1,2,3;BYDAY=MO", start, ws, we)), 13)
+
+    def test_unsupported_rrule_parts_are_named(self):
+        cases = {
+            "FREQ=WEEKLY;BYWEEKNO=5": "BYWEEKNO",
+            "FREQ=YEARLY;BYYEARDAY=100": "BYYEARDAY",
+            "FREQ=DAILY;BYHOUR=9,14": "BYHOUR",
+            "FREQ=DAILY;BYMINUTE=30": "BYMINUTE",
+            "FREQ=HOURLY;INTERVAL=2": "FREQ=HOURLY",
+            "FREQ=MINUTELY": "FREQ=MINUTELY",
+            "INTERVAL=2": "FREQ=?",
+            "FREQ=WEEKLY;BYMONTHDAY=1": "BYMONTHDAY with FREQ=WEEKLY",
+            "FREQ=DAILY;BYMONTH=6": "BYMONTH with FREQ=DAILY",
+            "FREQ=WEEKLY;BYDAY=MO;BYSETPOS=1": "BYSETPOS with FREQ=WEEKLY",
+            "FREQ=WEEKLY;BYDAY=2MO": "ordinal BYDAY with FREQ=WEEKLY",
+            "FREQ=YEARLY;BYDAY=MO": "BYDAY with FREQ=YEARLY and no BYMONTH",
+            "FREQ=MONTHLY;BYSETPOS=1": "BYSETPOS without BYDAY/BYMONTHDAY",
+            "FREQ=MONTHLY;RSCALE=HEBREW;BYMONTHDAY=1": "RSCALE",
+            "FREQ=MONTHLY;X-CUSTOM=1": "X-CUSTOM",
+        }
+        for rrule, reason in cases.items():
+            self.assertEqual(cal.unsupported_rrule_reason(cal.parse_rrule(rrule)), reason, rrule)
+        for rrule in ("FREQ=DAILY", "FREQ=WEEKLY;WKST=SU;BYDAY=MO,WE", "FREQ=MONTHLY;BYDAY=-1WE",
+                      "FREQ=MONTHLY;BYDAY=MO,TU,WE,TH,FR;BYSETPOS=-1", "FREQ=YEARLY", "FREQ=YEARLY;BYMONTH=9;BYMONTHDAY=30",
+                      "FREQ=MONTHLY;BYMONTHDAY=1,-1;COUNT=3;INTERVAL=2;UNTIL=20271231T000000Z"):
+            self.assertEqual(cal.unsupported_rrule_reason(cal.parse_rrule(rrule)), "", rrule)
+        self.assertEqual(cal.parse_rrule("FREQ=MONTHLY;BYSETPOS=1,0,-1,x")["BYSETPOS"], [1, -1])
+        # Every fixture series is one the expander implements.
+        for line in (ICS / "recurrence.ics").read_text().splitlines():
+            if line.startswith("RRULE:"):
+                self.assertEqual(cal.unsupported_rrule_reason(cal.parse_rrule(line[6:])), "", line)
+
+    def test_unsupported_series_is_skipped_whole_and_counted(self):
+        # The wrong expansion would have put a "meeting" on every weekday.
+        ics = ("BEGIN:VCALENDAR\n"
+               "BEGIN:VEVENT\nUID:wk@x\nDTSTART;TZID=America/Denver:20260105T090000\n"
+               "DTEND;TZID=America/Denver:20260105T093000\nSUMMARY:Week five\nRRULE:FREQ=WEEKLY;BYWEEKNO=5\nEND:VEVENT\n"
+               "BEGIN:VEVENT\nUID:ok@x\nDTSTART;TZID=America/Denver:20260130T090000\n"
+               "DTEND;TZID=America/Denver:20260130T093000\nSUMMARY:Last weekday\n"
+               "RRULE:FREQ=MONTHLY;BYDAY=MO,TU,WE,TH,FR;BYSETPOS=-1\nEND:VEVENT\n"
+               # A moved instance of the skipped series is a concrete event and still counts.
+               "BEGIN:VEVENT\nUID:wk@x\nRECURRENCE-ID;TZID=America/Denver:20260928T090000\n"
+               "DTSTART;TZID=America/Denver:20260929T100000\nDTEND;TZID=America/Denver:20260929T103000\n"
+               "SUMMARY:Week five (moved)\nEND:VEVENT\n"
+               "END:VCALENDAR\n")
+        ws, we = datetime(2026, 9, 28, tzinfo=DENVER), datetime(2026, 10, 3, tzinfo=DENVER)
+        diag: dict = {}
+        events = cal.events_from_ics(ics, ws, we, "", diag)
+        self.assertEqual(sorted((e["title"], e["start"][:10]) for e in events),
+                         [("Last weekday", "2026-09-30"), ("Week five (moved)", "2026-09-29")])
+        self.assertEqual(diag["rules_skipped"], 1)
+        self.assertEqual(diag["skipped"], [{"uid": "wk@x", "rule": "FREQ=WEEKLY;BYWEEKNO=5", "reason": "BYWEEKNO"}])
+        self.assertFalse(diag["self_known"])  # no attendees at all
+        # Without a diag dict the call shape is unchanged.
+        self.assertEqual(len(cal.events_from_ics(ics, ws, we)), 2)
+
+    def test_owner_tie_is_never_guessed(self):
+        def comps(pairs):
+            body = ""
+            for i, people in enumerate(pairs):
+                body += f"BEGIN:VEVENT\nUID:u{i}@x\nDTSTART:20260901T140000Z\nSUMMARY:E{i}\n"
+                body += "".join(f"ATTENDEE:mailto:{p}\n" for p in people) + "END:VEVENT\n"
+            return cal.parse_ics(f"BEGIN:VCALENDAR\n{body}END:VCALENDAR\n")
+        two = [["a@x.test", "b@x.test"]] * 3
+        for _ in range(5):  # set iteration order must not matter
+            self.assertEqual(cal.detect_self_emails(comps(two)), set())
+        self.assertEqual(cal.detect_self_emails(comps(two), "B@x.test"), {"b@x.test"})
+        self.assertEqual(cal.detect_self_emails(comps(two + [["a@x.test", "c@x.test"]])), {"a@x.test"})
+        self.assertEqual(cal.detect_self_emails(comps([["a@x.test", "b@x.test"]] * 2)), set())  # too few events
+        self.assertEqual(cal.detect_self_emails(comps([["a@x.test", "b@x.test"], ["c@x.test"], ["d@x.test"], ["e@x.test"]])),
+                         set())  # nobody dominates
+        # Unknown owner: nobody is `self`, my_response stays unknown.
+        events = cal.events_from_ics(
+            "BEGIN:VCALENDAR\n" + "".join(
+                f"BEGIN:VEVENT\nUID:u{i}@x\nDTSTART:20260930T200000Z\nDTEND:20260930T203000Z\nSUMMARY:E{i}\n"
+                "ATTENDEE;PARTSTAT=ACCEPTED:mailto:a@x.test\nATTENDEE;PARTSTAT=DECLINED:mailto:b@x.test\nEND:VEVENT\n"
+                for i in range(3)) + "END:VCALENDAR\n", *_window(T_SYNC))
+        self.assertEqual({e["my_response"] for e in events}, {""})
+        self.assertFalse(any(a["self"] for e in events for a in e["attendees"]))
+
     def test_expand_rrule_iteration_cap(self):
         start = datetime(2000, 1, 1, 9, 0, tzinfo=DENVER)
         rule = cal.parse_rrule("FREQ=WEEKLY;COUNT=999999")
@@ -498,6 +626,130 @@ class TestIcsSource(unittest.TestCase):
         with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
             cal.fetch_ics(cfg, now=1000.0)
         self.assertEqual(captured["url"], "https://example.test/feed.ics")
+
+    # ---- Codex review 2, P2: the secret feed address must never leak into an error
+
+    def _secret_free(self, cfg, label):
+        """Every surface a feed error can reach: fetch_ics, load_events,
+        snapshot (-> .meta.json), test_report (-> `calendar test --json`),
+        the plain-text report, and process()'s .meta.json via for_call."""
+        secret = "private-SECRET"
+        _text, info = cal.fetch_ics(cfg, now=1000.0)
+        self.assertNotIn(secret, json.dumps(info), label)
+        _events, info2 = cal.load_events(cfg, *_window(T_SYNC))
+        self.assertNotIn(secret, json.dumps(info2), label)
+        snap = cal.snapshot(cfg, T_SYNC, "Chrome", meet_codes=[])
+        self.assertNotIn(secret, json.dumps(snap), label)
+        rep = cal.test_report(cfg, T_SYNC)
+        self.assertNotIn(secret, json.dumps(rep), label)
+        self.assertNotIn(secret, cal.format_test_report(rep), label)
+        meta = {"app": "Chrome", "started_at": T_SYNC, "duration": 600}
+        cal.for_call(meta, cfg, 600)
+        self.assertNotIn(secret, json.dumps(meta), label)
+        return info, rep
+
+    def test_scheme_less_address_is_a_credential_free_validation_error(self):
+        # urllib.request.Request() raises ValueError("unknown url type: '<the
+        # whole address>'"); it used to happen outside the try block and the
+        # address (the credential) rode into calendar test --json and .meta.json.
+        bare = self.url[len("http://"):]
+        cfg = self._cfg(calendar_ics_url=bare)
+        info, rep = self._secret_free(cfg, "scheme-less")
+        self.assertEqual(info["error"], "feed address must start with https:// or webcal://")
+        self.assertFalse(rep["ok"])
+        self.assertIn("must start with https://", rep["message"])
+        self.assertEqual(len(self.srv.requests), 0)  # never even attempted
+        # webcal:// (any case) is normalized to https://; a bare host with no path still needs a scheme.
+        self.assertEqual(cal._normalize_feed_url("WEBCAL://x.test/a.ics"), "https://x.test/a.ics")
+        self.assertEqual(cal._normalize_feed_url("  https://x.test/a.ics "), "https://x.test/a.ics")
+        self.assertIsNone(cal._normalize_feed_url("x.test/private-SECRET/a.ics"))
+        self.assertIsNone(cal._normalize_feed_url("https:///nohost"))
+        self.assertIsNone(cal._normalize_feed_url("ftp://x.test/a.ics"))
+
+    def test_secret_never_appears_on_any_error_path(self):
+        base = self.url
+        cases = {
+            "unreachable": dict(calendar_ics_url="http://127.0.0.1:1/private-SECRET/x.ics"),
+            "bad port (urllib ValueError)": dict(calendar_ics_url="http://127.0.0.1:nope/private-SECRET/x.ics"),
+            "scheme-less": dict(calendar_ics_url=base[len("http://"):]),
+            "webcal scheme-less host only": dict(calendar_ics_url="private-SECRET"),
+            "address command prints it to stderr and fails": dict(
+                calendar_ics_url="", calendar_ics_url_command=f"echo '{base}' >&2; exit 3"),
+        }
+        for label, over in cases.items():
+            with self.subTest(label):
+                self._secret_free(self._cfg(**over), label)
+        server_cases = {
+            "HTTP 404, no cache": lambda h: (404, "gone", {}),
+            "HTTP 500": lambda h: (500, "boom", {}),
+            "HTTP 401": lambda h: (401, "nope", {}),
+            "not an iCalendar body": lambda h: (200, "<html>sign in</html>", {}),
+            "redirect loop": lambda h: (302, "", {"Location": h.path}),
+        }
+        for label, behavior in server_cases.items():
+            with self.subTest(label):
+                self.srv.behavior = behavior
+                info, _rep = self._secret_free(self._cfg(), label)
+                self.assertTrue(info["error"], label)
+        # And with a stale cache to fall back on, the same errors ride along redacted.
+        self.srv.behavior = lambda h: (200, self.text, {"Content-Type": "text/calendar"})
+        cal.fetch_ics(self._cfg(), now=1000.0)
+        self.srv.behavior = lambda h: (403, "reset", {})
+        self._secret_free(self._cfg(), "403 with cache")
+        _text, info = cal.fetch_ics(self._cfg(), now=5000.0)  # past the TTL: revalidates, gets the 403
+        self.assertTrue(info["cached"])
+        self.assertIn("HTTP 403", info["error"])
+        self.assertNotIn("SECRET", info["error"])
+        rep = cal.test_report(self._cfg(), T_SYNC, refresh=True)
+        self.assertTrue(rep["ok"])  # served from the cache
+        self.assertNotIn("SECRET", json.dumps(rep))
+        self.assertIn("HTTP 403", rep["message"])
+
+    def test_redact_strips_every_form_of_the_address(self):
+        url = "webcal://calendar.google.com/calendar/ical/private-SECRET/basic.ics"
+        norm = cal._normalize_feed_url(url)
+        msg = f"unknown url type: '{url[len('webcal://'):]}' and {norm} and {url}"
+        out = cal._redact(msg, url, norm)
+        self.assertNotIn("SECRET", out)
+        self.assertEqual(out.count("<feed address>"), 3)
+        self.assertEqual(cal._redact("plain text", ""), "plain text")
+        self.assertEqual(cal._redact("short a.b", "a.b"), "short a.b")  # too short to be a credential
+
+    # ---- Codex review 2, P2: owner detection and the test report's diagnostics
+
+    def test_report_carries_owner_and_skipped_rule_diagnostics(self):
+        rep = cal.test_report(self._cfg(), T_SYNC)
+        self.assertTrue(rep["ok"])
+        self.assertEqual(rep["my_email"], "owner@example.com")  # detected: 8 of 10 invites
+        self.assertTrue(rep["my_email_known"])
+        self.assertEqual(rep["rules_skipped"], 0)
+        self.assertIn("Your address: owner@example.com", cal.format_test_report(rep))
+        # Configured wins and is what the report shows.
+        rep2 = cal.test_report(self._cfg(calendar_my_email="Me@Example.com"), T_SYNC)
+        self.assertEqual(rep2["my_email"], "me@example.com")
+        self.assertTrue(rep2["my_email_known"])
+        # A feed of 1:1s with the same person: a tie, so unknown, and the report says so.
+        tie = "\n".join(["BEGIN:VCALENDAR"] + [
+            f"BEGIN:VEVENT\nUID:t{i}@x\nDTSTART:202609{28 + i}T140000Z\nDTEND:202609{28 + i}T143000Z\nSUMMARY:One on one {i}\n"
+            "ATTENDEE;CN=A:mailto:a@example.com\nATTENDEE;CN=B:mailto:b@example.com\n"
+            "RRULE:FREQ=WEEKLY;BYWEEKNO=5\nEND:VEVENT" for i in range(0, 3)] + ["END:VCALENDAR"])
+        self.text = tie
+        cfg = self._cfg(calendar_ics_url=self.url + "?tie")
+        rep3 = cal.test_report(cfg, T_SYNC)
+        self.assertTrue(rep3["ok"])
+        self.assertFalse(rep3["my_email_known"])
+        self.assertEqual(rep3["my_email"], "")
+        self.assertEqual(rep3["rules_skipped"], 3)  # BYWEEKNO is not expanded
+        text = cal.format_test_report(rep3)
+        self.assertIn("Your address: unknown", text)
+        self.assertIn("calendar_my_email", text)
+        self.assertIn("Skipped: 3 recurring series", text)
+        snap = cal.snapshot(cfg, T_SYNC, "", meet_codes=[])
+        self.assertEqual((snap["self_known"], snap["self_email"], snap["rules_skipped"]), (False, "", 3))
+        self.assertEqual(snap["events"], [])
+        # A command source marks `self` itself: always "known" there.
+        rep4 = cal.test_report(self._cfg(calendar_source="command", calendar_command="echo []"), T_SYNC)
+        self.assertTrue(rep4["my_email_known"])
 
     def test_load_events_ics_end_to_end(self):
         cfg = self._cfg()

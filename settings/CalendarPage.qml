@@ -89,6 +89,16 @@ SettingsPage {
     onRun: page.store.testCalendar()
   }
   NoteText { store: page.store; text: "Shows which event a call starting right now would match. `spitball calendar test --at 14:30` checks another time." }
+  Text {
+    visible: page.store.calendarOwnerUnknown
+    width: parent.width
+    textFormat: Text.PlainText
+    text: "Couldn't tell which address in this feed is yours (no address clearly dominates, and a tie is never guessed). Set \"Your calendar email\" under Advanced so your own replies are read and speaker naming knows which side is you."
+    color: Color.urgent
+    wrapMode: Text.WordWrap
+    font.family: page.store.fontFamily
+    font.pixelSize: Style.font.caption
+  }
 
   PanelSeparator { foreground: page.store.foreground }
 

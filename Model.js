@@ -532,22 +532,56 @@ function micNoiseFloorDb(value) {
   return Math.max(-80, Math.min(-20, Math.round(n)))
 }
 
+// One CLI run's outcome for the `--json` commands: {ok, data, error}.
+// `ok` means "spitball answered with JSON" -- NOT that the command
+// succeeded. `calendar test`, `check transcription`, `check summary`, and
+// `status` all exit 1 for an expected failure while printing the
+// structured {ok: false, message/error: ...} explanation on stdout; that
+// explanation is the whole point, so a nonzero exit with parsable stdout
+// is still ok here and the caller reads `data.ok`. Only a run with no JSON
+// at all (spitball missing, a traceback, an empty stdout) is not ok.
+function cliJsonResult(code, stdoutText, stderrText) {
+  var text = String(stdoutText || "")
+  var parsed = null
+  try {
+    parsed = JSON.parse(text)
+  } catch (e) {
+    parsed = undefined
+  }
+  if (parsed !== undefined && parsed !== null && typeof parsed === "object") {
+    return { ok: true, data: parsed, error: "" }
+  }
+  if (code !== 0) return { ok: false, data: null, error: String(stderrText || "") || ("exit " + code) }
+  return { ok: false, data: null, error: "bad JSON from CLI" }
+}
+
 // The Test button's result line, from `spitball calendar test --json`
 // ({ok, source, message, match, confidence, confident, summary,
-// events_nearby}). `ok` is about the source; a match is reported on top of
-// it, never required for a ✓.
+// events_nearby, rules_skipped}). `ok` is about the source; a match is
+// reported on top of it, never required for a ✓.
 function calendarTestText(ok, data) {
   if (!ok || !data || typeof data !== "object") return "✗ Couldn't reach spitball"
   if (!data.ok) return "✗ " + (data.message || data.error || "Failed")
+  var skipped = Number(data.rules_skipped || 0)
+  var note = skipped ? "; " + skipped + " recurring series skipped (unsupported repeat rule)" : ""
   var m = data.match
   if (m && m.title) {
-    return "✓ Matched “" + String(m.title) + "” (score " + Number(data.confidence || 0) + ")"
+    return "✓ Matched “" + String(m.title) + "” (score " + Number(data.confidence || 0) + ")" + note
   }
   var n = Number(data.events_nearby || 0)
   var src = data.source === "command" ? "Command OK" : "Feed OK"
   if (data.cached) src += " (cached)"
   var tail = data.summary ? String(data.summary) : (n ? n + " event(s) nearby, no confident match" : "no events at that time")
-  return "✓ " + src + "; " + tail
+  return "✓ " + src + "; " + tail + note
+}
+
+// Whether the Calendar page should nudge for `calendar_my_email`: the feed
+// was read fine but no address clearly dominates it (a tie is never
+// guessed), so Spitball can't tell which invitee is you.
+function calendarOwnerUnknown(ok, data) {
+  if (!ok || !data || typeof data !== "object" || !data.ok) return false
+  if (data.source !== "ics") return false
+  return data.my_email_known === false
 }
 
 // A fresh copy each call (one new object per entry), so a caller can't

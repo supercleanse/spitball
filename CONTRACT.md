@@ -131,7 +131,7 @@ from a checkout.
 | `spitball config unset <key>` | removes a key, back to its default. Sends `reload`. |
 | `spitball check transcription [--provider P] [--json]` | `{"ok": bool, "message": "…"}` -- tests the configured (or given) transcription provider for real: deepgram does an authenticated `GET /v1/projects`; local checks voxtype is on PATH. |
 | `spitball check summary [--json]` | `{"ok": bool, "message": "…", "models": [...]}` from `GET {summary_base_url}/models`. |
-| `spitball calendar test [--at TIME] [--app APP] [--meet CODE] [--refresh] [--json]` | the calendar source's health plus the match for a call starting now (or at `TIME`: `"14:30"`, `"2026-09-30 14:30"`, ISO 8601, or epoch seconds). `--app` / `--meet` supply what a real call would have (the app on the mic, a Meet code from a window title); `--refresh` re-downloads the feed regardless of its age. Works whether or not `calendar_enabled` is on. `--json`: `{"ok", "enabled", "source": "ics"\|"command"\|"off", "message", "error", "events_nearby", "match": <event>\|null, "confident", "confidence", "candidates": [{"id", "title", "start", "end", "score", "filtered", "reasons"}], "summary", "at", "fetched_at", "cached"}`. `ok` is about the source (fetched, or served from the cache); no match is still `ok`. Exit 1 when the source fails or nothing is configured. |
+| `spitball calendar test [--at TIME] [--app APP] [--meet CODE] [--refresh] [--json]` | the calendar source's health plus the match for a call starting now (or at `TIME`: `"14:30"`, `"2026-09-30 14:30"`, ISO 8601, or epoch seconds). `--app` / `--meet` supply what a real call would have (the app on the mic, a Meet code from a window title); `--refresh` re-downloads the feed regardless of its age. Works whether or not `calendar_enabled` is on. `--json`: `{"ok", "enabled", "source": "ics"\|"command"\|"off", "message", "error", "events_nearby", "match": <event>\|null, "confident", "confidence", "candidates": [{"id", "title", "start", "end", "score", "filtered", "reasons"}], "summary", "at", "fetched_at", "cached", "my_email", "my_email_known", "rules_skipped"}`. `ok` is about the source (fetched, or served from the cache); no match is still `ok`. `my_email_known` is false when the feed's owner couldn't be told (see "Owner" under Calendar events); `rules_skipped` counts recurring series the expander refused (see "Recurrence"). Exit 1 when the source fails or nothing is configured -- **the JSON is still printed**, and the settings overlay reads it (a nonzero exit with JSON on stdout is an answer, not a crash). `message`/`error` never contain the feed address: a malformed one is reported as `feed address must start with https:// or webcal://` and every fetch error is scrubbed of it. |
 | `spitball local info [--json]` | what voxtype is actually configured with right now: `{"installed": bool, "engine": "whisper"\|"parakeet"\|"", "model": "...", "onnx": bool, "can_upgrade_parakeet": bool, "message": "..."}`. Spitball never manages this itself -- it's read straight from `voxtype config get`. |
 | `spitball local models [--json]` | every whisper/parakeet model voxtype knows how to download (from `voxtype info models --json`), each `{"name", "engine", "installed", "size_mb", "languages", "recommended", "active"}`. Spitball never downloads any of these -- see `set-model`. |
 | `spitball local set-model <name>` | starts switching voxtype to `name` **in the background** and returns immediately -- see "Model switch file" above. Normally: a detached child re-execs `spitball local _set-model-worker <name>` after a graphical `pkexec voxtype setup onnx --enable/--disable` prompt (only if the engine is actually changing) and `voxtype setup --download --model <name> --activate --progress-format json`, whose NDJSON events feed model.json directly, then, for a parakeet model, `voxtype config set parakeet.streaming true|false` (true only for a streaming-capable model, which also gets the three `streaming_*_secs` window sizes written into voxtype's `[parakeet]` table if missing). Falls back to opening a floating terminal running `bin/spitball-upgrade-parakeet` (the original interactive approach) when `pkexec` is missing or Omarchy's shell doesn't answer `shell ping` (no way to draw a graphical prompt) -- model.json then gets `state: "terminal"` and no further progress. Exit 1 only if neither path could be started at all (no pkexec/agent AND no terminal launcher). Spitball's own process never runs `sudo` or `pkexec` itself, or edits voxtype's config directly. |
@@ -407,7 +407,7 @@ all speak:
 | `status` | `confirmed` \| `tentative` \| `cancelled` (a canceled event is never matched) |
 | `transparency` | `opaque` \| `transparent` (marked free; never matched) |
 | `kind` | `default`, or one of the kinds that are never matched: `focus`, `out_of_office`, `working_location`, `birthday` -- from the title (Google's feed has no event-type field) and Outlook's busy status |
-| `my_response` | your own reply: `accepted` \| `declined` \| `tentative` \| `needs_action` \| `""` (unknown). Declined is never matched. From the ATTENDEE line whose address is `calendar_my_email`, or, when that's empty, the address that appears on most invites in the feed; the organizer counts as accepted. |
+| `my_response` | your own reply: `accepted` \| `declined` \| `tentative` \| `needs_action` \| `""` (unknown). Declined is never matched. From the ATTENDEE line whose address is `calendar_my_email`, or, when that's empty, the address that clearly dominates the feed with no tie (see "Owner" below); the organizer counts as accepted. |
 | `attendees` | every human invitee (rooms/resources dropped), each with `self` |
 | `conference` | the meeting link, or `null`: `kind` `meet` \| `zoom` \| `teams` \| `webex`, and `code` -- the Meet code (`abc-defg-hij`) or Zoom meeting id -- from `X-GOOGLE-CONFERENCE`, LOCATION, URL, Teams' `X-MICROSOFT-SKYPETEAMSMEETINGURL`, or the description |
 | `description` | capped at 4,000 characters |
@@ -425,6 +425,33 @@ Google-API-style names are accepted too (`summary`, `displayName`,
 `responseStatus`, `eventType`, `hangoutLink`). Events outside the window are
 dropped. A non-zero exit, a timeout (20 s), or non-JSON output is reported as the
 source's `error`; recording is never affected.
+
+**Recurrence.** A series is expanded on the spot from its RRULE (in the event's own
+zone; `EXDATE`, `RECURRENCE-ID` overrides, and `COUNT`/`UNTIL` honored). The
+expander implements exactly: `FREQ` `DAILY` / `WEEKLY` / `MONTHLY` / `YEARLY`;
+`INTERVAL`, `COUNT`, `UNTIL`, `WKST`; `BYDAY` (plain days for `DAILY`/`WEEKLY`,
+ordinal days such as `-1WE` for `MONTHLY`/`YEARLY`); `BYMONTHDAY` and `BYMONTH` for
+`MONTHLY`/`YEARLY` (both `BYDAY` and `BYMONTHDAY` given = their intersection, RFC
+5545); `BYSETPOS` for `MONTHLY` (over each month's set) and `YEARLY` (over the
+year's set across `BYMONTH`), e.g. `FREQ=MONTHLY;BYDAY=MO,TU,WE,TH,FR;BYSETPOS=-1`
+is the last weekday of the month. **Any other part** (`BYWEEKNO`, `BYYEARDAY`,
+`BYHOUR`/`BYMINUTE`/`BYSECOND`, `RSCALE`, an `X-` part, sub-daily `FREQ`, or a
+supported part in a combination the expander doesn't handle -- `BYMONTHDAY` on a
+`WEEKLY` rule, `BYSETPOS` without a set, `BYDAY` on a `YEARLY` rule with no
+`BYMONTH`) makes the **whole series skipped**, never expanded approximately: a
+made-up instance could confidently match a recording. Its moved overrides are
+concrete events and still count. Skips are counted: `rules_skipped` in the
+`.meta.json` snapshot and in `calendar test --json` (with a `Skipped:` line in the
+plain report), so a feed that leans on such a rule is visible rather than silently
+thin.
+
+**Owner.** Which attendee is you (`self`, `my_response`): `calendar_my_email` when
+set; otherwise the address that appears on the most invites in the feed, and only
+when it appears on at least half of at least three invites **and no other address
+ties it**. A tie (a feed that is mostly 1:1s with one person) is never broken by
+guessing -- the owner stays unknown, nobody is `self`, `my_response` is `""`, and
+`calendar test` reports `my_email_known: false` (the Calendar page then asks for
+your address).
 
 **Matching.** Candidates are events whose span runs from 15 minutes before the
 recording started to 10 minutes after; hard filters drop all-day, canceled,

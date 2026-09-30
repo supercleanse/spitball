@@ -799,6 +799,53 @@ test("calendarTestText: CLI failure, source failure, match, and no-match lines",
     "✓ Feed OK (cached); 1 event(s) nearby, no confident match");
 });
 
+// Codex review 2, P2: the store used to drop stdout on any nonzero exit, so
+// `calendar test` (and `check …`, `status`) failures always read "Couldn't
+// reach spitball" instead of the JSON's own explanation.
+test("cliJsonResult: nonzero exit with JSON on stdout is still an answer", () => {
+  const r = Model.cliJsonResult(1, JSON.stringify({ ok: false, message: "calendar feed: HTTP 403 (reset)" }), "");
+  assert.equal(r.ok, true);
+  assert.equal(r.data.ok, false);
+  assert.equal(r.data.message, "calendar feed: HTTP 403 (reset)");
+  assert.equal(r.error, "");
+  assert.equal(Model.calendarTestText(r.ok, r.data), "✗ calendar feed: HTTP 403 (reset)");
+  // Zero exit + JSON: as before.
+  const ok = Model.cliJsonResult(0, JSON.stringify({ ok: true, source: "ics", match: null, events_nearby: 0 }), "");
+  assert.equal(ok.ok, true);
+  assert.equal(Model.calendarTestText(ok.ok, ok.data), "✓ Feed OK; no events at that time");
+  // Arrays are JSON answers too (`local models --json`).
+  assert.equal(JSON.stringify(Model.cliJsonResult(0, "[1,2]", "").data), "[1,2]");
+});
+
+test("cliJsonResult: no JSON at all is a real failure, with stderr or the exit code", () => {
+  assert.equal(JSON.stringify(Model.cliJsonResult(1, "", "Traceback: boom")), JSON.stringify({ ok: false, data: null, error: "Traceback: boom" }));
+  assert.equal(JSON.stringify(Model.cliJsonResult(2, "", "")), JSON.stringify({ ok: false, data: null, error: "exit 2" }));
+  assert.equal(JSON.stringify(Model.cliJsonResult(0, "not json", "")), JSON.stringify({ ok: false, data: null, error: "bad JSON from CLI" }));
+  assert.equal(JSON.stringify(Model.cliJsonResult(0, "", "")), JSON.stringify({ ok: false, data: null, error: "bad JSON from CLI" }));
+  assert.equal(JSON.stringify(Model.cliJsonResult(0, "null", "")), JSON.stringify({ ok: false, data: null, error: "bad JSON from CLI" }));
+  assert.equal(JSON.stringify(Model.cliJsonResult(1, "42", "")), JSON.stringify({ ok: false, data: null, error: "exit 1" }));
+  assert.equal(Model.calendarTestText(false, null), "✗ Couldn't reach spitball");
+});
+
+test("calendarTestText: skipped recurring series are mentioned", () => {
+  assert.equal(Model.calendarTestText(true, { ok: true, source: "ics", match: { title: "Weekly sync" }, confidence: 75, rules_skipped: 2 }),
+    "✓ Matched “Weekly sync” (score 75); 2 recurring series skipped (unsupported repeat rule)");
+  assert.equal(Model.calendarTestText(true, { ok: true, source: "ics", match: null, events_nearby: 0, rules_skipped: 1 }),
+    "✓ Feed OK; no events at that time; 1 recurring series skipped (unsupported repeat rule)");
+  assert.equal(Model.calendarTestText(true, { ok: true, source: "ics", match: null, events_nearby: 0, rules_skipped: 0 }),
+    "✓ Feed OK; no events at that time");
+});
+
+test("calendarOwnerUnknown: only a healthy feed whose owner couldn't be told", () => {
+  assert.equal(Model.calendarOwnerUnknown(true, { ok: true, source: "ics", my_email_known: false }), true);
+  assert.equal(Model.calendarOwnerUnknown(true, { ok: true, source: "ics", my_email_known: true }), false);
+  assert.equal(Model.calendarOwnerUnknown(true, { ok: true, source: "ics" }), false);            // older CLI, no field
+  assert.equal(Model.calendarOwnerUnknown(true, { ok: true, source: "command", my_email_known: false }), false);
+  assert.equal(Model.calendarOwnerUnknown(true, { ok: false, source: "ics", my_email_known: false }), false);
+  assert.equal(Model.calendarOwnerUnknown(false, null), false);
+  assert.equal(Model.calendarOwnerUnknown(true, "x"), false);
+});
+
 // ---------------------------------------------------------------- audio page: mic_denoise
 
 test("micDenoiseOptions: off / auto / on, in that order, with labels", () => {

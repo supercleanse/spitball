@@ -420,8 +420,19 @@ were invited, whether you accepted, and, once the call has ended, how much of th
 recording fell inside the event, which is what settles back-to-back meetings. The
 best event has to clear a threshold and beat the runner-up by a margin, or there is
 no match. Recurring series are expanded on the spot (weekly, daily, monthly,
-yearly, `INTERVAL`, `COUNT`, `UNTIL`, `BYDAY` including "last Wednesday", `EXDATE`,
-moved and canceled instances) in the event's own time zone.
+yearly, `INTERVAL`, `COUNT`, `UNTIL`, `BYDAY` including "last Wednesday",
+`BYMONTHDAY`, `BYMONTH`, `BYSETPOS` such as Outlook's "last weekday of the month",
+`EXDATE`, moved and canceled instances) in the event's own time zone. A series whose
+rule uses something the expander doesn't implement (`BYWEEKNO`, `BYYEARDAY`, hourly
+rules, and the like) is skipped whole rather than expanded wrongly, and
+`spitball calendar test` says how many were skipped; the exact list is in
+CONTRACT.md under "Recurrence".
+
+Which invitee is you comes from `calendar_my_email` when set, otherwise from the
+address that clearly dominates the feed. When two addresses tie (a calendar that is
+mostly 1:1s with one person) Spitball does not guess: nobody is marked as you,
+`spitball calendar test` says "Your address: unknown", and the Calendar page asks
+you to set your email under Advanced.
 
 Calendar trouble (no network, a reset address, a slow feed) never delays or blocks a
 recording: the lookup runs in the background, and a failure is just noted in
@@ -546,7 +557,7 @@ default, and you only need to set the ones you want to change.
 | `calendar_prefer_event_title` | `true` | On a confident match, the event's title becomes the call's title (folder, transcript, summary). `false` keeps the summarizer's title and adds only the meeting header. |
 | `calendar_names_to_summary` | `true` | Put the invite list (names only, never addresses) in the summary request. `false`: the summarizer gets the meeting's title and time and nothing about the people; `transcript.md` and `summary.md` keep their own `**Attendees:**` line either way. Speaker naming has its own switch, `speaker_names`. |
 | `calendar_description_to_summary` | `false` | Also send the event description in the summary request. Off by default: it can carry private text. |
-| `calendar_my_email` | `""` | Your address on the calendar, so your own response is read (declined invites are skipped). Empty: the address on nearly every invite in the feed is taken as yours. |
+| `calendar_my_email` | `""` | Your address on the calendar, so your own response is read (declined invites are skipped). Empty: the address on nearly every invite in the feed is taken as yours, unless another address ties it, in which case nobody is (set this). |
 | `speaker_names` | `true` | Put invitees' names on the far-side speakers, from what people say, when the call matched a meeting. One short call to the summary endpoint carrying the transcript and the invitees' names (never their addresses); a 1:1 needs none. This switch alone governs that call: `calendar_names_to_summary` does not. See [Speakers](#speakers). |
 | `speaker_split` | `true` | Tell far-side voices apart on the local provider, once `spitball diarize setup` has installed the add-on. Never runs for a 1:1; any failure keeps one "Them". |
 | `speaker_max` | `6` | The most far-side voices a transcript shows (1–12). The invite's headcount is used when known, capped here; extra or tiny voices fold into their neighbors. |
@@ -577,7 +588,11 @@ so it never lands in your shell history or `ps` output.
 `spitball check transcription --json` and `spitball check summary --json` test the
 configured provider/endpoint for real (a live network call) and report `{"ok", "message"}`
 (summary also lists `"models"`). `spitball calendar test --json` does the same for the
-calendar source and adds the match for a call starting now.
+calendar source and adds the match for a call starting now. All three exit 1 on a
+failure but still print the JSON, and its `message` is the explanation the Test
+buttons show. The feed address never appears in any of it: a pasted address without
+its `https://` (or `webcal://`) is reported as exactly that, and every fetch error
+is scrubbed of the address before it is written anywhere.
 
 ## Crash recovery
 

@@ -513,7 +513,11 @@ def _raw_event(comp: dict, self_emails: set) -> dict | None:
 def detect_self_emails(comps: list, configured: str = "") -> set:
     """The calendar owner's address: `calendar_my_email` when set, else the
     address that appears on the most ATTENDEE lines across the feed (the
-    owner is on nearly every invite they receive), when it clearly dominates."""
+    owner is on nearly every invite they receive), when it clearly
+    dominates AND nobody ties it. A tie (a feed that is mostly 1:1s with
+    the same person) is left unknown rather than picked at random -- the
+    wrong guess would flip who "self" is for speaker naming and read the
+    other person's replies as yours. Empty means unknown."""
     if configured.strip():
         return {configured.strip().lower()}
     counts: dict = {}
@@ -528,7 +532,10 @@ def detect_self_emails(comps: list, configured: str = "") -> set:
                 counts[e] = counts.get(e, 0) + 1
     if not counts:
         return set()
-    top, n = max(counts.items(), key=lambda kv: kv[1])
+    ranked = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+    top, n = ranked[0]
+    if len(ranked) > 1 and ranked[1][1] == n:
+        return set()  # a tie: no owner without calendar_my_email
     if events_with >= 3 and n >= 0.5 * events_with:
         return {top}
     return set()
@@ -556,19 +563,63 @@ def parse_rrule(value: str) -> dict:
                 if m:
                     days.append((int(m.group(1)) if m.group(1) else None, _WEEKDAYS[m.group(2)]))
             rule[k] = days
-        elif k in ("BYMONTHDAY", "BYMONTH"):
+        elif k in ("BYMONTHDAY", "BYMONTH", "BYSETPOS"):
             vals = []
             for tok in v.split(","):
                 try:
-                    vals.append(int(tok))
+                    n = int(tok)
                 except ValueError:
-                    pass
+                    continue
+                if n != 0:
+                    vals.append(n)
             rule[k] = vals
         elif k == "WKST":
             rule[k] = _WEEKDAYS.get(v.upper(), 0)
         else:
             rule[k] = v.upper() if k == "FREQ" else v
     return rule
+
+
+# What expand_rrule() actually implements. Anything outside this is refused
+# for the whole series (expand() skips it and counts it) rather than
+# expanded wrongly: a made-up instance can confidently match a recording
+# and hand it the wrong title and attendees.
+_RRULE_PARTS = {"FREQ", "INTERVAL", "COUNT", "UNTIL", "BYDAY", "BYMONTHDAY", "BYMONTH", "BYSETPOS", "WKST"}
+
+
+def unsupported_rrule_reason(rule: dict) -> str:
+    """"" when expand_rrule() handles every part of `rule` exactly, else why
+    not (the offending part), for diagnostics."""
+    freq = rule.get("FREQ", "")
+    if freq not in ("DAILY", "WEEKLY", "MONTHLY", "YEARLY"):
+        return f"FREQ={freq or '?'}"
+    for k in rule:
+        if k not in _RRULE_PARTS:
+            return k  # BYWEEKNO, BYYEARDAY, BYHOUR, BYMINUTE, BYSECOND, RSCALE, X-…
+    ordinals = [o for o, _wd in rule.get("BYDAY", []) if o is not None]
+    if freq in ("DAILY", "WEEKLY"):
+        for k in ("BYMONTHDAY", "BYMONTH", "BYSETPOS"):
+            if rule.get(k):
+                return f"{k} with FREQ={freq}"
+        if ordinals:
+            return f"ordinal BYDAY with FREQ={freq}"
+    if freq == "YEARLY" and rule.get("BYDAY") and not rule.get("BYMONTH"):
+        return "BYDAY with FREQ=YEARLY and no BYMONTH"
+    if rule.get("BYSETPOS") and not (rule.get("BYDAY") or rule.get("BYMONTHDAY")):
+        return "BYSETPOS without BYDAY/BYMONTHDAY"
+    return ""
+
+
+def _setpos(days: list, positions: list) -> list:
+    """RFC 5545 BYSETPOS over one occurrence set (sorted): the n-th (1-based)
+    or -n-th from the end."""
+    picked = set()
+    for p in positions:
+        if p > 0 and p <= len(days):
+            picked.add(days[p - 1])
+        elif p < 0 and -p <= len(days):
+            picked.add(days[p])
+    return sorted(picked)
 
 
 def _until(rule: dict, dtstart):
@@ -604,23 +655,31 @@ def _nth_weekday(year: int, month: int, weekday: int, ordinal) -> list:
     return [days[ordinal]] if -ordinal <= len(days) else []
 
 
-def _month_days(year: int, month: int, rule: dict, dtstart) -> list:
-    """Day numbers a MONTHLY/YEARLY rule selects inside one month."""
+def _month_days(year: int, month: int, rule: dict, dtstart, setpos: bool = True) -> list:
+    """Day numbers a MONTHLY/YEARLY rule selects inside one month: BYDAY,
+    BYMONTHDAY, or (RFC 5545) their intersection when both are given, then
+    BYSETPOS over that month's set (unless the caller applies it over a
+    larger set, as YEARLY does)."""
     import calendar as _cal
     last = _cal.monthrange(year, month)[1]
+    days = None
     if rule.get("BYDAY"):
         days = set()
         for ordinal, wd in rule["BYDAY"]:
             days.update(_nth_weekday(year, month, wd, ordinal))
-        return sorted(days)
     if rule.get("BYMONTHDAY"):
-        days = set()
+        by_md = set()
         for md in rule["BYMONTHDAY"]:
             d = md if md > 0 else last + 1 + md
             if 1 <= d <= last:
-                days.add(d)
-        return sorted(days)
-    return [dtstart.day] if dtstart.day <= last else []
+                by_md.add(d)
+        days = by_md if days is None else days & by_md
+    if days is None:
+        return [dtstart.day] if dtstart.day <= last else []
+    out = sorted(days)
+    if setpos and rule.get("BYSETPOS"):
+        out = _setpos(out, rule["BYSETPOS"])
+    return out
 
 
 def expand_rrule(dtstart, rule: dict, exdates: set, win_start: datetime, win_end: datetime,
@@ -719,22 +778,30 @@ def expand_rrule(dtstart, rule: dict, exdates: set, win_start: datetime, win_end
     if freq in ("MONTHLY", "YEARLY"):
         months_step = interval if freq == "MONTHLY" else 12 * interval
         y, m = dtstart.year, dtstart.month
-        by_month = sorted(rule.get("BYMONTH") or []) if freq == "YEARLY" else []
+        by_month = sorted(mo for mo in (rule.get("BYMONTH") or []) if 1 <= mo <= 12)
+        # YEARLY: BYSETPOS ranks the whole year's set (every BYMONTH month
+        # together, RFC 5545); MONTHLY: each month is its own set.
+        yearly_setpos = freq == "YEARLY" and bool(rule.get("BYSETPOS"))
         stop = False
         while not stop and iterations < MAX_RULE_ITERATIONS:
             iterations += 1
-            for mo in (by_month or [m]):
-                if not 1 <= mo <= 12:
-                    continue
-                if _as_datetime(date(y, mo, 1)) - timedelta(days=1) > hi:
-                    stop = True
+            if freq == "MONTHLY" and by_month and m not in by_month:
+                if _as_datetime(date(y, m, 1)) - timedelta(days=1) > hi:
                     break
-                for day in _month_days(y, mo, rule, dtstart):
-                    if not consider(dtstart.replace(year=y, month=mo, day=day)):
+            else:
+                occs = []
+                for mo in ([m] if freq == "MONTHLY" else (by_month or [m])):
+                    if _as_datetime(date(y, mo, 1)) - timedelta(days=1) > hi and not yearly_setpos:
                         stop = True
                         break
-                if stop:
-                    break
+                    for day in _month_days(y, mo, rule, dtstart, setpos=not yearly_setpos):
+                        occs.append(dtstart.replace(year=y, month=mo, day=day))
+                if yearly_setpos:
+                    occs = _setpos(sorted(occs), rule["BYSETPOS"])
+                for occ in occs:
+                    if not consider(occ):
+                        stop = True
+                        break
             total = y * 12 + (m - 1) + months_step
             y, m = total // 12, total % 12 + 1
         return out
@@ -755,11 +822,14 @@ def _instance(master: dict, start, end, recurring: bool, recurrence_id=None) -> 
     return ev
 
 
-def expand(raw_events: list, win_start: datetime, win_end: datetime) -> list:
+def expand(raw_events: list, win_start: datetime, win_end: datetime, diag: dict | None = None) -> list:
     """Masters + RRULEs + RECURRENCE-ID overrides -> concrete instances whose
     span touches [win_start, win_end], as JSON-ready dicts (see CONTRACT.md).
     An override replaces the instance its RECURRENCE-ID names (wherever that
-    override moved it); a canceled override removes it."""
+    override moved it); a canceled override removes it. A series whose RRULE
+    uses a part the expander doesn't implement is skipped whole (its moved
+    overrides, being concrete events, still count) and counted in `diag`
+    (`rules_skipped`, `skipped`: [{"uid", "rule", "reason"}])."""
     overrides: dict = {}
     masters = []
     for ev in raw_events:
@@ -774,6 +844,12 @@ def expand(raw_events: list, win_start: datetime, win_end: datetime) -> list:
         ov = overrides.get(ev["uid"], {})
         if ev["rrule"]:
             rule = parse_rrule(ev["rrule"])
+            reason = unsupported_rrule_reason(rule)
+            if reason:
+                if diag is not None:
+                    diag["rules_skipped"] = diag.get("rules_skipped", 0) + 1
+                    diag.setdefault("skipped", []).append({"uid": ev["uid"], "rule": ev["rrule"], "reason": reason})
+                continue
             starts = expand_rrule(ev["start"], rule, ev["exdates"], win_start, win_end, duration)
             for s in starts:
                 k = _key(s)
@@ -802,11 +878,18 @@ def expand(raw_events: list, win_start: datetime, win_end: datetime) -> list:
     return out
 
 
-def events_from_ics(text: str, win_start: datetime, win_end: datetime, my_email: str = "") -> list:
+def events_from_ics(text: str, win_start: datetime, win_end: datetime, my_email: str = "",
+                    diag: dict | None = None) -> list:
+    """Events in the window from an iCalendar text. `diag`, when given, gets
+    `self_email` (the owner's address, "" when unknown), `self_known`, and
+    expand()'s skipped-rule counts."""
     comps = parse_ics(text)
     self_emails = detect_self_emails(comps, my_email)
+    if diag is not None:
+        diag["self_email"] = next(iter(sorted(self_emails)), "")
+        diag["self_known"] = bool(self_emails)
     raw = [r for r in (_raw_event(c, self_emails) for c in comps) if r]
-    return expand(raw, win_start, win_end)
+    return expand(raw, win_start, win_end, diag)
 
 
 # ---------------------------------------------------------------- calendar_command events
@@ -931,6 +1014,42 @@ def _url_key(url: str) -> str:
     return hashlib.sha256(url.encode()).hexdigest()[:16]
 
 
+def _feed_url(cfg: dict) -> str:
+    """The configured feed address as given (env, config, or its command)."""
+    return config.secret(cfg, "calendar_ics_url", config.SECRET_ENV.get("calendar_ics_url", ""))
+
+
+def _normalize_feed_url(url: str) -> str | None:
+    """webcal:// -> https://; None unless the result is an http(s) URL with
+    a host. Decided by us, not by urllib, so no exception ever carries the
+    address."""
+    u = url.strip()
+    if u.lower().startswith("webcal://"):
+        u = "https://" + u[len("webcal://"):]
+    m = re.match(r"^(https?)://([^/?#\s]+)", u, flags=re.I)
+    if not m or not m.group(2):
+        return None
+    return u
+
+
+def _redact(text: str, *urls: str) -> str:
+    """Strips the feed address -- in every form it could take: as given,
+    normalized, with or without its scheme -- from an error message."""
+    forms = set()
+    for u in urls:
+        u = (u or "").strip()
+        if not u:
+            continue
+        forms.add(u)
+        for prefix in ("https://", "http://", "webcal://"):
+            if u.lower().startswith(prefix):
+                forms.add(u[len(prefix):])
+    for form in sorted(forms, key=len, reverse=True):
+        if len(form) >= 8:  # never blank a trivially short token out of unrelated text
+            text = text.replace(form, "<feed address>")
+    return text
+
+
 def fetch_ics(cfg: dict, refresh: bool = False, now: float | None = None) -> tuple:
     """(ics_text | None, info). Serves the on-disk cache while it is younger
     than `calendar_cache_ttl_s`; otherwise fetches (with ETag/Last-Modified
@@ -938,12 +1057,17 @@ def fetch_ics(cfg: dict, refresh: bool = False, now: float | None = None) -> tup
     {"source": "ics", "cached": bool, "fetched_at": epoch, "error": ""}."""
     now = time.time() if now is None else now
     info = {"source": "ics", "cached": False, "fetched_at": 0, "error": "", "bytes": 0}
-    url = config.secret(cfg, "calendar_ics_url", config.SECRET_ENV.get("calendar_ics_url", ""))
-    if not url:
+    raw_url = _feed_url(cfg)
+    if not raw_url:
         info["error"] = "no calendar feed address set"
         return None, info
-    if url.lower().startswith("webcal://"):
-        url = "https://" + url[len("webcal://"):]
+    url = _normalize_feed_url(raw_url)
+    if url is None:
+        # Validated here, before anything can raise with the address inside
+        # it: urllib's own "unknown url type: '<the whole address>'" would
+        # carry the credential into `calendar test --json` and .meta.json.
+        info["error"] = "feed address must start with https:// or webcal://"
+        return None, info
     feed_path, meta_path = _cache_paths()
     meta = _read_cache_meta()
     key = _url_key(url)
@@ -968,8 +1092,11 @@ def fetch_ics(cfg: dict, refresh: bool = False, now: float | None = None) -> tup
             headers["If-None-Match"] = meta["etag"]
         if meta.get("last_modified"):
             headers["If-Modified-Since"] = meta["last_modified"]
-    req = urllib.request.Request(url, headers=headers)
+    # Every error message below is passed through _redact(): the address is
+    # the credential and must never appear in `info["error"]`, which ends up
+    # in `calendar test --json` and every recording's .meta.json.
     try:
+        req = urllib.request.Request(url, headers=headers)
         with urllib.request.urlopen(req, timeout=FETCH_TIMEOUT_S) as resp:
             body = resp.read()
             etag = resp.headers.get("ETag", "")
@@ -983,9 +1110,12 @@ def fetch_ics(cfg: dict, refresh: bool = False, now: float | None = None) -> tup
         if e.code in (401, 403, 404):
             err += " (the secret address may have been reset -- copy a fresh one from your calendar's settings)"
         return serve_cache(err) if have_cache else (None, {**info, "error": err})
-    except (urllib.error.URLError, TimeoutError, OSError, ValueError) as e:
+    except ValueError as e:  # a malformed address urllib refused (e.g. http.client.InvalidURL)
+        err = _redact(f"feed address is not a valid URL ({e.__class__.__name__})", raw_url, url)
+        return serve_cache(err) if have_cache else (None, {**info, "error": err})
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
         reason = getattr(e, "reason", None) or e.__class__.__name__
-        err = f"calendar feed unreachable ({reason})"
+        err = _redact(f"calendar feed unreachable ({reason})", raw_url, url)
         return serve_cache(err) if have_cache else (None, {**info, "error": err})
     text = body.decode("utf-8", errors="replace")
     if "BEGIN:VCALENDAR" not in text[:2000].upper():
@@ -1048,11 +1178,16 @@ def load_events(cfg: dict, win_start: datetime, win_end: datetime, refresh: bool
         text, info = fetch_ics(cfg, refresh=refresh)
         if text is None:
             return [], info
+        diag: dict = {}
         try:
-            events = events_from_ics(text, win_start, win_end, str(cfg.get("calendar_my_email") or ""))
+            events = events_from_ics(text, win_start, win_end, str(cfg.get("calendar_my_email") or ""), diag)
         except Exception as e:  # a feed we can't parse is a source error, never a crash
-            info["error"] = f"couldn't parse the calendar feed ({e.__class__.__name__}: {e})"
+            info["error"] = _redact(f"couldn't parse the calendar feed ({e.__class__.__name__}: {e})", _feed_url(cfg))
             return [], info
+        info["self_email"] = diag.get("self_email", "")
+        info["self_known"] = bool(diag.get("self_known"))
+        info["rules_skipped"] = int(diag.get("rules_skipped", 0))
+        info["skipped"] = diag.get("skipped", [])
         return events, info
     return [], {"source": "off", "cached": False, "fetched_at": 0, "error": ""}
 
@@ -1244,10 +1379,17 @@ def snapshot(cfg: dict, started_at: float, app: str = "", meet_codes=None, refre
         events, info = load_events(cfg, t - pad, t + pad, refresh=refresh)
         snap.update(source=info.get("source", "off"), fetched_at=info.get("fetched_at", 0),
                     cached=bool(info.get("cached")), error=info.get("error", ""))
+        if info.get("source") == "ics":
+            # Diagnostics that travel with the call: whose calendar this is
+            # (empty = couldn't tell; set calendar_my_email) and how many
+            # recurring series were skipped for RRULE parts we don't expand.
+            snap["self_email"] = str(info.get("self_email") or "")
+            snap["self_known"] = bool(info.get("self_known"))
+            snap["rules_skipped"] = int(info.get("rules_skipped") or 0)
         # Keep only what could ever be a candidate, so .meta.json stays small.
         snap["events"] = candidates_for(events, started_at)
     except Exception as e:  # pragma: no cover - belt and braces; nothing here may escape
-        snap["error"] = f"calendar lookup failed ({e.__class__.__name__}: {e})"
+        snap["error"] = _redact(f"calendar lookup failed ({e.__class__.__name__}: {e})", _feed_url(cfg))
     return snap
 
 
@@ -1458,11 +1600,18 @@ def test_report(cfg: dict, at: float, app: str = "", meet_codes=(), refresh: boo
         message = ("feed OK" if kind == "ics" else "command OK") + (", cached" if snap["cached"] else "")
     summary = decision["summary"]
     ev = decision["event"]
+    # Owner: for the feed, whether we know which address is yours (configured
+    # or clearly dominant, never a tie); a command marks `self` itself.
+    my_email = str(cfg.get("calendar_my_email") or "").strip().lower() if kind != "ics" else \
+        str(snap.get("self_email") or "")
+    my_email_known = True if kind != "ics" else bool(snap.get("self_known"))
     return {"ok": ok, "enabled": enabled, "source": kind, "message": f"{message}; {summary}",
             "error": snap["error"], "events_nearby": len(snap["events"]),
             "match": ev, "confident": decision["confident"], "confidence": decision["confidence"],
             "candidates": decision["candidates"], "summary": summary, "at": at,
-            "fetched_at": snap["fetched_at"], "cached": snap["cached"]}
+            "fetched_at": snap["fetched_at"], "cached": snap["cached"],
+            "my_email": my_email, "my_email_known": my_email_known,
+            "rules_skipped": int(snap.get("rules_skipped") or 0)}
 
 
 def format_test_report(rep: dict) -> str:
@@ -1478,6 +1627,16 @@ def format_test_report(rep: dict) -> str:
             lines.append(f"Attendees: {', '.join(names)}")
     else:
         lines.append(f"Match: none ({rep.get('summary', '')})")
+    if rep.get("source") == "ics" and rep.get("ok"):
+        if rep.get("my_email_known"):
+            lines.append(f"Your address: {rep.get('my_email') or '(configured)'}")
+        else:
+            lines.append("Your address: unknown -- no address clearly dominates the feed; set "
+                         "calendar_my_email so your own replies are read and speaker naming knows which side is you")
+        n = int(rep.get("rules_skipped") or 0)
+        if n:
+            lines.append(f"Skipped: {n} recurring series with RRULE parts Spitball doesn't expand "
+                         "(they never match a call; see CONTRACT.md \"Recurrence\")")
     cands = rep.get("candidates") or []
     if cands:
         lines.append("Candidates:")
