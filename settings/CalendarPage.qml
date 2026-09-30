@@ -110,7 +110,7 @@ SettingsPage {
     disabledLook: page.store.loadFailed
     onToggled: page.store.setKey("calendar_names_to_summary", !checked)
   }
-  NoteText { store: page.store; text: "Names go wherever the Summary endpoint points (a local model by default)." }
+  NoteText { store: page.store; text: "On: the summary request lists who was on the invite (names only, never addresses), wherever the Summary endpoint points (a local model by default). Off: the summarizer gets the meeting's title and time and nothing about the people. transcript.md and summary.md keep their own Attendees line either way, and speaker naming (Speakers page) has its own switch." }
   ErrorNote { store: page.store; key: "calendar_names_to_summary" }
 
   ToggleRow {
@@ -120,7 +120,7 @@ SettingsPage {
     disabledLook: page.store.loadFailed
     onToggled: page.store.setKey("calendar_description_to_summary", !checked)
   }
-  NoteText { store: page.store; text: "Off by default: descriptions can carry private text and add little." }
+  NoteText { store: page.store; text: "On: the event's description goes into the summary request as well. Off by default: descriptions can carry private text and add little." }
   ErrorNote { store: page.store; key: "calendar_description_to_summary" }
 
   RevealRow {

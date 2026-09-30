@@ -270,7 +270,11 @@ def _live_cmd(rest: list) -> int:
         elif status["fast"]:
             print(f"Fast live transcript: on ({status['model']})")
         elif not status["installed"]:
-            print("Fast live transcript: not installed (run `spitball live setup`)")
+            if live_engine.venv_present():
+                print(f"Fast live transcript: not installed -- the venv at {status['venv']} has no "
+                      "onnx-asr (the speaker split shares it); run `spitball live setup` to add it")
+            else:
+                print("Fast live transcript: not installed (run `spitball live setup`)")
         else:
             print("Fast live transcript: installed, but voxtype isn't on a Parakeet model")
         return 0

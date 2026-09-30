@@ -8,11 +8,17 @@ those ids into people. Three sources, in order of authority:
   calendar  a 1:1 call: exactly one other invitee and exactly one far
             voice, so the far side is that person, no model needed.
   llm       one short call to the summary endpoint with the transcript
-            and the invite list, asking which "Speaker N" is which invitee
-            and why ("0:42 'thanks, Priya' right after her turn"). Strict
-            JSON back; a name that isn't on the invite is thrown away, a
-            name claimed for two speakers makes both uncertain, and a
-            claim without evidence is downgraded.
+            and the invitees' names -- never their email addresses; an
+            invitee with no name on the invite is sent as a local
+            placeholder ("Invitee 2") that maps back here -- asking which
+            "Speaker N" is which invitee and why ("0:42 'thanks, Priya'
+            right after her turn"). Strict JSON back; a name that isn't on
+            the invite is thrown away, a name claimed for two speakers
+            makes both uncertain, and a claim without evidence is
+            downgraded. This pass is governed by `speaker_names` alone:
+            it cannot work without the names, so the Calendar page's
+            `calendar_names_to_summary` (the summary request's own invite
+            list) does not gate it.
 
 Rendering keeps the uncertainty visible: a high-confidence match reads as
 the name, a medium one as "Speaker 2 (probably Priya Nair)", anything
@@ -220,8 +226,10 @@ def mismatch_line(expected: int | None, found: int) -> str:
 
 def candidates(meeting: dict | None) -> list:
     """The far-side invitees: everyone who isn't `self` and didn't decline,
-    as {"name", "email"} with a display name (the address when the invite
-    carries no name)."""
+    as {"name", "email", "named", "label"}. `name` is the display name
+    (the address when the invite carries no name -- used locally only);
+    `label` is what the model is shown: the name, or "Invitee N" for a
+    nameless invitee, so no address ever reaches the model."""
     if not meeting or not isinstance(meeting.get("attendees"), list):
         return []
     out = []
@@ -229,25 +237,31 @@ def candidates(meeting: dict | None) -> list:
     for a in meeting["attendees"]:
         if not isinstance(a, dict) or a.get("self") or a.get("response") == "declined":
             continue
-        name = (a.get("name") or "").strip() or (a.get("email") or "").strip()
+        real = (a.get("name") or "").strip()
+        email = (a.get("email") or "").strip()
+        name = real or email
         if not name or name.lower() in seen:
             continue
         seen.add(name.lower())
-        out.append({"name": name, "email": (a.get("email") or "").strip()})
+        out.append({"name": name, "email": email, "named": bool(real)})
+    for i, c in enumerate(out, 1):
+        c["label"] = c["name"] if c["named"] else f"Invitee {i}"
     return out
 
 
 def _match_candidate(name: str, cands: list) -> str:
-    """The candidate's display name for what the model wrote: exact
-    (case-insensitive) first, then a unique first-name or address match."""
+    """The candidate's display name for what the model wrote: an exact
+    (case-insensitive) match on the label it was shown or the display
+    name, then a unique first-name match. Never by email address -- the
+    model was never given one, so matching on it would be a guess."""
     key = (name or "").strip().lower()
     if not key:
         return ""
     for c in cands:
-        if c["name"].lower() == key or (c["email"] and c["email"].lower() == key):
+        if c["label"].lower() == key or c["name"].lower() == key:
             return c["name"]
-    hits = [c for c in cands if c["name"].lower().split()[0] == key.split()[0]
-            or (c["email"] and c["email"].lower().split("@")[0] == key)]
+    first = key.split()[0]
+    hits = [c for c in cands if c["named"] and c["name"].lower().split()[0] == first]
     return hits[0]["name"] if len(hits) == 1 else ""
 
 
@@ -309,7 +323,9 @@ def name_with_llm(transcript_text: str, cands: list, me: str, cfg: dict, chat=No
     body = transcript_text
     if len(body) > NAMING_MAX_CHARS:
         body = body[:NAMING_MAX_CHARS] + "\n\n[transcript truncated]"
-    invite = "\n".join(f"- {c['name']}" + (f" <{c['email']}>" if c["email"] else "") for c in cands)
+    # Names only: the address never leaves the machine. A nameless invitee
+    # is a placeholder the model can echo back and candidates() maps home.
+    invite = "\n".join(f"- {c['label']}" + ("" if c["named"] else " (no name on the invite)") for c in cands)
     user = f"People on the invite (besides {me}):\n{invite}\n\nTranscript:\n\n{body}"
     reply = chat(NAMING_SYSTEM.replace("{me}", me), user, cfg, 800)
     return parse_answers(reply, cands)
@@ -353,12 +369,68 @@ def parse_answers(reply: str, cands: list) -> dict:
     return {n: a for n, a in answers.items() if a["confidence"] != "low"}
 
 
+# ------------------------------------------------------------------ re-transcription
+
+def carry_user_names(previous: dict | None, normalized: dict, cfg: dict) -> list:
+    """After `reprocess --retranscribe`: the hand-set (`source: user`)
+    entries of the old cache's `speakers` block are put onto the fresh
+    transcript so normalize_map() can follow each one to its voice by
+    provider id (the same id => the same voice, for Deepgram's ids and the
+    local split's cluster ids alike). An entry whose id no longer exists
+    can't be placed: it is recorded under `speakers_dropped`
+    ([{"name", "id", "was"}]) and returned, so the header and the CLI say
+    so instead of the name quietly disappearing. Automatic (calendar/llm)
+    entries are not carried -- resolve() recomputes those anyway."""
+    normalized.pop("speakers_dropped", None)
+    block = (previous or {}).get("speakers")
+    if not isinstance(block, dict) or not block:
+        return []
+    order, _ = far_speaker_order(normalized.get("utterances", []), max_speakers(cfg))
+    ids = set(order)
+    single = len(block) == 1
+    carry: dict = {}
+    dropped: list = []
+    for n in sorted(block, key=lambda k: int(k) if str(k).isdigit() else 0):
+        e = block[n]
+        if not isinstance(e, dict) or e.get("source") != "user" or not str(e.get("name") or "").strip():
+            continue
+        try:
+            spk = int(e["id"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if spk in ids:
+            carry[str(n)] = dict(e)
+        else:
+            dropped.append({"name": str(e["name"]).strip(), "id": spk,
+                            "was": "Them" if single else f"Speaker {n}"})
+    if carry:
+        normalized["speakers"] = carry  # re-keyed by resolve()/normalize_map()
+    if dropped:
+        normalized["speakers_dropped"] = dropped
+    return dropped
+
+
+def dropped_line(dropped) -> str:
+    """The header note for names a re-transcription could not carry over."""
+    if not isinstance(dropped, list) or not dropped:
+        return ""
+    items = [d for d in dropped if isinstance(d, dict) and d.get("name")]
+    if not items:
+        return ""
+    parts = ", ".join(f"{d['name']} (was {d.get('was') or 'a far-side speaker'})" for d in items)
+    plural = len(items) != 1
+    return (f"**Note:** re-transcribing changed the far-side voices, so {len(items)} hand-set "
+            f"name{'s' if plural else ''} could not be carried over: {parts}. "
+            f"Set {'them' if plural else 'it'} again with `spitball speakers <call-dir> <n> \"Name\"`.")
+
+
 # ------------------------------------------------------------------ CLI helpers
 
 def set_name(normalized: dict, cfg: dict, n: int, name: str) -> dict:
     """`spitball speakers <dir> <n> "Name"` / `--clear`: a user entry
     (kept forever) or, with an empty name, back to automatic. Returns the
-    updated map. Raises ValueError for an unknown speaker number."""
+    updated map. Raises ValueError for an unknown speaker number. Setting
+    a name that a re-transcription had dropped clears that dropped note."""
     order, _ = far_speaker_order(normalized.get("utterances", []), max_speakers(cfg))
     speakers = normalize_map(normalized.get("speakers"), order)
     key = str(n)
@@ -367,6 +439,14 @@ def set_name(normalized: dict, cfg: dict, n: int, name: str) -> dict:
     name = (name or "").strip()
     if name:
         speakers[key].update(name=name, confidence="high", source="user", evidence="set by hand")
+        dropped = normalized.get("speakers_dropped")
+        if isinstance(dropped, list):
+            dropped = [d for d in dropped if not (isinstance(d, dict)
+                                                 and str(d.get("name") or "").lower() == name.lower())]
+            if dropped:
+                normalized["speakers_dropped"] = dropped
+            else:
+                normalized.pop("speakers_dropped", None)
     else:
         speakers[key].update(name="", confidence="none", source="", evidence="")
     normalized["speakers"] = speakers

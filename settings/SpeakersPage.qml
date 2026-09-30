@@ -23,7 +23,11 @@ SettingsPage {
   }
   NoteText {
     store: page.store
-    text: "When a call matched a meeting, one short request to the summary endpoint matches each \"Speaker N\" to an invitee from what people say (\"thanks, Priya\", \"this is Alex\"). A sure match shows the name; an unsure one reads \"Speaker 2 (probably Priya)\"; no evidence keeps \"Speaker 2\". A call with one other invitee is named without any request. Fix a name with: spitball speakers <call-dir> <n> \"Name\"."
+    text: "When a call matched a meeting, one short request to the Summary endpoint matches each \"Speaker N\" to an invitee from what people say (\"thanks, Priya\", \"this is Alex\"). A sure match shows the name; an unsure one reads \"Speaker 2 (probably Priya)\"; no evidence keeps \"Speaker 2\". A call with one other invitee is named without any request. Fix a name with: spitball speakers <call-dir> <n> \"Name\"."
+  }
+  NoteText {
+    store: page.store
+    text: "What that request sends: the transcript and the invitees' names, never their email addresses. This switch alone governs it (naming can't work without the names), so turn it off if the Summary endpoint isn't your own machine and the names shouldn't leave it. The Calendar page's \"Send attendee names to the summarizer\" covers the summary request only, but a speaker named here appears by name in the transcript the summarizer reads."
   }
   ErrorNote { store: page.store; key: "speaker_names" }
 

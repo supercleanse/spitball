@@ -259,14 +259,34 @@ def _load_live_transcript(call_dir: Path, cfg: dict) -> dict | None:
     return data
 
 
-def _base_header(meta: dict, decision: dict | None) -> str:
+def _core_header(meta: dict) -> str:
     started = datetime.fromtimestamp(meta["started_at"])
-    header = (f"**Date:** {started:%B %-d, %Y, %-I:%M %p}  \n"
-              f"**App:** {meta.get('app') or 'Manual'}  \n"
-              f"**Length:** {_hms(meta['duration'])}")
+    return (f"**Date:** {started:%B %-d, %Y, %-I:%M %p}  \n"
+            f"**App:** {meta.get('app') or 'Manual'}  \n"
+            f"**Length:** {_hms(meta['duration'])}")
+
+
+def _base_header(meta: dict, decision: dict | None) -> str:
+    """The header of transcript.md / summary.md (local files): date, app,
+    length, and the matched meeting with its attendee list."""
+    header = _core_header(meta)
     cal_lines = calendar.header_lines(decision)
     if cal_lines:
         header += "  \n" + "  \n".join(cal_lines)
+    return header
+
+
+def _model_header(meta: dict, decision: dict | None, cfg: dict) -> str:
+    """What the summary endpoint is told about the call besides the
+    transcript. Built apart from the local header on purpose: the
+    calendar's part is `calendar.summary_context()` -- the meeting title and
+    time, the invite list only when `calendar_names_to_summary`, the
+    description only when `calendar_description_to_summary` -- so
+    transcript.md's own `**Attendees:**` line never rides along."""
+    header = _core_header(meta).replace("  \n", "\n")
+    context = calendar.summary_context(decision, cfg)
+    if context:
+        header += "\n" + context
     return header
 
 
@@ -282,8 +302,9 @@ def _transcript_notes(normalized: dict) -> list:
 
 
 def _speaker_lines(normalized: dict, cfg: dict, naming_error: str = "") -> list:
-    """The `**Speakers:**` line, the invite-count sanity check, and a note
-    when the naming pass was attempted and failed."""
+    """The `**Speakers:**` line, the invite-count sanity check, a note when
+    the naming pass was attempted and failed, and a note for any hand-set
+    name a re-transcription could not carry over."""
     order, _ = speakers.far_speaker_order(normalized.get("utterances", []), speakers.max_speakers(cfg))
     lines = speakers.summary_lines(normalized.get("speakers") or {}, single=len(order) == 1)
     mismatch = speakers.mismatch_line(diarize.expected_far_speakers(normalized.get("meeting")), len(order))
@@ -291,6 +312,9 @@ def _speaker_lines(normalized: dict, cfg: dict, naming_error: str = "") -> list:
         lines.append(mismatch)
     if naming_error:
         lines.append(f"**Note:** speaker names unavailable: {naming_error}")
+    dropped = speakers.dropped_line(normalized.get("speakers_dropped"))
+    if dropped:
+        lines.append(dropped)
     return lines
 
 
@@ -336,7 +360,10 @@ def process(call_dir: Path, meta: dict, cfg: dict | None = None, notify=None,
     meeting = calendar.meeting_record(decision)
     expected_far = diarize.expected_far_speakers(meeting)
 
-    cached = None if retranscribe else _load_cached_transcript(call_dir, cfg)
+    # The old cache is read even on a re-transcription: its hand-set
+    # speaker names (`spitball speakers`) are carried onto the fresh result.
+    previous = _load_cached_transcript(call_dir, cfg)
+    cached = None if retranscribe else previous
     if cached is not None:
         normalized = cached
     else:
@@ -354,6 +381,13 @@ def process(call_dir: Path, meta: dict, cfg: dict | None = None, notify=None,
             from .providers import local as local_provider
             normalized = diarize.split_transcript(audio, normalized, cfg, expected_far,
                                                   transcribe_piece=local_provider.transcribe_piece)
+        if previous is not None:
+            # A fresh transcript replaces the cache; the user's own names
+            # follow their voices by provider id, and any that can't are
+            # said out loud rather than lost.
+            dropped = speakers.carry_user_names(previous, normalized, cfg)
+            if dropped and notify:
+                notify(speakers.dropped_line(dropped).replace("**Note:** ", ""))
     if meeting:
         normalized["meeting"] = meeting
     else:
@@ -361,8 +395,8 @@ def process(call_dir: Path, meta: dict, cfg: dict | None = None, notify=None,
     (call_dir / ".transcript.json").write_text(json.dumps(normalized))
 
     # Speaker naming (spitball/speakers.py): who each far-side voice is,
-    # from the invite list and what people say. Reads the transcript with
-    # neutral labels; user renames from an earlier run survive.
+    # from the invitees' names and what people say. Reads the transcript
+    # with neutral labels; user renames from an earlier run survive.
     neutral = _render_lines(build_transcript(normalized, cfg, named=False))
     naming = speakers.resolve(normalized, cfg, neutral)
     (call_dir / ".transcript.json").write_text(json.dumps(normalized))
@@ -376,10 +410,13 @@ def process(call_dir: Path, meta: dict, cfg: dict | None = None, notify=None,
     if notify:
         notify("Summarizing…")
     title = event["title"] if use_event_title else f"Call on {started:%B %-d}"
-    summary_meta = header.replace("  \n", "\n")
-    context = calendar.summary_context(decision, cfg)
-    if context:
-        summary_meta += "\n" + context
+    # The summarizer's metadata is NOT the local header: the calendar part
+    # of it obeys the Calendar settings (see _model_header). The notes ride
+    # along -- a `**Speakers:**` line only carries names the naming pass
+    # (`speaker_names`) or the user already put on the transcript itself.
+    summary_meta = _model_header(meta, decision, cfg)
+    if notes:
+        summary_meta += "\n" + "\n".join(notes)
     try:
         summary = summarize(transcript, summary_meta, cfg) if lines else \
             f"# {title}\n\nNo speech was detected in this recording."

@@ -2,6 +2,7 @@
 never runs here: the protocol is exercised against small fake worker
 scripts run under this same interpreter, and tests/__init__.py points
 SPITBALL_ENGINE_DIR at a session temp dir with no venv in it."""
+import shutil
 import sys
 import tempfile
 import textwrap
@@ -52,6 +53,88 @@ class TestOpenEngine(unittest.TestCase):
              mock.patch("spitball.live_engine.Engine.open") as opener:
             self.assertIsNone(live_engine.open_engine({}))
         opener.assert_not_called()
+
+
+class TestInstalled(unittest.TestCase):
+    """installed(): Codex P2 regression -- it used to be "the venv python
+    exists", so a venv `spitball diarize setup` made (sherpa-onnx only)
+    read as a working live engine: `live status` said installed, the Live
+    page hid Install, and the worker could not start."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.tmp = Path(self._tmp.name)
+        p = mock.patch("spitball.live_engine.ENGINE_DIR", self.tmp)
+        p.start()
+        self.addCleanup(p.stop)
+        self.venv = self.tmp / "venv"
+
+    def _bare_venv(self):
+        (self.venv / "bin").mkdir(parents=True)
+        (self.venv / "bin" / "python").write_text("")
+
+    def test_no_venv(self):
+        self.assertFalse(live_engine.venv_present())
+        self.assertFalse(live_engine.installed())
+        self.assertFalse(live_engine.has_package("onnx_asr"))
+
+    def test_bare_or_diarize_only_venv_is_not_installed(self):
+        self._bare_venv()
+        self.assertTrue(live_engine.venv_present())
+        self.assertFalse(live_engine.installed())
+        (self.venv / "lib" / "python3.14" / "site-packages" / "sherpa_onnx").mkdir(parents=True)
+        self.assertFalse(live_engine.installed())
+        with mock.patch("spitball.live_engine.Engine.open") as opener:
+            self.assertIsNone(live_engine.open_engine({}))
+        opener.assert_not_called()
+
+    def test_onnx_asr_in_the_venv_means_installed(self):
+        self._bare_venv()
+        (self.venv / "lib" / "python3.14" / "site-packages" / "onnx_asr").mkdir(parents=True)
+        self.assertTrue(live_engine.installed())
+        # A stray file of that name is not a package.
+        shutil.rmtree(self.venv / "lib" / "python3.14" / "site-packages" / "onnx_asr")
+        (self.venv / "lib" / "python3.14" / "site-packages" / "onnx_asr").write_text("")
+        self.assertFalse(live_engine.installed())
+
+    def test_setup_into_a_diarize_only_venv_installs_onnx_asr(self):
+        # `live setup` must not skip an existing venv: it adds its packages.
+        self._bare_venv()
+        (self.venv / "lib" / "python3.14" / "site-packages" / "sherpa_onnx").mkdir(parents=True)
+        run = mock.Mock(return_value=mock.Mock(returncode=0, stdout="", stderr=""))
+        with mock.patch("spitball.live_engine.shutil.which", return_value="/usr/bin/uv"):
+            ok, _ = live_engine.setup(run=run)
+        self.assertTrue(ok)
+        cmds = [c.args[0] for c in run.call_args_list]
+        self.assertIn("--allow-existing", cmds[0])
+        self.assertEqual(cmds[1][:3], ["/usr/bin/uv", "pip", "install"])
+        self.assertTrue(any(p.startswith("onnx-asr") for p in cmds[1]), cmds[1])
+
+    def test_live_status_says_why_when_the_venv_has_no_engine(self):
+        import contextlib
+        import io
+        import json
+        from spitball.__main__ import main
+        self._bare_venv()
+        with mock.patch("spitball.providers.local.info", return_value={"engine": "parakeet", "model": ""}):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(main(["live", "status"]), 0)
+            self.assertIn("has no onnx-asr", out.getvalue())
+            self.assertIn("spitball live setup", out.getvalue())
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                main(["live", "status", "--json"])
+            status = json.loads(out.getvalue())
+            self.assertEqual((status["installed"], status["fast"]), (False, False))
+            self.assertEqual(status["venv"], str(self.venv))
+        shutil.rmtree(self.venv)
+        with mock.patch("spitball.providers.local.info", return_value={"engine": "parakeet", "model": ""}):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                main(["live", "status"])
+            self.assertEqual(out.getvalue().strip(), "Fast live transcript: not installed (run `spitball live setup`)")
 
 
 class TestModelDirFor(unittest.TestCase):

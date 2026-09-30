@@ -85,6 +85,6 @@ SettingsPage {
   }
   NoteText {
     store: page.store
-    text: "Installing creates a small virtualenv (about 130 MB) under ~/.local/share/spitball/live-engine/ with onnx-asr and onnxruntime. It needs voxtype on a Parakeet model to take effect."
+    text: "Installing creates a small virtualenv (about 130 MB) under ~/.local/share/spitball/live-engine/ with onnx-asr and onnxruntime, or adds them to the one the speaker split already made there. \"Installed\" means onnx-asr is actually in it. It needs voxtype on a Parakeet model to take effect."
   }
 }

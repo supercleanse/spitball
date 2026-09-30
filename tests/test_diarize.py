@@ -78,10 +78,12 @@ class TestInstalledOnDisk(unittest.TestCase):
             venv = Path(d) / "venv"
             (venv / "bin").mkdir(parents=True)
             (venv / "bin" / "python").write_text("")
-            self.assertTrue(live_engine.installed())
+            self.assertTrue(live_engine.venv_present())
+            self.assertFalse(live_engine.installed())  # a bare venv is no live engine
             self.assertFalse(diarize.package_installed())
             (venv / "lib" / "python3.14" / "site-packages" / "sherpa_onnx").mkdir(parents=True)
             self.assertTrue(diarize.package_installed())
+            self.assertFalse(live_engine.installed())  # Codex P2: diarize-only venv stays "not installed" for live
             self.assertFalse(diarize.installed())
             diarize.model_dir().mkdir(parents=True)
             diarize.segmentation_model().write_bytes(b"x")
@@ -89,6 +91,20 @@ class TestInstalledOnDisk(unittest.TestCase):
             diarize.embedding_model().write_bytes(b"y")
             self.assertTrue(diarize.installed())
             self.assertTrue(diarize.status()["installed"])
+            self.assertFalse(live_engine.installed())  # still: the split's install never claims the live engine
+
+    def test_each_add_on_sees_only_its_own_package(self):
+        # Symmetric: a live-engine-only venv is no speaker split, and a
+        # diarize-only venv is no live engine.
+        with tempfile.TemporaryDirectory() as d, mock.patch("spitball.live_engine.ENGINE_DIR", Path(d)):
+            venv = Path(d) / "venv"
+            (venv / "bin").mkdir(parents=True)
+            (venv / "bin" / "python").write_text("")
+            (venv / "lib" / "python3.14" / "site-packages" / "onnx_asr").mkdir(parents=True)
+            self.assertTrue(live_engine.installed())
+            self.assertFalse(diarize.package_installed())
+            self.assertEqual(diarize.status()["package"], False)
+            self.assertEqual(diarize.skip_reason(_cfg(), 3), "not installed")
 
 
 class TestSetup(unittest.TestCase):

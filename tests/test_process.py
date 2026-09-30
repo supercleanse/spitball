@@ -878,6 +878,45 @@ class TestCalendarInPipeline(TestProcessPipeline):
             process.process(self.call_dir, self._meta([self._event()], ["abc-defg-hij"]), cfg)
         self.assertIn("**Event description:**\nAgenda: numbers", summ.call_args.args[1])
 
+    def test_description_off_by_default_stays_out_of_the_summary_request(self):
+        cfg = dict(self.cfg, calendar_enabled=True)
+        p_transcribe, p_summarize = self._patched()
+        with p_transcribe, p_summarize as summ:
+            process.process(self.call_dir, self._meta([self._event()], ["abc-defg-hij"]), cfg)
+        self.assertNotIn("Agenda: numbers", summ.call_args.args[1])
+
+    def test_names_to_summary_off_keeps_attendees_local_and_out_of_the_request(self):
+        # Codex P1 regression: the local header's **Attendees:** line used to
+        # be copied into the summarizer's metadata, so the toggle changed
+        # nothing. The model-bound metadata is built on its own now.
+        cfg = dict(self.cfg, calendar_enabled=True, calendar_names_to_summary=False)
+        p_transcribe, p_summarize = self._patched()
+        with p_transcribe, p_summarize as summ:
+            result = process.process(self.call_dir, self._meta([self._event()], ["abc-defg-hij"]), cfg)
+        meta_arg = summ.call_args.args[1]
+        self.assertIn("**Meeting:** Weekly sync", meta_arg)      # title and time still go
+        self.assertIn("**When:**", meta_arg)
+        self.assertNotIn("Attendees", meta_arg)
+        self.assertNotIn("People on the invite", meta_arg)
+        self.assertNotIn("Person 0", meta_arg)
+        self.assertNotIn("Person 1", meta_arg)
+        self.assertNotIn("@", meta_arg)
+        # The local files keep the full attendee list regardless.
+        final_dir = Path(result["dir"])
+        for name in ("transcript.md", "summary.md"):
+            self.assertIn("**Attendees:** Person 0 (organizer), Person 1", (final_dir / name).read_text())
+
+    def test_names_to_summary_on_sends_the_invite_list_but_not_the_local_attendees_line(self):
+        cfg = dict(self.cfg, calendar_enabled=True)
+        p_transcribe, p_summarize = self._patched()
+        with p_transcribe, p_summarize as summ:
+            process.process(self.call_dir, self._meta([self._event()], ["abc-defg-hij"]), cfg)
+        meta_arg = summ.call_args.args[1]
+        self.assertIn("**People on the invite:** Person 0 (organizer), Person 1", meta_arg)
+        self.assertNotIn("**Attendees:**", meta_arg)
+        self.assertNotIn("@", meta_arg)
+        self.assertEqual(meta_arg.count("Person 1"), 1)
+
     def test_no_snapshot_and_calendar_off_is_unchanged(self):
         p_transcribe, p_summarize = self._patched()
         with p_transcribe, p_summarize as summ:
@@ -989,10 +1028,11 @@ class TestSpeakersInPipeline(TestProcessPipeline):
         self.assertIn("**[00:00:00] Priya Nair:** I think we should ship Friday", text)
         self.assertIn("**[00:00:05] Speaker 2 (probably Alex Demo):** I disagree, let's wait", text)
         self.assertIn("**Speakers:** Speaker 1 = Priya Nair, Speaker 2 (probably Alex Demo)", text)
-        # The model saw neutral labels and the invite list, not the names.
+        # The model saw neutral labels and the invitees' names -- never an address.
         system, user, _, _ = chat.call_args[0]
         self.assertIn("**[00:00:00] Speaker 1:** I think", user)
-        self.assertIn("- Priya Nair <priya@example.com>", user)
+        self.assertIn("- Priya Nair\n", user)
+        self.assertNotIn("@", user)
         # The summarizer got the renamed transcript and the Speakers line.
         transcript_arg, meta_arg = sm.call_args[0][0], sm.call_args[0][1]
         self.assertIn("Priya Nair:** I think", transcript_arg)
@@ -1078,6 +1118,86 @@ class TestSpeakersInPipeline(TestProcessPipeline):
         self.assertIn("**[00:00:05] Alex Demo:**", transcript)
         cache = json.loads((Path(result2["dir"]) / ".transcript.json").read_text())
         self.assertEqual({e["source"] for e in cache["speakers"].values()}, {"user"})
+
+    def _retranscribed(self, ids):
+        """The multi-speaker fixture with its far-side ids (2, 5) remapped --
+        what a fresh provider run might hand back."""
+        fresh = json.loads(json.dumps(_normalized_fixture("deepgram_multi_speaker.json", self.cfg)))
+        remap = dict(zip([2, 5], ids))
+        for u in fresh["utterances"]:
+            if u["channel"] == 1:
+                u["speaker"] = remap[u["speaker"]]
+        return fresh
+
+    def test_retranscribe_keeps_hand_set_names_by_voice_id(self):
+        # Codex P2 regression: a fresh provider result has no `speakers`
+        # block and used to wipe the user's names on --retranscribe.
+        result, _, _, _ = self._run(None)
+        final_dir = Path(result["dir"])
+        process.rename_speaker(final_dir, 1, "Priya N.", self.cfg)
+        process.rename_speaker(final_dir, 2, "Alex D.", self.cfg)
+        notes = []
+        with mock.patch("spitball.calendar.for_call", return_value=None), \
+             mock.patch("spitball.process.transcribe", return_value=self._retranscribed([2, 5])) as t, \
+             mock.patch("spitball.speakers._chat", side_effect=AssertionError("no model")), \
+             mock.patch("spitball.process.summarize", return_value="# T\n\n## Summary\n- x"):
+            process.process(final_dir, {}, self.cfg, notify=notes.append, retranscribe=True)
+        t.assert_called_once()
+        cache = json.loads((final_dir / ".transcript.json").read_text())
+        self.assertEqual([(e["name"], e["source"]) for e in cache["speakers"].values()],
+                         [("Priya N.", "user"), ("Alex D.", "user")])
+        self.assertNotIn("speakers_dropped", cache)
+        transcript = (final_dir / "transcript.md").read_text()
+        self.assertIn("**[00:00:00] Priya N.:**", transcript)
+        self.assertIn("**[00:00:05] Alex D.:**", transcript)
+        self.assertNotIn("could not be carried over", transcript)
+        self.assertFalse([n for n in notes if "carried over" in n])
+
+    def test_retranscribe_reports_a_name_it_could_not_carry_over(self):
+        result, _, _, _ = self._run(None)
+        final_dir = Path(result["dir"])
+        process.rename_speaker(final_dir, 1, "Priya N.", self.cfg)
+        process.rename_speaker(final_dir, 2, "Alex D.", self.cfg)
+        notes = []
+        with mock.patch("spitball.calendar.for_call", return_value=None), \
+             mock.patch("spitball.process.transcribe", return_value=self._retranscribed([2, 9])), \
+             mock.patch("spitball.speakers._chat", side_effect=AssertionError("no model")), \
+             mock.patch("spitball.process.summarize", return_value="# T\n\n## Summary\n- x") as sm:
+            process.process(final_dir, {}, self.cfg, notify=notes.append, retranscribe=True)
+        cache = json.loads((final_dir / ".transcript.json").read_text())
+        self.assertEqual(cache["speakers"]["1"]["name"], "Priya N.")
+        self.assertEqual(cache["speakers"]["2"]["name"], "")
+        self.assertEqual(cache["speakers_dropped"], [{"name": "Alex D.", "id": 5, "was": "Speaker 2"}])
+        note = "1 hand-set name could not be carried over: Alex D. (was Speaker 2)"
+        transcript = (final_dir / "transcript.md").read_text()
+        self.assertIn("**[00:00:05] Speaker 2:**", transcript)
+        self.assertIn(f"**Note:** re-transcribing changed the far-side voices, so {note}", transcript)
+        self.assertIn(note, (final_dir / "summary.md").read_text())
+        self.assertIn(note, sm.call_args.args[1])          # the summarizer is told too
+        self.assertTrue([n for n in notes if note in n], notes)  # and the CLI (notify=print)
+        # Setting the name again clears the note; a plain reprocess keeps it otherwise.
+        with mock.patch("spitball.calendar.for_call", return_value=None), \
+             mock.patch("spitball.process.transcribe", side_effect=AssertionError("cached")), \
+             mock.patch("spitball.process.summarize", return_value="# T\n\n## Summary\n- x"):
+            process.process(final_dir, {}, self.cfg)
+        self.assertIn(note, (final_dir / "transcript.md").read_text())
+        process.rename_speaker(final_dir, 2, "Alex D.", self.cfg)
+        self.assertNotIn("carried over", (final_dir / "transcript.md").read_text())
+        self.assertNotIn("speakers_dropped", json.loads((final_dir / ".transcript.json").read_text()))
+
+    def test_plain_reprocess_never_reports_dropped_names(self):
+        result, _, _, _ = self._run(None)
+        final_dir = Path(result["dir"])
+        process.rename_speaker(final_dir, 2, "Alex D.", self.cfg)
+        notes = []
+        with mock.patch("spitball.calendar.for_call", return_value=None), \
+             mock.patch("spitball.process.transcribe", side_effect=AssertionError("cached")), \
+             mock.patch("spitball.process.summarize", return_value="# T\n\n## Summary\n- x"):
+            process.process(final_dir, {}, self.cfg, notify=notes.append)
+        cache = json.loads((final_dir / ".transcript.json").read_text())
+        self.assertEqual(cache["speakers"]["2"]["name"], "Alex D.")
+        self.assertNotIn("speakers_dropped", cache)
+        self.assertEqual(notes, ["Summarizing…"])
 
     def test_clear_goes_back_to_automatic(self):
         result, _, _, _ = self._run(None)

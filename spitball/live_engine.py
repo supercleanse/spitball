@@ -47,8 +47,30 @@ def venv_python() -> Path:
     return ENGINE_DIR / "venv" / "bin" / "python"
 
 
-def installed() -> bool:
+def venv_present() -> bool:
+    """Whether the shared venv exists at all. Not the same as installed():
+    `spitball diarize setup` creates this same venv with only sherpa-onnx
+    in it, which is no live engine."""
     return venv_python().exists()
+
+
+def has_package(import_name: str) -> bool:
+    """Whether a package is in the venv, by its import directory under
+    site-packages -- checked on disk, not by importing, so a status call
+    never has to start the venv's Python. Shared with spitball/diarize.py
+    for its own package."""
+    if not venv_present():
+        return False
+    venv = ENGINE_DIR / "venv"
+    return any(p.is_dir() for p in venv.glob(f"lib/python*/site-packages/{import_name}"))
+
+
+def installed() -> bool:
+    """The venv exists AND onnx-asr is in it -- what the worker imports.
+    A venv without it (diarize-only, or a half-finished `live setup`)
+    reports not installed, so `live status`, the Live page's Install
+    button, and open_engine() all agree with what can actually start."""
+    return has_package("onnx_asr")
 
 
 def model_dir_for(meta: dict) -> Path | None:
@@ -90,7 +112,9 @@ def install(packages: tuple, run=subprocess.run) -> str:
 
 
 def setup(run=subprocess.run) -> tuple[bool, str]:
-    """Creates the venv and installs PACKAGES. Returns (ok, message)."""
+    """Creates the venv (or reuses one `spitball diarize setup` made) and
+    installs PACKAGES into it -- never skipped on an existing venv, since
+    a diarize-only venv has no onnx-asr yet. Returns (ok, message)."""
     error = install(PACKAGES, run)
     if error:
         return False, error

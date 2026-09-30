@@ -197,8 +197,11 @@ virtualenv at `~/.local/share/spitball/live-engine/venv` (about 130 MB) and inst
 [onnx-asr](https://github.com/istupakov/onnx-asr), onnxruntime, numpy, and
 sentencepiece into it from PyPI. It uses [uv](https://docs.astral.sh/uv/) when it's
 on your PATH, otherwise `python3 -m venv` and pip. Nothing outside that folder is
-installed, and deleting the folder removes it. Without it, the live transcript still
-works, just a few seconds slower (see [Live transcript](#live-transcript)).
+installed, and deleting the folder removes it. The speaker split shares this venv;
+if `spitball diarize setup` made it first, `live setup` adds onnx-asr to it, and
+`live status` reports the engine installed only once onnx-asr is really there.
+Without it, the live transcript still works, just a few seconds slower (see
+[Live transcript](#live-transcript)).
 
 Switching voxtype between its Whisper and Parakeet engines from Settings asks for
 your password (a graphical `pkexec` prompt, or `sudo` in a terminal as a fallback),
@@ -446,7 +449,12 @@ Speakers page.
 **Naming from the invite** (`speaker_names`, on by default). When a call has a
 confident calendar match, Spitball hands the transcript (with its neutral labels) and
 the invitees' names to the summary endpoint once, before the summary, and asks which
-"Speaker N" is which invitee and why. Only what people actually say counts: someone
+"Speaker N" is which invitee and why. Names only: an email address never goes along,
+and an invitee with no name on the invite is sent as a placeholder ("Invitee 2") that
+maps back on this machine. This switch alone decides whether that request happens
+(naming can't work without the names), so the Calendar page's "Send attendee names to
+the summarizer" does not gate it: turn `speaker_names` off if the summary endpoint
+isn't your own machine and the names shouldn't leave it. Only what people actually say counts: someone
 introducing themselves, being addressed by name right before or after their turn,
 or you addressing them. A name that isn't on the invite is thrown away; a name
 claimed for two speakers makes both unsure. A sure match shows the name; an unsure
@@ -462,6 +470,13 @@ wording included), and the export copy on the spot, without another model call. 
 hand-set name is final: a later `spitball reprocess` keeps it and only re-resolves
 the others. `--clear` goes back to automatic. If you want a fresh summary written
 with the corrected names, run `spitball reprocess <call-dir>` afterward.
+
+`spitball reprocess <call-dir> --retranscribe` keeps hand-set names too: each one
+follows its voice onto the fresh transcript by the provider's speaker id. When a
+re-transcription comes back with different voices and a name has nowhere to go, it is
+not dropped quietly: the command says so, the transcript and summary header carry a
+`**Note:**` naming it (until you set it again or the next `--retranscribe`), and
+`.transcript.json` records it under `speakers_dropped`.
 
 **Telling voices apart on this computer** (`speaker_split`, on by default, no
 effect until installed). Deepgram splits the far channel on its own. The local
@@ -529,10 +544,10 @@ default, and you only need to set the ones you want to change.
 | `calendar_command` | `""` | A shell command printing a JSON array of events (shape in CONTRACT.md); used when `calendar_source` is `"command"`. |
 | `calendar_cache_ttl_s` | `900` | Re-download the feed once the cached copy is older than this many seconds. |
 | `calendar_prefer_event_title` | `true` | On a confident match, the event's title becomes the call's title (folder, transcript, summary). `false` keeps the summarizer's title and adds only the meeting header. |
-| `calendar_names_to_summary` | `true` | Tell the summarizer who was on the invite. |
-| `calendar_description_to_summary` | `false` | Also send the event description to the summarizer. Off by default: it can carry private text. |
+| `calendar_names_to_summary` | `true` | Put the invite list (names only, never addresses) in the summary request. `false`: the summarizer gets the meeting's title and time and nothing about the people; `transcript.md` and `summary.md` keep their own `**Attendees:**` line either way. Speaker naming has its own switch, `speaker_names`. |
+| `calendar_description_to_summary` | `false` | Also send the event description in the summary request. Off by default: it can carry private text. |
 | `calendar_my_email` | `""` | Your address on the calendar, so your own response is read (declined invites are skipped). Empty: the address on nearly every invite in the feed is taken as yours. |
-| `speaker_names` | `true` | Put invitees' names on the far-side speakers, from what people say, when the call matched a meeting. One short call to the summary endpoint; a 1:1 needs none. See [Speakers](#speakers). |
+| `speaker_names` | `true` | Put invitees' names on the far-side speakers, from what people say, when the call matched a meeting. One short call to the summary endpoint carrying the transcript and the invitees' names (never their addresses); a 1:1 needs none. This switch alone governs that call: `calendar_names_to_summary` does not. See [Speakers](#speakers). |
 | `speaker_split` | `true` | Tell far-side voices apart on the local provider, once `spitball diarize setup` has installed the add-on. Never runs for a 1:1; any failure keeps one "Them". |
 | `speaker_max` | `6` | The most far-side voices a transcript shows (1–12). The invite's headcount is used when known, capped here; extra or tiny voices fold into their neighbors. |
 
@@ -586,14 +601,18 @@ With the calendar on, the feed is read into `~/.local/state/spitball/calendar/` 
 600) and the events around each call are written into that call's `.meta.json`. The
 names of the people on the invite go to the summary endpoint along with the
 transcript (`calendar_names_to_summary`, on by default — turn it off if that endpoint
-is not your own machine); the event description goes only if you turn
-`calendar_description_to_summary` on. Attendee email addresses stay in the dot-files
-and never appear in `transcript.md` or `summary.md` unless an attendee has no name on
-the invite.
+is not your own machine, and the summarizer then gets only the meeting's title and
+time; the `**Attendees:**` line in `transcript.md` and `summary.md` is local and is
+never what the model sees); the event description goes only if you turn
+`calendar_description_to_summary` on. Attendee email addresses stay in the dot-files,
+never go to any model, and never appear in `transcript.md` or `summary.md` unless an
+attendee has no name on the invite.
 
-Speaker naming sends the same two things (the transcript and the invitees' names and
-addresses) to that same endpoint once more, before the summary; `speaker_names:
-false` turns it off. The on-device speaker split runs entirely on your machine and
+Speaker naming sends the transcript and the invitees' names (never their addresses)
+to that same endpoint once more, before the summary; `speaker_names: false` turns it
+off, and nothing else does — it needs the names, so `calendar_names_to_summary` has
+no say in it. A speaker it names then appears by name in the transcript the
+summarizer reads. The on-device speaker split runs entirely on your machine and
 keeps nothing between calls: no voice profiles, no enrollment, no guesses about
 anyone's gender. The names Spitball prints come only from the invite and from what
 people said.
@@ -662,10 +681,10 @@ ln -s ~/.config/omarchy/plugins/supercleanse.spitball/bin/spitball ~/.local/bin/
 | `spitball check transcription\|summary [--json]` | Test the configured transcription provider or summary endpoint for real. |
 | `spitball calendar test [--at TIME] [--app APP] [--meet CODE] [--refresh] [--json]` | Which calendar event a call starting now (or at `TIME`) would match, with every candidate and its score. See [Calendar](#calendar). |
 | `spitball local info\|models\|set-model` | What voxtype is configured with, every model it can download, or switch it to one. See [Transcription providers](#transcription-providers). |
-| `spitball live setup\|status [--json]` | Install the fast live-transcript engine, or show whether it's on and which model it loads. See [Live transcript](#live-transcript). |
+| `spitball live setup\|status [--json]` | Install the fast live-transcript engine (into the shared venv, even one the speaker split already made), or show whether it's on and which model it loads. "Installed" means onnx-asr is actually in the venv. See [Live transcript](#live-transcript). |
 | `spitball speakers <call-dir> [--json]` | List a call's far-side speakers: label, resolved name, confidence, source, evidence, talk time. See [Speakers](#speakers). |
 | `spitball speakers <call-dir> <n> "Name"` / `--clear` | Name speaker `n` by hand (or go back to automatic) and re-render `transcript.md`, `summary.md`, and the export copy. No model call. |
-| `spitball diarize setup\|status [--json]` | Install the on-device speaker split (sherpa-onnx + two small models, into the live-engine venv), or show whether it's installed. |
+| `spitball diarize setup\|status [--json]` | Install the on-device speaker split (sherpa-onnx + two small models, into the live-engine venv), or show whether it's installed. Each add-on checks for its own package: a venv with only sherpa-onnx is a working split and not a live engine, and the other way around. |
 | `spitball pick-folder [--title T]` | Native folder chooser; prints the chosen path (used by the settings panel). |
 | `spitball daemon` | Run the service directly. `SpitballService.qml` does this for you; you shouldn't need to. |
 

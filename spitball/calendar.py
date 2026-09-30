@@ -1371,14 +1371,20 @@ def header_lines(decision: dict | None) -> list:
 
 
 def summary_context(decision: dict | None, cfg: dict) -> str:
-    """Extra lines for the summarizer's user message: the invite list (when
-    `calendar_names_to_summary`) and the description (only when
-    `calendar_description_to_summary` -- off by default, it can carry
+    """The calendar's whole contribution to the summarizer's user message
+    (process.py builds the model's metadata from this, never from
+    header_lines(), whose `**Attendees:**` line is for the local files):
+    the meeting title and time always; the invite list only when
+    `calendar_names_to_summary`; the description only when
+    `calendar_description_to_summary` (off by default, it can carry
     private text)."""
     if not decision or not decision.get("event"):
         return ""
     ev = decision["event"]
     lines = [f"**Meeting:** {ev['title']}"]
+    when = format_when(ev)
+    if when:
+        lines.append(f"**When:** {when}")
     if cfg.get("calendar_names_to_summary", True):
         names = attendee_names(ev)
         if names:

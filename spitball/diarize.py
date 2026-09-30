@@ -91,11 +91,12 @@ def embedding_model() -> Path:
 
 
 def package_installed() -> bool:
-    """Whether the sherpa-onnx wheel is in the live-engine venv -- checked
-    on disk, not by importing (that would mean starting the venv's Python
-    on every status call)."""
-    venv = live_engine.ENGINE_DIR / "venv"
-    return live_engine.installed() and any(venv.glob("lib/python*/site-packages/sherpa_onnx"))
+    """Whether the sherpa-onnx wheel is in the shared venv -- checked on
+    disk, not by importing (that would mean starting the venv's Python on
+    every status call). Independent of the live engine's own package:
+    a diarize-only venv counts here and not for `live status`, and the
+    other way around."""
+    return live_engine.has_package("sherpa_onnx")
 
 
 def models_present() -> bool:

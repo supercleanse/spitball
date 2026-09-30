@@ -152,15 +152,32 @@ class TestCandidates(unittest.TestCase):
         self.assertEqual(speakers.candidates(None), [])
         self.assertEqual(speakers.candidates({"attendees": "nope"}), [])
 
-    def test_match_candidate_exact_first_name_and_address(self):
+    def test_match_candidate_exact_and_first_name_never_address(self):
         cands = speakers.candidates(MEETING)
         self.assertEqual(speakers._match_candidate("priya nair", cands), "Priya Nair")
         self.assertEqual(speakers._match_candidate("Priya", cands), "Priya Nair")
-        self.assertEqual(speakers._match_candidate("alex@example.com", cands), "Alex Demo")
         self.assertEqual(speakers._match_candidate("alex", cands), "Alex Demo")
+        # The model is never shown an address, so one it writes is a guess, not a match.
+        self.assertEqual(speakers._match_candidate("alex@example.com", cands), "")
         self.assertEqual(speakers._match_candidate("Sam Declined", cands), "")  # not a candidate
         self.assertEqual(speakers._match_candidate("Nobody", cands), "")
         self.assertEqual(speakers._match_candidate("", cands), "")
+
+    def test_nameless_invitee_is_a_placeholder_for_the_model_that_maps_home(self):
+        # Codex P1 regression: an invitee with no name on the invite used to
+        # reach the model as their address. Now the model sees "Invitee N"
+        # and its answer maps back to the local display name (the address).
+        m = {"attendees": [{"name": "Priya Nair", "email": "priya@example.com", "response": "accepted", "self": False},
+                           {"name": "", "email": "x@example.com", "response": "accepted", "self": False}]}
+        cands = speakers.candidates(m)
+        self.assertEqual([(c["label"], c["named"]) for c in cands], [("Priya Nair", True), ("Invitee 2", False)])
+        self.assertEqual(speakers._match_candidate("Invitee 2", cands), "x@example.com")
+        self.assertEqual(speakers._match_candidate("invitee 2", cands), "x@example.com")
+        self.assertEqual(speakers._match_candidate("x@example.com", cands), "x@example.com")  # local name, exact
+        self.assertEqual(speakers._match_candidate("x", cands), "")  # no first-name guessing off an address
+        self.assertEqual(speakers.parse_answers(
+            json.dumps({"Speaker 1": {"name": "Invitee 2", "confidence": "high", "evidence": "0:01 intro"}}),
+            cands)["1"]["name"], "x@example.com")
 
     def test_ambiguous_first_name_is_no_match(self):
         m = {"attendees": [{"name": "Sam One", "email": "", "response": "accepted", "self": False},
@@ -252,13 +269,35 @@ class TestResolve(unittest.TestCase):
         self.assertEqual(rep["method"], "llm")
         system, user, cfg, max_tokens = chat.call_args[0]
         self.assertIn("Morgan", system)
-        self.assertIn("- Priya Nair <priya@example.com>", user)
-        self.assertIn("- Alex Demo <alex@example.com>", user)
+        self.assertIn("- Priya Nair\n", user)
+        self.assertIn("- Alex Demo\n", user)
+        self.assertNotIn("@", user)  # names only: no address ever leaves the machine
         self.assertNotIn("Sam Declined", user)
         self.assertIn("**[00:00:05] Speaker 1:** hello", user)
         self.assertEqual(n["speakers"]["1"], {"id": 0, "name": "Alex Demo", "confidence": "medium",
                                               "source": "llm", "evidence": "0:05 intro"})
         self.assertEqual(n["speakers"]["2"]["name"], "")
+
+    def test_llm_prompt_shows_a_nameless_invitee_as_a_placeholder(self):
+        meeting = {"attendees": [MEETING["attendees"][0],
+                                 {"name": "", "email": "x@example.com", "response": "accepted", "self": False}]}
+        n = self._normalized(meeting=meeting)
+        chat = mock.Mock(return_value=json.dumps({"Speaker 2": {"name": "Invitee 2", "confidence": "high", "evidence": "0:15 'this is me'"}}))
+        speakers.resolve(n, _cfg(), "t", chat=chat)
+        user = chat.call_args[0][1]
+        self.assertIn("- Priya Nair\n", user)
+        self.assertIn("- Invitee 2 (no name on the invite)", user)
+        self.assertNotIn("@", user)
+        self.assertEqual(n["speakers"]["2"]["name"], "x@example.com")  # mapped back locally
+
+    def test_naming_is_governed_by_speaker_names_alone(self):
+        # The Calendar page's calendar_names_to_summary is about the summary
+        # request; naming can't work without the names, so it still runs.
+        n = self._normalized()
+        chat = mock.Mock(return_value="{}")
+        rep = speakers.resolve(n, _cfg(calendar_names_to_summary=False), "t", chat=chat)
+        self.assertEqual(rep["method"], "llm")
+        chat.assert_called_once()
 
     def test_user_entries_are_never_recomputed(self):
         block = {"1": {"id": 0, "name": "Hand Named", "confidence": "high", "source": "user", "evidence": "set by hand"},
@@ -372,6 +411,78 @@ class TestCliHelpers(unittest.TestCase):
         body = "Them asked twice. Later, Wrong Name asked again."
         out = speakers.rename_in_summary(body, {"1": "Wrong Name"}, {"1": "Right Name"})
         self.assertEqual(out, "Right Name asked twice. Later, Right Name asked again.")
+
+
+class TestCarryUserNames(unittest.TestCase):
+    """carry_user_names(): Codex P2 regression -- `reprocess --retranscribe`
+    used to overwrite the cache with a provider result that has no
+    `speakers` block, and every hand-set name went with it."""
+
+    def _old(self):
+        return {"speakers": {
+            "1": {"id": 2, "name": "Priya N.", "confidence": "high", "source": "user", "evidence": "set by hand"},
+            "2": {"id": 5, "name": "Old Guess", "confidence": "high", "source": "llm", "evidence": "e"},
+            "3": {"id": 7, "name": "Sam Hand", "confidence": "high", "source": "user", "evidence": "set by hand"}}}
+
+    def _fresh(self, ids):
+        return {"utterances": [_u(1, 5 + 10 * i, 12 + 10 * i, "a good long stretch of words spoken here", speaker=s)
+                               for i, s in enumerate(ids)]}
+
+    def test_same_ids_carry_over_and_automatic_entries_do_not(self):
+        n = self._fresh([2, 5, 7])
+        self.assertEqual(speakers.carry_user_names(self._old(), n, _cfg()), [])
+        block = speakers.normalize_map(n["speakers"], [2, 5, 7])
+        self.assertEqual((block["1"]["name"], block["1"]["source"]), ("Priya N.", "user"))
+        self.assertEqual(block["2"]["name"], "")  # the llm guess is resolve()'s job again
+        self.assertEqual((block["3"]["name"], block["3"]["source"]), ("Sam Hand", "user"))
+        self.assertNotIn("speakers_dropped", n)
+
+    def test_a_gone_id_is_dropped_and_recorded(self):
+        n = self._fresh([2, 9])
+        dropped = speakers.carry_user_names(self._old(), n, _cfg())
+        self.assertEqual(dropped, [{"name": "Sam Hand", "id": 7, "was": "Speaker 3"}])
+        self.assertEqual(n["speakers_dropped"], dropped)
+        block = speakers.normalize_map(n["speakers"], [2, 9])
+        self.assertEqual(block["1"]["name"], "Priya N.")
+        self.assertEqual(block["2"]["name"], "")
+
+    def test_single_voice_reads_them(self):
+        old = {"speakers": {"1": {"id": 0, "name": "Only One", "confidence": "high", "source": "user", "evidence": "x"}}}
+        n = self._fresh([3])
+        self.assertEqual(speakers.carry_user_names(old, n, _cfg()), [{"name": "Only One", "id": 0, "was": "Them"}])
+
+    def test_nothing_to_carry(self):
+        n = self._fresh([2])
+        self.assertEqual(speakers.carry_user_names(None, n, _cfg()), [])
+        self.assertEqual(speakers.carry_user_names({"speakers": "junk"}, n, _cfg()), [])
+        self.assertEqual(speakers.carry_user_names({"speakers": {"1": {"id": "?", "name": "X", "source": "user"}}}, n, _cfg()), [])
+        self.assertNotIn("speakers", n)
+        # A stale dropped record from an earlier run is cleared by the next carry.
+        n["speakers_dropped"] = [{"name": "Stale", "id": 1, "was": "Speaker 1"}]
+        speakers.carry_user_names(None, n, _cfg())
+        self.assertNotIn("speakers_dropped", n)
+
+    def test_dropped_line_wording(self):
+        self.assertEqual(speakers.dropped_line(None), "")
+        self.assertEqual(speakers.dropped_line([]), "")
+        self.assertEqual(speakers.dropped_line([{"name": ""}]), "")
+        one = speakers.dropped_line([{"name": "Sam Hand", "id": 7, "was": "Speaker 3"}])
+        self.assertTrue(one.startswith("**Note:** re-transcribing changed the far-side voices, so 1 hand-set name "
+                                       "could not be carried over: Sam Hand (was Speaker 3). Set it again"), one)
+        two = speakers.dropped_line([{"name": "A", "was": "Speaker 1"}, {"name": "B", "was": "Speaker 2"}])
+        self.assertIn("2 hand-set names could not be carried over: A (was Speaker 1), B (was Speaker 2). Set them again", two)
+
+    def test_setting_a_dropped_name_again_clears_its_record(self):
+        n = self._fresh([2, 9])
+        speakers.carry_user_names(self._old(), n, _cfg())
+        speakers.set_name(n, _cfg(), 2, "sam hand")  # case-insensitive
+        self.assertNotIn("speakers_dropped", n)
+        self.assertEqual(n["speakers"]["2"]["name"], "sam hand")
+        # A different name leaves the record (and its note) in place.
+        n2 = self._fresh([2, 9])
+        speakers.carry_user_names(self._old(), n2, _cfg())
+        speakers.set_name(n2, _cfg(), 2, "Someone Else")
+        self.assertEqual(n2["speakers_dropped"][0]["name"], "Sam Hand")
 
 
 class TestDeepgramFixture(unittest.TestCase):
