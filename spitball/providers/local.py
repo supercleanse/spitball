@@ -60,6 +60,13 @@ described in step 3).
 voxtype has no timestamps of its own, so each channel is segmented into
 speech windows ourselves (ffmpeg silencedetect) and each window is
 transcribed as its own utterance.
+
+The far channel is one mixed voice to voxtype. With the optional speaker
+split installed (`spitball diarize setup`, spitball/diarize.py) it is
+diarized first, and each speech window is cut at any speaker change before
+it is transcribed, so every utterance carries the id of the one voice in
+it. Without the add-on, or when the invite says there was only one other
+person, every far utterance keeps `speaker: 0` as before.
 """
 from __future__ import annotations
 
@@ -73,6 +80,8 @@ from pathlib import Path
 
 from .. import audio as audio_mod
 from .. import config
+from .. import denoise
+from .. import diarize
 
 NOT_INSTALLED_MESSAGE = "Install dictation (voxtype) or pick a cloud service"
 VOXTYPE_LIB_DIR = Path("/usr/lib/voxtype")
@@ -201,20 +210,49 @@ def info() -> dict:
 
 # --------------------------------------------------------------- transcribe
 
-def _transcribe_channel(wav: Path, channel: int, tmp: Path) -> list:
+def _transcribe_channel(wav: Path, channel: int, tmp: Path, vad: bool = False,
+                        segments: list | None = None) -> list:
+    """Segments one channel into speech windows and transcribes each.
+
+    `vad=True` is the Whisper path's tighter speech detection (docs/SPEC-v2.md
+    section 3): Whisper hallucinates text over audio with no speech in it, so
+    (1) when steady background noise sits above `silencedetect`'s fixed
+    -35 dB gate -- which otherwise leaves the channel with no detectable
+    pauses and cuts it into 30 s blocks of noise -- the gate is raised to
+    10 dB above the measured floor, and (2) any window whose loudest 50 ms
+    frame stays within 6 dB of the floor is skipped as noise-only. Both come
+    from one cheap `astats` pass (audio.measure_levels), no extra tools.
+    Parakeet is far less prone to hallucinating, so it keeps the plain
+    -35 dB segmentation (`vad=False`).
+
+    `segments` (the far channel only) are diarized speaker turns, [(start,
+    end, speaker)]: each window is cut where the speaker changes
+    (diarize.plan_windows) and every piece is transcribed under its own
+    speaker id. None (or []) keeps every utterance at `speaker: 0`."""
     duration = audio_mod.ffprobe_duration(wav)
-    silences = audio_mod.detect_silence(wav)
-    windows = audio_mod.speech_windows(duration, silences)
+    levels: list[float] = []
+    floor = None
+    noise_db = denoise.SILENCE_GATE_DB
+    if vad:
+        levels = audio_mod.measure_levels(wav)
+        floor = denoise.noise_floor_db(levels)
+        noise_db = denoise.adaptive_silence_db(floor)
+    silences = audio_mod.detect_silence(wav, noise_db=noise_db)
+    windows = [(s, e) for s, e in audio_mod.speech_windows(duration, silences) if e - s >= 0.4]
+    if vad:
+        windows = [(s, e) for s, e in windows if denoise.has_speech(levels, s, e, floor)]
+    if segments:
+        pieces = diarize.plan_windows(windows, segments)
+    else:
+        pieces = [(s, e, 0) for s, e in windows]
     utterances = []
-    for i, (start, end) in enumerate(windows):
-        if end - start < 0.4:
-            continue
-        utterances += _transcribe_window(wav, channel, start, end, tmp, f"ch{channel}-w{i}")
+    for i, (start, end, speaker) in enumerate(pieces):
+        utterances += _transcribe_window(wav, channel, start, end, tmp, f"ch{channel}-w{i}", speaker)
     return utterances
 
 
 def _transcribe_window(wav: Path, channel: int, start: float, end: float, tmp: Path,
-                       tag: str) -> list:
+                       tag: str, speaker: int = 0) -> list:
     """One voxtype run on [start, end). If voxtype fails, retry the two halves,
     down to MIN_RETRY_S; a piece that still fails becomes a visible gap marker
     instead of silently disappearing."""
@@ -230,25 +268,47 @@ def _transcribe_window(wav: Path, channel: int, start: float, end: float, tmp: P
         clip.unlink(missing_ok=True)
     if ok:
         text = _clean_stdout(r.stdout)
-        return [{"channel": channel, "speaker": 0, "start": start, "end": end,
+        return [{"channel": channel, "speaker": speaker, "start": start, "end": end,
                  "transcript": text}] if text else []
     if end - start >= 2 * MIN_RETRY_S:
         mid = (start + end) / 2
-        return (_transcribe_window(wav, channel, start, mid, tmp, tag + "a")
-                + _transcribe_window(wav, channel, mid, end, tmp, tag + "b"))
-    return [{"channel": channel, "speaker": 0, "start": start, "end": end,
+        return (_transcribe_window(wav, channel, start, mid, tmp, tag + "a", speaker)
+                + _transcribe_window(wav, channel, mid, end, tmp, tag + "b", speaker))
+    return [{"channel": channel, "speaker": speaker, "start": start, "end": end,
              "transcript": "[transcription failed for this part]", "failed": True}]
 
 
-def transcribe(audio: Path, cfg: dict) -> dict:
+def transcribe_piece(wav: Path, start: float, end: float, tmp: Path, tag: str, speaker: int) -> list:
+    """One far-channel piece under a given speaker id -- what
+    diarize.split_transcript() calls to re-transcribe a reused live
+    utterance that straddled a speaker change."""
+    return _transcribe_window(wav, 1, start, end, tmp, tag, speaker)
+
+
+def transcribe(audio: Path, cfg: dict, hints: dict | None = None) -> dict:
     if not shutil.which("voxtype"):
         raise RuntimeError("voxtype not installed: install Omarchy's dictation (voxtype), "
                            "or switch transcription_provider to a cloud service")
+    meta = info()
+    whisper = meta.get("engine") == "whisper"
+    expected = (hints or {}).get("far_speakers")
     with tempfile.TemporaryDirectory() as tmp_str:
         tmp = Path(tmp_str)
+        # The mic copy gets the rumble high-pass in the split; the far copy is
+        # left exactly as recorded. audio.opus itself is never rewritten.
         left, right = audio_mod.split_stereo_to_mono_wavs(audio, tmp)
-        utterances = _transcribe_channel(left, 0, tmp) + _transcribe_channel(right, 1, tmp)
-    return {"provider": "local", "model": info().get("model") or "", "utterances": utterances}
+        # Mic noise reduction (spitball/denoise.py): a further temp copy of
+        # the mic channel, made only when the setting (and, for "auto", the
+        # measured noise floor) says so. `mic_denoise` records what ran.
+        mic, mic_record = denoise.prepare_mic(left, cfg, tmp / "channel-0-denoised.wav")
+        # Speaker split (spitball/diarize.py): far channel only, skipped for
+        # a 1:1, and any failure means no segments -- one "Them" as before.
+        # `diarization` records what happened.
+        far_segments, diar_record = diarize.far_channel(right, cfg, expected)
+        utterances = (_transcribe_channel(mic, 0, tmp, vad=whisper)
+                      + _transcribe_channel(right, 1, tmp, vad=whisper, segments=far_segments))
+    return {"provider": "local", "model": meta.get("model") or "", "utterances": utterances,
+            "mic_denoise": mic_record, "diarization": diar_record}
 
 
 def ready(cfg: dict) -> str:

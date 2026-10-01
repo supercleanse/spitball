@@ -30,8 +30,12 @@ def _module(cfg: dict, name: str | None = None):
     return mod
 
 
-def transcribe(audio: Path, cfg: dict) -> dict:
-    return _module(cfg).transcribe(audio, cfg)
+def transcribe(audio: Path, cfg: dict, hints: dict | None = None) -> dict:
+    """`hints` is what the pipeline already knows about the call that a
+    provider may use: {"far_speakers": N} (how many other people the
+    calendar invite lists, or None) feeds the local speaker split. Deepgram
+    ignores it."""
+    return _module(cfg).transcribe(audio, cfg, hints=hints)
 
 
 def check(cfg: dict, provider: str | None = None) -> dict:

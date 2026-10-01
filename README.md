@@ -36,23 +36,72 @@ stops on its own when the call ends, and leaves you a transcript and a summary i
 5. **Transcribes.** By default, on-device with [voxtype](https://voxtype.io) (ships
    with Omarchy) — audio never leaves your machine. Switch to Deepgram
    (`nova-3`, multichannel, diarized) for cloud transcription instead. See
-   [Transcription providers](#transcription-providers) below.
+   [Transcription providers](#transcription-providers) below. The copy of your mic
+   the transcriber hears gets a rumble filter, and noise reduction when the room is
+   loud; the recording itself is never altered. See [Audio and noise](#audio-and-noise).
 
 6. **Summarizes.** The transcript goes to any OpenAI-compatible chat endpoint (a
    local Ollama by default) for a title, summary, decisions, and action items. No
    model configured or reachable just means a transcript instead of a summary;
    `spitball reprocess <dir>` fills the summary in later.
 
+7. **Knows which meeting it was** (optional). Paste your calendar's secret iCal
+   address and Spitball matches each call to the event it belongs to: the folder
+   takes the event's title, the transcript starts with the meeting and its
+   attendees, and the summarizer is told who was invited. A minute before a
+   meeting with a Zoom, Meet, Teams, or Webex link, a notification offers
+   **Join & record**: one click opens the link and starts recording, pinned to
+   that event. See [Calendar](#calendar).
+
+8. **Knows who said what.** With a matched meeting, one short model call puts the
+   invitees' names on the far-side speakers from what people say ("thanks, Priya";
+   "this is Alex"), and an unsure match stays visibly unsure: "Speaker 2 (probably
+   Priya)". A 1:1 call needs no model at all. On the local provider, an optional
+   on-device add-on tells the other side's voices apart first; Deepgram already
+   does. `spitball speakers <dir> 2 "Priya Nair"` fixes a name by hand. See
+   [Speakers](#speakers).
+
 Any click on the widget, left or right, opens its menu: start recording, show the
 live transcript and stop while recording, dismiss the current detection, toggle
 auto-record, open the last call's summary, open the calls folder, or open Settings.
 A click never stops a call by itself; Stop is always an explicit menu item or the
-Live popup's button. Settings and the Live popup each have a ✕ in their header to
-close them. When something needs attention before Spitball can transcribe (no
-Deepgram key, no local dictation installed), the widget shows a small "Set up" gear
-even while idle, and its menu leads with **Set up transcription…**. Switching the local model from Settings (see
+Live popup's button. The Live popup has a ✕ in its header to close it. When
+something needs attention before Spitball can transcribe (no Deepgram key, no local
+dictation installed), the widget shows a small "Set up" gear even while idle, and its
+menu leads with **Set up transcription…**, which opens Settings on the Transcription
+page. Switching the local model from Settings (see
 [Transcription providers](#transcription-providers)) shows the same way: a small
 download glyph while it runs, with the percentage in its tooltip.
+
+## Settings
+
+**Settings…** in the menu opens a centered overlay, the same kind of surface as
+Omarchy's own menu and emoji picker: a card over a dimmed screen, with the sections
+down the left and one page on the right. Esc, a click outside the card, or the ✕
+closes it. When nothing on the page has focus, `j`/`k` or the arrow keys move between
+sections, `1`–`9` jump straight to one, and Tab walks into the page's controls;
+inside a text field, Esc hands focus back to the section list first.
+
+| Page | What's on it |
+|---|---|
+| **General** | Your name, the spoken language, auto-record (with its consent note), the daemon's status and a Restart button. |
+| **Recording** | The calls folder, the detection and ending timings, the minimum call lengths, the Opus bitrate, which apps count as a call, and which of them is on the mic right now. |
+| **Transcription** | Local (voxtype) or Deepgram. Local: the voxtype model picker with its inline Switch confirmation and download progress, or an Install button if voxtype is missing. Deepgram: API key, model, Test, and the key command under Advanced. |
+| **Live** | The live transcript on/off, the line cutoff, the fast-engine toggle, and whether the engine is installed (with an Install button). |
+| **Audio** | Mic noise reduction for the transcriber (Off / Auto / On, with a line on each), the mic and speakers Spitball would record today, and under Advanced the background level Auto trips at. See [Audio and noise](#audio-and-noise). |
+| **Speakers** | Naming the far side from the calendar invite, the on-device split of the far channel into separate voices (with an Install button), the most far-side voices to show, and which providers split speakers. See [Speakers](#speakers). |
+| **Summary** | Summaries on/off, the endpoint, the model (a dropdown when the endpoint lists any), API key, Test, and the key command under Advanced. |
+| **Calendar** | Matching on/off, the source (a secret iCal/ICS address stored like an API key, or your own command), a Test button that shows what a call starting now would match, whether the event title becomes the call title, what goes to the summarizer (attendee names on by default, the description off), meeting reminders on/off and how long before the start they fire, and under Advanced the address command, your calendar email, and the feed refresh interval. See [Calendar](#calendar). |
+| **Storage** | The notes-copy folder (`export_dir`) and a way into the calls folder. |
+| **About** | Version, install path, a status snapshot, and the docs. |
+
+Every change is saved the moment you make it (through `spitball config`, below). A
+few actions open something outside the shell — the folder picker, the voxtype or
+live-engine installer, the password prompt for a model switch — and the overlay
+closes first so that window isn't hidden behind it; the folder picker brings it back
+when you're done, the installers and model switch leave it closed until you reopen
+it. From outside the shell, `omarchy-shell supercleanse.spitball-settings open`
+(or `openSection transcription`) opens it too, handy for a keybinding.
 
 ## Live transcript
 
@@ -150,8 +199,11 @@ virtualenv at `~/.local/share/spitball/live-engine/venv` (about 130 MB) and inst
 [onnx-asr](https://github.com/istupakov/onnx-asr), onnxruntime, numpy, and
 sentencepiece into it from PyPI. It uses [uv](https://docs.astral.sh/uv/) when it's
 on your PATH, otherwise `python3 -m venv` and pip. Nothing outside that folder is
-installed, and deleting the folder removes it. Without it, the live transcript still
-works, just a few seconds slower (see [Live transcript](#live-transcript)).
+installed, and deleting the folder removes it. The speaker split shares this venv;
+if `spitball diarize setup` made it first, `live setup` adds onnx-asr to it, and
+`live status` reports the engine installed only once onnx-asr is really there.
+Without it, the live transcript still works, just a few seconds slower (see
+[Live transcript](#live-transcript)).
 
 Switching voxtype between its Whisper and Parakeet engines from Settings asks for
 your password (a graphical `pkexec` prompt, or `sudo` in a terminal as a fallback),
@@ -180,8 +232,14 @@ Each call gets its own folder, `~/Calls/<YYYY-MM-DD-HHMM>-<app>-<title-slug>/`:
 | `summary.md` | Title, summary, decisions, action items, open questions. |
 
 The folder isn't named with a title until processing finishes — it starts as
-`<timestamp>-<app>` and gets a slug of the generated title appended once transcription
-and summarization are done.
+`<timestamp>-<app>` and gets a slug of the title appended once transcription and
+summarization are done: the matched calendar event's title when there is a confident
+match (see [Calendar](#calendar)), otherwise the summarizer's. A few dot-files sit
+beside them: `.meta.json` (the call's facts, plus the calendar candidates snapshotted
+when recording started), `.transcript.json` (the cached transcript, the matched meeting
+and its attendees, who each far-side speaker resolved to, which mic noise reduction
+ran, and whether the speaker split ran), and `.live.json` (the live transcript, when
+it ran).
 
 Set `export_dir` and Spitball also copies the summary and full transcript, as one
 markdown file, into that folder — handy for dropping calls straight into an Obsidian
@@ -198,7 +256,7 @@ Set `transcription_provider` to pick one:
   what's active; `spitball local models` lists every model voxtype knows how to
   download with size/language/installed info.
 
-  The Settings popup's Local section has one Model dropdown, with **Parakeet
+  The Transcription page in Settings has one Model dropdown, with **Parakeet
   (unified, English)** marked Recommended. It's the one streaming-capable model:
   switching to it also turns on voxtype's `parakeet.streaming`, so dictation
   types while you talk instead of after you stop, and writes the streaming
@@ -218,7 +276,7 @@ Set `transcription_provider` to pick one:
   click **Switch**. `spitball local set-model <name>` (what that button calls)
   then runs the whole switch **in the background**: it never blocks, and its
   progress (`$XDG_RUNTIME_DIR/spitball/model.json`, see CONTRACT.md) shows both
-  in the popup, if you reopen it, and as a small download glyph on the bar
+  in Settings, if you reopen it, and as a small download glyph on the bar
   widget itself while it runs. Normally there's no terminal at all — just
   Omarchy's own graphical password prompt if the engine needs to change (e.g.
   Whisper → Parakeet), then a background download. It only opens a floating
@@ -227,8 +285,12 @@ Set `transcription_provider` to pick one:
   own process never runs `sudo`/`pkexec` itself or edits voxtype's config
   directly. If voxtype isn't installed at all, the bar shows a "Set up" gear
   with a hint to install it or switch providers.
+
+  voxtype hears the other side as one voice ("Them"). `spitball diarize setup`
+  adds an on-device speaker split that tells the far-side voices apart before
+  they are transcribed — see [Speakers](#speakers).
 - **`deepgram`** — cloud, multichannel + diarized, so the far side can have several
-  distinct speakers. See `deepgram_model`/`deepgram_api_key(_command)` below.
+  distinct speakers without any add-on. See `deepgram_model`/`deepgram_api_key(_command)` below.
 
 More providers (an OpenAI-compatible endpoint, AssemblyAI, Soniox) are planned —
 see `docs/ROADMAP.md`.
@@ -237,6 +299,267 @@ Every provider transcribes into the same shape, cached as `.transcript.json` in 
 call folder so `spitball reprocess <dir>` doesn't re-transcribe unless you pass
 `--retranscribe`. `language` picks the spoken language: `"en"` (default), `"auto"`
 (provider-dependent detection), or an ISO code.
+
+## Audio and noise
+
+Spitball records your mic as it is. What changes is the copy the transcriber hears:
+
+- **Always:** a high-pass filter at 80 Hz on the mic copy takes out desk rumble, fan
+  hum, and handling thumps below the voice band. The far side (the monitor of your
+  speakers) is left exactly as recorded: it is already the call app's processed
+  output, and cleaning it again only loses detail.
+- **When the room is noisy:** `mic_denoise` runs RNNoise (ffmpeg's `arnndn` filter
+  with the model in `models/rnnoise/`, blended 70/30 with the original) over a
+  temporary copy of the mic channel before transcription. If the model file is
+  missing or the filter fails, ffmpeg's built-in `afftdn` runs instead.
+
+`mic_denoise` has three settings (the Audio page in Settings, or `spitball config set
+mic_denoise off|auto|on`):
+
+| Value | What happens |
+|---|---|
+| `off` | Nothing beyond the high-pass. |
+| `auto` (default) | Spitball measures the mic's background level (the quietest tenth of the call's mic audio, in 50 ms slices) and denoises only when it is above `mic_noise_floor_db`, −45 dBFS by default. A headset in a quiet room sits near −60 and is left alone; a laptop fan lands around −45 to −40; a cafe or an open office reads above −35. |
+| `on` | Always denoise the mic copy. |
+
+Why the default is a gate and not simply on: Whisper and Parakeet were trained on
+noisy audio, and more than one study has found that denoising clean audio makes their
+transcripts worse, not better (the research is summarized in `docs/SPEC-v2.md`). A
+check on this machine with Parakeet and synthetic noise found the filter neither
+helped nor hurt at the noise levels tried, so the gate is there to keep a clean mic
+exactly as it was. Judge it on your own calls: the `mic_denoise` block below tells
+you what ran, and `reprocess --retranscribe` lets you compare.
+
+The live transcript follows the same setting. Each few-second slice of the mic is
+measured as it arrives, and once the running background level crosses the threshold
+the slices are denoised the same way (with 3 dB of hysteresis so a call hovering at
+the threshold doesn't flip between lines).
+
+What ran is recorded in `.transcript.json` (and `.live.json`) as a `mic_denoise`
+block: the mode, whether it applied, which filter, the measured background and
+speaking levels in dBFS, and the threshold. `spitball reprocess <dir> --retranscribe`
+transcribes again with the current setting, so you can compare a call with it off and
+on. The Deepgram provider uploads the recording as it is; the setting does not apply
+to it (Deepgram's own advice is not to preprocess).
+
+**Whisper and silence.** Whisper is known to invent text over audio that has no
+speech in it. When voxtype is on a Whisper model, Spitball segments both channels
+with a stricter speech check: the pause detector's gate rises with the measured
+background, so steady noise still splits into pauses, and any window with nothing
+louder than the room in it is skipped. Parakeet doesn't hallucinate that way and keeps the plain
+segmentation.
+
+### Echo from laptop speakers
+
+Noise reduction cannot remove the other side's voice from your mic. It is speech, and
+the filter keeps speech. On built-in speakers that bleed makes both channels repeat
+each other; Spitball drops mic lines that duplicate far-side lines in time and
+wording, but the real fix is echo cancellation at the source, which needs the
+speaker signal as a reference. PipeWire ships exactly that. Create
+`~/.config/pipewire/pipewire.conf.d/echo-cancel.conf`:
+
+```
+context.modules = [
+  { name = libpipewire-module-echo-cancel
+    args = {
+      library.name = aec/libspa-aec-webrtc
+      aec.args = { webrtc.noise_suppression = true }
+      source.props = { node.name = "echo-cancel-source" node.description = "Echo-canceled mic" }
+      sink.props   = { node.name = "echo-cancel-sink"   node.description = "Echo-canceled speakers" }
+    }
+  }
+]
+```
+
+Then `systemctl --user restart pipewire pipewire-pulse wireplumber` and make the new
+source and sink your defaults (`wpctl status` lists them, `wpctl set-default <id>`
+picks one). Spitball records the default source, so it gets the cleaned mic with no
+change on its side, and so does your call app. (Zoom, Meet, Teams, and Discord cancel
+echo inside the app already; the module matters for the recording, which taps the
+mic before the app does.) [EasyEffects](https://github.com/wwmm/easyeffects)
+(`pacman -S easyeffects`) wraps the same WebRTC echo canceler, RNNoise, and
+DeepFilterNet behind a GUI and works with Spitball the same way: whatever it makes
+the default source is what gets recorded. Headphones avoid the problem entirely.
+
+## Calendar
+
+Turn on **Match calls to calendar events** on the Calendar page and Spitball works out
+which meeting each call was. There's no Google sign-in and no OAuth client to set up:
+
+1. In Google Calendar, open Settings → your calendar → **Integrate calendar** and copy
+   the **Secret address in iCal format**. Any other ICS/webcal address works the same
+   way (Outlook's "Publish calendar", Fastmail, Nextcloud, Proton…), with whatever
+   attendee detail that provider puts in its feed.
+2. Paste it into **Secret iCal address** and click **Test**.
+
+The address is a credential: anyone holding it can read that calendar until you
+reset it in the same settings page. So Spitball stores it like an API key
+(`spitball config set-secret calendar_ics_url`, masked everywhere, never logged),
+and a `calendar_ics_url_command` variant fetches it from a password manager instead.
+The feed (your whole calendar, several MB for an old one) is downloaded at most once
+per `calendar_cache_ttl_s` (15 minutes) into `~/.local/state/spitball/calendar/`, mode
+600, and a stale copy is used when the download fails.
+
+**What a confident match does.** The call folder is named after the event
+(`2026-09-30-1400-chrome-weekly-sync`), `transcript.md` and `summary.md` open with
+`**Meeting:**`, `**When:**`, and `**Attendees:**` lines, the summarizer is told who
+was on the invite (and, only if you turn it on, the event description), and the
+attendee list is kept in `.transcript.json` for speaker naming. Turn off **Use the
+event title as the call title** to keep the summarizer's own title and add only the
+header. A weak match never renames anything: the header just says
+`**Calendar:** no confident match (2 candidates)`.
+
+**How matching works.** When recording starts, the daemon snapshots every event whose
+time touches the call (from 15 minutes before its start to 10 minutes after its end)
+into the call's `.meta.json`, along with any Google Meet code visible in a window
+title (Chromium titles a Meet tab "Meet – abc-defg-hij"). All-day events, canceled
+ones, ones marked free, focus time, out-of-office, working-location and birthday
+entries, and invites you declined are dropped. The rest are scored: a Meet code that
+matches the event's link is decisive; otherwise it's whether the meeting link fits
+the app on the mic (a Meet link with a browser, a Zoom link with Zoom), whether the
+recording started during the event and how far from its start, how many other people
+were invited, whether you accepted, and, once the call has ended, how much of the
+recording fell inside the event, which is what settles back-to-back meetings. The
+best event has to clear a threshold and beat the runner-up by a margin, or there is
+no match. Recurring series are expanded on the spot (weekly, daily, monthly,
+yearly, `INTERVAL`, `COUNT`, `UNTIL`, `BYDAY` including "last Wednesday",
+`BYMONTHDAY`, `BYMONTH`, `BYSETPOS` such as Outlook's "last weekday of the month",
+`EXDATE`, moved and canceled instances) in the event's own time zone. A series whose
+rule uses something the expander doesn't implement (`BYWEEKNO`, `BYYEARDAY`, hourly
+rules, and the like) is skipped whole rather than expanded wrongly, and
+`spitball calendar test` says how many were skipped; the exact list is in
+CONTRACT.md under "Recurrence".
+
+Which invitee is you comes from `calendar_my_email` when set, otherwise from the
+address that clearly dominates the feed. When two addresses tie (a calendar that is
+mostly 1:1s with one person) Spitball does not guess: nobody is marked as you,
+`spitball calendar test` says "Your address: unknown", and the Calendar page asks
+you to set your email under Advanced.
+
+Calendar trouble (no network, a reset address, a slow feed) never delays or blocks a
+recording: the lookup runs in the background, and a failure is just noted in
+`.meta.json`. `spitball calendar test` shows the match for a call starting now,
+`--at 14:30` (or a full date/time) for another moment, `--meet abc-defg-hij` /
+`--app Zoom` to add the context a real call would have, and `--json` for the raw
+picture. Got it wrong? `spitball reprocess <dir> --event <id>` pins one of the
+snapshot's candidates (ids are in `.meta.json` and the `--json` output) and
+`--no-event` clears the match; both re-render the transcript and summary.
+
+**Meeting reminders.** With the calendar on, Spitball also reminds you before a
+meeting starts (**Remind me before meetings with a video link**, on by default, one
+minute ahead; change the lead time next to it). A minute before any event you haven't
+declined that carries a Zoom, Google Meet, Microsoft Teams, or Webex link, a desktop
+notification from Spitball ("Spitball reminder: Weekly sync in 1 min", with the time
+and the link's host) offers **Join & record**: it opens the meeting link in your
+browser and starts recording right away, pinned to that event, so the folder,
+transcript header, and summary are certain to carry the right meeting. Once the call
+app takes the mic the recording follows it and stops when the call ends, like any
+detected call; if nothing ever takes the mic it stays a manual recording you stop
+from the bar. **Dismiss** does nothing. Clicking the notification body is the same as
+Join & record; on Omarchy's own shell that click is the only button it draws, and
+right-click dismisses. If a recording is already running when a reminder is due, no
+reminder fires. All-day events, canceled ones, ones marked free, focus time,
+out-of-office, and invites without a video link never remind. Each occurrence fires
+once (the daemon keeps a list in `~/.local/state/spitball/calendar/reminded.json`, so
+a restart doesn't repeat it), and a meeting that started more than two minutes ago is
+never reminded, so waking a laptop doesn't bring a pile of stale toasts.
+`spitball calendar upcoming` lists what is due in the next day and when each fires.
+
+Invites can come from anyone, so the link is the one thing the reminder is strict
+about: only an `https` link whose host is exactly `meet.google.com`,
+`teams.microsoft.com`, or `teams.live.com`, or `zoom.us` / `webex.com` or a subdomain
+of them, is ever opened, it is handed to `xdg-open` directly (never through a shell),
+and lookalikes (`meet.google.com.evil.example`, `zoom.us@evil.example`, `http://`,
+`javascript:`) are refused. If a notification server has no action support, the
+reminder is a plain toast that tells you to click the record button in the bar.
+
+**Your own source.** Set **Source** to *Your own command* (`calendar_source:
+"command"`) and `calendar_command` to any shell command that prints a JSON array of
+events — the shape is in [CONTRACT.md](CONTRACT.md#calendar-events); only `title`,
+`start`, and `end` are required. The command gets the window as
+`SPITBALL_WINDOW_START`/`SPITBALL_WINDOW_END`. This is how khal/vdirsyncer, gcalcli,
+a CalDAV script, or an Evolution Data Server one-liner plugs into the same matcher.
+
+## Speakers
+
+Your own channel is always labeled with your name. The other side is one voice
+("Them") or several ("Speaker 1", "Speaker 2", …), depending on the provider and on
+the optional split below. Two things then put names on those labels, both on the
+Speakers page.
+
+**Naming from the invite** (`speaker_names`, on by default). When a call has a
+confident calendar match, Spitball hands the transcript (with its neutral labels) and
+the invitees' names to the summary endpoint once, before the summary, and asks which
+"Speaker N" is which invitee and why. Names only: an email address never goes along
+in any request Spitball makes (invite lists, titles, descriptions, and speaker
+labels are scrubbed of addresses before they leave, and the secret feed address is
+stripped too). Work calendars often list a colleague by address only, so an
+invitee with no name on the invite gets one when Spitball can find it: a name you
+gave that address before (see the hand fix below), a word in the meeting title the
+address starts with ("Q3 Review: Rob" for `robert@`), or the address itself
+(`priya.nair@` reads as Priya Nair; a bare `jordan@` reads as "probably Jordan"
+until you confirm it once). Role addresses like `support@` and initial-plus-surname
+ones like `jsmith@` give nothing; those invitees are only counted ("and 1 more with
+no name on the invite"), and a speaker name is never an address. This
+switch alone decides whether that request happens
+(naming can't work without the names), so the Calendar page's "Send attendee names to
+the summarizer" does not gate it: turn `speaker_names` off if the summary endpoint
+isn't your own machine and the names shouldn't leave it. Only what people actually say counts: someone
+introducing themselves, being addressed by name right before or after their turn,
+or you addressing them. A name that isn't on the invite is thrown away; a name
+claimed for two speakers makes both unsure. A sure match shows the name; an unsure
+one reads `Speaker 2 (probably Priya Nair)`, in the transcript and in the summary's
+own wording; no evidence keeps `Speaker 2`. A 1:1 call (one other invitee, one
+far-side voice) is named with no model call at all. No pitch or gender guessing,
+and no voiceprints: nothing about anyone's voice is remembered between calls.
+
+Got a name wrong or missing? `spitball speakers <call-dir>` lists the far-side
+speakers with what each resolved to and the evidence; `spitball speakers <call-dir>
+2 "Priya Nair"` names one by hand and re-renders `transcript.md`, `summary.md` (its
+wording included), and the export copy on the spot, without another model call. When
+that speaker is clearly one invitee (a 1:1, or a voice Spitball had already tied to
+one person), the name is remembered for their address, so the next call with them
+gets it right on its own. A hand-set name is final: a later `spitball reprocess` keeps it and only re-resolves
+the others. `--clear` goes back to automatic. If you want a fresh summary written
+with the corrected names, run `spitball reprocess <call-dir>` afterward.
+
+`spitball reprocess <call-dir> --retranscribe` keeps hand-set names too: each one
+follows its voice onto the fresh transcript by the provider's speaker id, as long as
+the new transcript comes from the same provider, the same speaker split, and the same
+number of far-side voices; ids from different providers (Deepgram's speaker 0 and the
+local provider's one unsplit "Them") don't name the same person, so after a provider
+change every hand-set name is dropped rather than put on the wrong voice. Whenever a
+name has nowhere to go, it is not dropped quietly: the command says so with the
+reason, the transcript and summary header carry a `**Note:**` naming it (until you
+set it again or the next `--retranscribe`), and `.transcript.json` records it under
+`speakers_dropped`.
+
+**Telling voices apart on this computer** (`speaker_split`, on by default, no
+effect until installed). Deepgram splits the far channel on its own. The local
+provider can too, once you click **Install** on the Speakers page (or run
+`spitball diarize setup`): it adds the [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx)
+wheel (about 100 MB) to the same virtualenv the fast live engine uses,
+`~/.local/share/spitball/live-engine/`, and downloads two small models (pyannote's
+segmentation-3.0 and a 3D-Speaker embedding model, about 30 MB together) from the
+k2-fsa GitHub releases, each verified against a pinned hash. No Hugging Face account
+or token, no PyTorch. Provenance and licenses are in `models/diarization/README.md`.
+
+With it installed, the far channel (only the far channel; your side is already
+separate) is diarized before transcription, each speech window is cut where the
+speaker changes, and every line carries the id of one voice. When the invite says
+how many other people were there, that count drives the clustering, which is the
+single biggest quality lever; when it doesn't, the clustering picks a count on its
+own and the result is capped at **Most far-side voices to show** (`speaker_max`,
+6). A call whose invite lists exactly one other person is never split. A voice with
+only a few words (an "mm-hm" the segmenter split off, a notification sound) folds
+into the voice speaking around it; so do voices beyond the cap. If the add-on is
+missing, the worker fails, or the far channel has no speech, the transcript keeps
+today's single "Them" and `.transcript.json`'s `diarization` block says why. Expect
+clean splits for two to four distinct headset voices, and merges or swaps for very
+similar voices, brief speakers, and several people sharing one room microphone; the
+header's `**Note:** the invite lists 3 other people; 5 voices were found on the far
+side.` line is the tell when a split went wrong. It costs a few seconds of CPU per
+minute of far-side speech.
 
 ## Configuration
 
@@ -268,13 +591,31 @@ default, and you only need to set the ones you want to change.
 | `min_call_s` | `60` | Discard an auto-detected recording shorter than this. |
 | `min_manual_s` | `10` | Discard a manually-started recording shorter than this. |
 | `opus_bitrate` | `32k` | ffmpeg's Opus encoding bitrate. |
+| `mic_denoise` | `"auto"` | Noise reduction on the copy of the mic the transcriber hears: `"off"`, `"auto"` (only when the measured background is above `mic_noise_floor_db`), or `"on"`. Never touches the recording or the far side. See [Audio and noise](#audio-and-noise). |
+| `mic_noise_floor_db` | `-45` | The background level (dBFS) above which `"auto"` denoises. Lower it to denoise more often. |
+| `calendar_enabled` | `false` | Match each call to a calendar event (see [Calendar](#calendar)). |
+| `calendar_source` | `"ics"` | `"ics"` (the secret address below) or `"command"` (`calendar_command`). |
+| `calendar_ics_url` | `""` | The secret iCal/ICS/webcal address. A secret: `set-secret` only, masked in `config get`. |
+| `calendar_ics_url_command` | `""` | A shell command whose stdout is that address, for a password manager. |
+| `calendar_command` | `""` | A shell command printing a JSON array of events (shape in CONTRACT.md); used when `calendar_source` is `"command"`. |
+| `calendar_cache_ttl_s` | `900` | Re-download the feed once the cached copy is older than this many seconds. |
+| `calendar_prefer_event_title` | `true` | On a confident match, the event's title becomes the call's title (folder, transcript, summary). `false` keeps the summarizer's title and adds only the meeting header. |
+| `calendar_names_to_summary` | `true` | Put the invite list (names only, never addresses) in the summary request. `false`: the summarizer gets the meeting's title and time and nothing about the people; `transcript.md` and `summary.md` keep their own `**Attendees:**` line either way. Speaker naming has its own switch, `speaker_names`. |
+| `calendar_description_to_summary` | `false` | Also send the event description in the summary request. Off by default: it can carry private text. |
+| `calendar_my_email` | `""` | Your address on the calendar, so your own response is read (declined invites are skipped). Empty: the address on nearly every invite in the feed is taken as yours, unless another address ties it, in which case nobody is (set this). |
+| `calendar_reminders` | `true` | With the calendar on, remind before each meeting that has a Zoom / Meet / Teams / Webex link, with a Join & record action. See [Calendar](#calendar). |
+| `calendar_remind_before_s` | `60` | How many seconds before the start the reminder fires (0–3600). |
+| `speaker_names` | `true` | Put invitees' names on the far-side speakers, from what people say, when the call matched a meeting. One short call to the summary endpoint carrying the transcript and the invitees' names (never their addresses); a 1:1 needs none. This switch alone governs that call: `calendar_names_to_summary` does not. See [Speakers](#speakers). |
+| `speaker_split` | `true` | Tell far-side voices apart on the local provider, once `spitball diarize setup` has installed the add-on. Never runs for a 1:1; any failure keeps one "Them". |
+| `speaker_max` | `6` | The most far-side voices a transcript shows (1–12). The invite's headcount is used when known, capped here; extra or tiny voices fold into their neighbors. |
 
 The Deepgram key can also come from the `DEEPGRAM_API_KEY` environment variable,
 which wins over both config keys — useful if you'd rather manage it outside the
 config file entirely. Same idea for `summary_api_key`, via `summary_api_key_command`.
 
-You can edit `config.json` by hand (restart the daemon afterward — see
-[Restart the daemon](#restart-the-daemon)), or through `spitball config`:
+Every key above has a control in [Settings](#settings). You can also edit
+`config.json` by hand (restart the daemon afterward — see
+[Restart the daemon](#restart-the-daemon)), or use `spitball config`:
 
 ```bash
 spitball config get --json                       # effective settings; *_api_key values are masked
@@ -287,13 +628,18 @@ spitball config unset export_dir                 # back to the default
 `config set`/`set-secret`/`unset` write atomically, make `config.json` mode `600`
 once it holds a secret, and reload the running daemon automatically (falls back to
 nothing happening — no crash — if the daemon isn't up). `set` rejects unknown keys
-and the secret keys themselves (`deepgram_api_key`, `summary_api_key`) — those go
-through `set-secret`, which reads the value from stdin so it never lands in your
-shell history or `ps` output.
+and the secret keys themselves (`deepgram_api_key`, `summary_api_key`,
+`calendar_ics_url`) — those go through `set-secret`, which reads the value from stdin
+so it never lands in your shell history or `ps` output.
 
 `spitball check transcription --json` and `spitball check summary --json` test the
 configured provider/endpoint for real (a live network call) and report `{"ok", "message"}`
-(summary also lists `"models"`).
+(summary also lists `"models"`). `spitball calendar test --json` does the same for the
+calendar source and adds the match for a call starting now. All three exit 1 on a
+failure but still print the JSON, and its `message` is the explanation the Test
+buttons show. The feed address never appears in any of it: a pasted address without
+its `https://` (or `webcal://`) is reported as exactly that, and every fetch error
+is scrubbed of the address before it is written anywhere.
 
 ## Crash recovery
 
@@ -312,6 +658,28 @@ of Deepgram's model-improvement program — see
 submitted audio. The transcript then goes wherever `summary_base_url` points, which
 is a local model on your own machine by default and stays there unless you point it
 somewhere else.
+
+With the calendar on, the feed is read into `~/.local/state/spitball/calendar/` (mode
+600) and the events around each call are written into that call's `.meta.json`. The
+names of the people on the invite go to the summary endpoint along with the
+transcript (`calendar_names_to_summary`, on by default — turn it off if that endpoint
+is not your own machine, and the summarizer then gets only the meeting's title and
+time; the `**Attendees:**` line in `transcript.md` and `summary.md` is local and is
+never what the model sees); the event description goes only if you turn
+`calendar_description_to_summary` on. Attendee email addresses stay in the dot-files,
+never go to any model, and never appear in `transcript.md` or `summary.md` unless an
+attendee has no name on the invite. A meeting reminder shows the event's title and
+the link's host on your own desktop, nowhere else; the one thing it ever opens is an
+`https` link to the meeting services listed under [Calendar](#calendar).
+
+Speaker naming sends the transcript and the invitees' names (never their addresses)
+to that same endpoint once more, before the summary; `speaker_names: false` turns it
+off, and nothing else does — it needs the names, so `calendar_names_to_summary` has
+no say in it. A speaker it names then appears by name in the transcript the
+summarizer reads. The on-device speaker split runs entirely on your machine and
+keeps nothing between calls: no voice profiles, no enrollment, no guesses about
+anyone's gender. The names Spitball prints come only from the invite and from what
+people said.
 
 Recording laws vary by place — some require only your own consent, others require
 everyone on the call to consent. Check your jurisdiction, and tell people you're
@@ -345,7 +713,14 @@ last line as the error — usually a PipeWire device that's gone missing. Confir
 side's voice, so both channels partially repeat each other. Spitball filters
 mic-channel text that overlaps far-side text in time and wording, but it isn't
 perfect — headphones avoid the problem at the source and give Deepgram a cleaner
-signal to diarize.
+signal to diarize, and PipeWire's echo cancellation fixes it for real; see
+[Echo from laptop speakers](#echo-from-laptop-speakers).
+
+**Words nobody said, in the quiet parts.** That is Whisper filling silence or noise
+with text. Spitball's Whisper-path speech check skips windows with nothing above the
+room's level in them, and `mic_denoise` lowers what the model hears in a noisy room;
+switching voxtype to Parakeet (Transcription page) avoids it altogether. Check the
+`mic_denoise` block in `.transcript.json` to see what ran.
 
 ## CLI
 
@@ -365,11 +740,16 @@ ln -s ~/.config/omarchy/plugins/supercleanse.spitball/bin/spitball ~/.local/bin/
 | `spitball open-last` | Open the last call's `summary.md`. |
 | `spitball open-folder` | Open `~/Calls` in the file manager. |
 | `spitball status [--json]` | Print the current state. |
-| `spitball reprocess <call-dir> [--retranscribe]` | Redo transcription and summary for one call folder. `--retranscribe` ignores the cached transcript and calls the provider again. |
+| `spitball reprocess <call-dir> [--retranscribe] [--event <id> \| --no-event]` | Redo transcription and summary for one call folder. `--retranscribe` ignores the cached transcript and calls the provider again; `--event`/`--no-event` pin or clear the calendar match by hand. |
 | `spitball config get\|set\|set-secret\|unset` | Read/edit settings. See [Configuration](#configuration). |
 | `spitball check transcription\|summary [--json]` | Test the configured transcription provider or summary endpoint for real. |
+| `spitball calendar test [--at TIME] [--app APP] [--meet CODE] [--refresh] [--json]` | Which calendar event a call starting now (or at `TIME`) would match, with every candidate and its score. See [Calendar](#calendar). |
+| `spitball calendar upcoming [--hours N] [--refresh] [--json]` | The meeting reminders due in the next `N` hours (24): each event with a video link, its link host, when the reminder fires, and whether it already has. See [Calendar](#calendar). |
 | `spitball local info\|models\|set-model` | What voxtype is configured with, every model it can download, or switch it to one. See [Transcription providers](#transcription-providers). |
-| `spitball live setup\|status [--json]` | Install the fast live-transcript engine, or show whether it's on and which model it loads. See [Live transcript](#live-transcript). |
+| `spitball live setup\|status [--json]` | Install the fast live-transcript engine (into the shared venv, even one the speaker split already made), or show whether it's on and which model it loads. "Installed" means onnx-asr is actually in the venv. See [Live transcript](#live-transcript). |
+| `spitball speakers <call-dir> [--json]` | List a call's far-side speakers: label, resolved name, confidence, source, evidence, talk time. See [Speakers](#speakers). |
+| `spitball speakers <call-dir> <n> "Name"` / `--clear` | Name speaker `n` by hand (or go back to automatic) and re-render `transcript.md`, `summary.md`, and the export copy. No model call. |
+| `spitball diarize setup\|status [--json]` | Install the on-device speaker split (sherpa-onnx + two small models, into the live-engine venv), or show whether it's installed. Each add-on checks for its own package: a venv with only sherpa-onnx is a working split and not a live engine, and the other way around. |
 | `spitball pick-folder [--title T]` | Native folder chooser; prints the chosen path (used by the settings panel). |
 | `spitball daemon` | Run the service directly. `SpitballService.qml` does this for you; you shouldn't need to. |
 
@@ -391,15 +771,33 @@ After changing Python (`spitball/*.py`, `bin/spitball`), restart just the daemon
 omarchy-shell supercleanse.spitball restart
 ```
 
-After changing QML (`Widget.qml`, `SpitballService.qml`), restart the shell:
+After changing QML (`Widget.qml`, `SpitballService.qml`, `LivePopup.qml`,
+`SettingsWindow.qml`, anything under `settings/`), restart the shell:
 
 ```bash
 omarchy restart shell
 ```
 
 Tests run through `tests/run.sh`; pass `--live` to include anything that talks to a
-real system (PipeWire, an actual model endpoint) instead of just fixtures.
+real system (PipeWire, an actual model endpoint) instead of just fixtures. Audio
+tests synthesize their own clips with ffmpeg at run time (nothing under `tests/`
+ships audio); `models/rnnoise/sh.rnnn` is the one binary asset in the repository. The
+speaker split's worker is exercised against a fake in the normal run; set
+`SPITBALL_DIARIZE_TEST_DIR` to a directory laid out like `spitball diarize setup`
+leaves `~/.local/share/spitball/live-engine/` (a `venv/` with sherpa-onnx and
+`models/diarization/` with the two pinned models) to also run it for real on a
+two-voice clip built from the speech samples in `tests/.cache/`. The
+settings overlay can be rendered without touching your desktop:
+`tests/offscreen/render.sh --fake-data <out-dir>` runs Quickshell offscreen
+against a fake CLI and writes one PNG per page. The layout is `SettingsWindow.qml`
+(the layer-shell window: scrim, focus, dismissal) over `settings/SettingsCard.qml`
+(header, nav, page loader), with `settings/SettingsStore.qml` holding every CLI
+round trip and one `settings/<Name>Page.qml` per section. To add a section, add an
+entry to `SETTINGS_SECTIONS` in `Model.js` and a page file that extends
+`SettingsPage`; the nav, the digit keys, and the tests pick it up from there.
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE). `models/rnnoise/sh.rnnn` is redistributed unchanged
+from [rnnoise-models](https://github.com/GregorR/rnnoise-models); its provenance and
+terms are in `models/rnnoise/README.md`.

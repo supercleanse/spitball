@@ -136,24 +136,26 @@ Panel {
   readonly property bool menuShowsSetup: root.needsSetup
     || (root.showModelSwitch && !Model.modelSwitchActive(root.modelSwitch))
 
-  // ------------------------------------------------------------ settings panel
-  // A second, independent popup from the menu's -- both use
-  // KeyboardPanel, but this one is opened by its own bool rather than the
-  // base Panel's `opened`/`controller` (which the menu already owns).
+  // ------------------------------------------------------------ settings overlay
+  // The settings overlay (SettingsWindow.qml, docs/SPEC-v2.md section 1) is
+  // its own centered layer-shell window, not a bar dropdown -- driven by
+  // this bool rather than the base Panel's `opened`/`controller` (which the
+  // menu already owns).
   property bool settingsOpened: false
 
-  function openSettings() {
+  // The one way into Settings. `section` is a Model.settingsSections() id
+  // ("general", "transcription", ...); anything else lands on General. The
+  // first-run gear and every "Set up" prompt pass "transcription", since
+  // that's where the setup_needed reason (missing key / no local model /
+  // voxtype missing) always gets resolved. Opening Settings closes the menu
+  // and the Live popup: the overlay takes exclusive keyboard focus and
+  // covers the screen, so anything left open under it would just be
+  // stranded until it closed.
+  function openSettings(section) {
     root.close()  // the menu, if it's what triggered this
+    root.liveOpened = false
+    settingsWindow.show(section === undefined ? "general" : String(section))
     root.settingsOpened = true
-  }
-
-  // Per docs/SPEC-settings-and-providers.md section 6: the first-run gear
-  // opens Settings scrolled straight to Transcription, since that's where
-  // the setup_needed reason (missing key / no local model / voxtype
-  // missing) always gets resolved.
-  function openSettingsToTranscription() {
-    root.openSettings()
-    if (settingsPanel && settingsPanel.settingsContent) settingsPanel.settingsContent.scrollToTranscription()
   }
 
   // ------------------------------------------------------------ live popup
@@ -177,8 +179,9 @@ Panel {
     function toggle(): string { root.liveOpened = !root.liveOpened; return "ok" }
   }
 
-  // Opens the settings panel from outside the shell, e.g. for screenshots:
+  // Opens the settings overlay from outside the shell, e.g. for a hotkey:
   //   omarchy-shell supercleanse.spitball-settings open
+  //   omarchy-shell supercleanse.spitball-settings openSection transcription
   // A distinct target from the service's "supercleanse.spitball" (which
   // already owns `restart`) -- Widget.qml and SpitballService.qml are
   // separate entry points with no shared scope to dispatch through one
@@ -187,9 +190,14 @@ Panel {
   // exactly once).
   IpcHandler {
     target: "supercleanse.spitball-settings"
-    function open(): string { root.openSettings(); return "ok" }
+    function open(): string { root.openSettings("general"); return "ok" }
+    function openSection(section: string): string { root.openSettings(section); return "ok" }
     function close(): string { root.settingsOpened = false; return "ok" }
-    function toggle(): string { root.settingsOpened = !root.settingsOpened; return "ok" }
+    function toggle(): string {
+      if (root.settingsOpened) root.settingsOpened = false
+      else root.openSettings("general")
+      return "ok"
+    }
   }
 
   // ------------------------------------------------------------ plumbing
@@ -342,7 +350,7 @@ Panel {
           text: "Set up transcription…"
           foreground: root.panelForeground
           fontFamily: root.fontFamily
-          onClicked: root.openSettingsToTranscription()
+          onClicked: root.openSettings("transcription")
         }
 
         Button {
@@ -434,55 +442,31 @@ Panel {
           text: "Settings…"
           foreground: root.panelForeground
           fontFamily: root.fontFamily
-          onClicked: root.openSettings()
+          onClicked: root.openSettings("general")
         }
       }
     }
   }
 
-  // ------------------------------------------------------------ settings popup
-  // A second, independent KeyboardPanel -- driven by `root.settingsOpened`
-  // rather than the menu's `root.opened`/`controller`, so either one can be
-  // open without disturbing the other's state. Wider/taller than the menu,
-  // since it holds a full settings form (SettingsPanel.qml). This is the
-  // same KeyboardPanel component omarchy.audio/omarchy.network/omarchy.power
-  // use for their own popups (see e.g.
-  // /usr/share/omarchy/shell/plugins/panels/audio/Panel.qml) -- Settings
-  // stays a normal bar dropdown popup, not a separate desktop window.
-  KeyboardPanel {
-    id: settingsPanel
-    property alias settingsContent: settingsContentItem
-    anchorItem: button
-    owner: root
-    bar: root.bar
+  // ------------------------------------------------------------ settings overlay
+  // Not a KeyboardPanel: a centered card over a scrim, the surface Omarchy
+  // uses for its menu/emoji/clipboard pickers (SettingsWindow.qml). Driven
+  // by `root.settingsOpened`; Esc, the scrim, and the card's ✕ all come back
+  // through requestClose so this stays the one place the bool is flipped.
+  // requestReopen is the layering rule from the old dropdown (a portal
+  // picker must open above the overlay, so the store closes it first and
+  // asks to come back once the picker resolves).
+  SettingsWindow {
+    id: settingsWindow
+    screen: button.QsWindow.window ? button.QsWindow.window.screen : null
     open: root.settingsOpened
-    focusTarget: settingsKeyCatcher
-    contentWidth: settingsPanel.fittedContentWidth(Style.space(380))
-    // No extra cap beyond fittedContentHeight's own screen-fit (matches the
-    // built-in panels' convention -- network/power/etc. pass no cap either):
-    // this is a fixed set of sections, not an unbounded list that needs one.
-    // The Flickable inside SettingsPanel is still there as a safety net for
-    // a screen too short for the whole form at once.
-    contentHeight: settingsPanel.fittedContentHeight(settingsContentItem.contentHeight)
-
-    FocusScope {
-      id: settingsKeyCatcher
-      anchors.fill: parent
-      focus: true
-      Keys.onEscapePressed: root.settingsOpened = false
-
-      SettingsPanel {
-        id: settingsContentItem
-        anchors.fill: parent
-        foreground: root.panelForeground
-        fontFamily: root.fontFamily
-        cliPath: root.cliPath
-        runtimeDir: root.runtimeDir + "/spitball"
-        active: root.settingsOpened
-        onRequestClose: root.settingsOpened = false
-        onRequestReopen: root.settingsOpened = true
-      }
-    }
+    foreground: root.panelForeground
+    fontFamily: root.fontFamily
+    cliPath: root.cliPath
+    runtimeDir: root.runtimeDir + "/spitball"
+    st: root.st
+    onRequestClose: root.settingsOpened = false
+    onRequestReopen: root.settingsOpened = true
   }
 
   // ------------------------------------------------------------ live popup

@@ -563,3 +563,367 @@ test("liveBubbles: partial flag passes through, absent means final", () => {
   assert.equal(out[0].partial, false);
   assert.equal(out[1].partial, true);
 });
+
+// ---------------------------------------------------------------- settings overlay: sections
+
+const SECTION_IDS = ["general", "recording", "transcription", "live", "audio",
+  "speakers", "summary", "calendar", "storage", "about"];
+
+test("settingsSections: the ten sections, in the spec's order, each with a label and page", () => {
+  const s = Model.settingsSections();
+  assert.equal(JSON.stringify(s.map(x => x.id)), JSON.stringify(SECTION_IDS));
+  assert.equal(JSON.stringify(s.map(x => x.label)), JSON.stringify(["General", "Recording",
+    "Transcription", "Live", "Audio", "Speakers", "Summary", "Calendar", "Storage", "About"]));
+  for (const entry of s) {
+    assert.ok(/^[A-Z][A-Za-z]+Page\.qml$/.test(entry.page), entry.page);
+    assert.equal(typeof entry.placeholder, "boolean");
+  }
+});
+
+test("settingsSections: no placeholders are left (Calendar landed in phase 2, Audio in phase 3, Speakers in phase 4)", () => {
+  const placeholders = Model.settingsSections().filter(x => x.placeholder).map(x => x.id);
+  assert.equal(JSON.stringify(placeholders), JSON.stringify([]));
+});
+
+test("settingsSections: every page file exists under settings/", () => {
+  const fs = require("node:fs");
+  const path = require("node:path");
+  for (const entry of Model.settingsSections()) {
+    const file = path.join(__dirname, "..", "..", "settings", entry.page);
+    assert.ok(fs.existsSync(file), "missing " + file);
+  }
+});
+
+test("settingsSections: returns a fresh copy each call", () => {
+  const a = Model.settingsSections();
+  a.push({ id: "x" });
+  a[0].label = "Mutated";
+  assert.equal(Model.settingsSections().length, 10);
+  assert.equal(Model.settingsSections()[0].label, "General");
+});
+
+test("settingsDefaultSection is General", () => {
+  assert.equal(Model.settingsDefaultSection(), "general");
+});
+
+test("settingsSectionIndex: known ids map to their position, anything else is -1", () => {
+  assert.equal(Model.settingsSectionIndex("general"), 0);
+  assert.equal(Model.settingsSectionIndex("transcription"), 2);
+  assert.equal(Model.settingsSectionIndex("about"), 9);
+  assert.equal(Model.settingsSectionIndex("nope"), -1);
+  assert.equal(Model.settingsSectionIndex(""), -1);
+  assert.equal(Model.settingsSectionIndex(undefined), -1);
+  assert.equal(Model.settingsSectionIndex(null), -1);
+});
+
+test("settingsSectionAt: in-range index gives the entry, out of range gives null", () => {
+  assert.equal(Model.settingsSectionAt(0).id, "general");
+  assert.equal(Model.settingsSectionAt(9).id, "about");
+  assert.equal(Model.settingsSectionAt(2.7).id, "transcription");
+  assert.equal(Model.settingsSectionAt(10), null);
+  assert.equal(Model.settingsSectionAt(-1), null);
+  assert.equal(Model.settingsSectionAt("x"), null);
+  assert.equal(Model.settingsSectionAt(undefined), null);
+});
+
+test("settingsNavStep: j/k move one and clamp at both ends, never wrapping", () => {
+  assert.equal(Model.settingsNavStep(0, 1), 1);
+  assert.equal(Model.settingsNavStep(3, -1), 2);
+  assert.equal(Model.settingsNavStep(0, -1), 0);
+  assert.equal(Model.settingsNavStep(9, 1), 9);
+  assert.equal(Model.settingsNavStep(5, 100), 9);
+  assert.equal(Model.settingsNavStep(5, -100), 0);
+});
+
+test("settingsNavStep: a bad starting index reads as the first section", () => {
+  assert.equal(Model.settingsNavStep(-4, 0), 0);
+  assert.equal(Model.settingsNavStep(42, 0), 0);
+  assert.equal(Model.settingsNavStep(undefined, 1), 1);
+  assert.equal(Model.settingsNavStep("garbage", 0), 0);
+});
+
+test("settingsSectionForKey: digits 1-9 jump to sections, everything else is -1", () => {
+  assert.equal(Model.settingsSectionForKey("1"), 0);
+  assert.equal(Model.settingsSectionForKey("9"), 8);
+  assert.equal(Model.settingsSectionForKey("0"), -1);
+  assert.equal(Model.settingsSectionForKey("j"), -1);
+  assert.equal(Model.settingsSectionForKey("12"), -1);
+  assert.equal(Model.settingsSectionForKey(""), -1);
+  assert.equal(Model.settingsSectionForKey(undefined), -1);
+});
+
+test("settingsSectionBadge: Transcription says Set up whenever the bar's gear would show", () => {
+  const needs = { state: "idle", setup_needed: "Add a Deepgram key" };
+  const fine = { state: "idle", setup_needed: "" };
+  assert.equal(Model.settingsSectionBadge("transcription", needs, null), "Set up");
+  assert.equal(Model.settingsSectionBadge("transcription", fine, { state: "error" }), "Set up");
+  assert.equal(Model.settingsSectionBadge("transcription", fine, { state: "downloading" }), "");
+  assert.equal(Model.settingsSectionBadge("transcription", fine, null), "");
+  assert.equal(Model.settingsSectionBadge("transcription", null, null), "");
+  // Only idle shows the gear -- offline/recording never do (same rule as needsSetup).
+  assert.equal(Model.settingsSectionBadge("transcription", { state: "recording", setup_needed: "x" }, null), "");
+});
+
+test("settingsSectionBadge: placeholders say Soon, everything else is blank", () => {
+  // No placeholder is left; the branch stays for the next section that ships as one.
+  assert.equal(Model.settingsSectionBadge("speakers", null, null), "");
+  assert.equal(Model.settingsSectionBadge("audio", null, null), "");
+  assert.equal(Model.settingsSectionBadge("calendar", null, null), "");
+  assert.equal(Model.settingsSectionBadge("general", null, null), "");
+  assert.equal(Model.settingsSectionBadge("nope", null, null), "");
+  assert.equal(Model.settingsSectionBadge(undefined, null, null), "");
+});
+
+// ---------------------------------------------------------------- settings overlay: call_apps
+
+test("callAppsList: sorted {key, label} rows; garbage reads as empty", () => {
+  const rows = Model.callAppsList({ zoom: "Zoom", brave: "Brave", chrome: "Chrome" });
+  assert.equal(JSON.stringify(rows), JSON.stringify([
+    { key: "brave", label: "Brave" }, { key: "chrome", label: "Chrome" }, { key: "zoom", label: "Zoom" }]));
+  assert.equal(Model.callAppsList(null).length, 0);
+  assert.equal(Model.callAppsList("zoom").length, 0);
+  assert.equal(Model.callAppsList(["zoom"]).length, 0);
+  assert.equal(Model.callAppsList({ x: "" })[0].label, "x");
+});
+
+test("callAppLabel: first letter upper-cased, rest kept", () => {
+  assert.equal(Model.callAppLabel("zoom"), "Zoom");
+  assert.equal(Model.callAppLabel("  jitsi "), "Jitsi");
+  assert.equal(Model.callAppLabel("WhatsApp"), "WhatsApp");
+  assert.equal(Model.callAppLabel(""), "");
+  assert.equal(Model.callAppLabel(undefined), "");
+});
+
+test("callAppsAdd: adds under the lower-cased key, keeps the rest, never mutates the input", () => {
+  const src = { zoom: "Zoom" };
+  const next = Model.callAppsAdd(src, "  Jitsi ");
+  assert.equal(JSON.stringify(next), JSON.stringify({ jitsi: "Jitsi", zoom: "Zoom" }));
+  assert.equal(JSON.stringify(src), JSON.stringify({ zoom: "Zoom" }));
+});
+
+test("callAppsAdd: blank or duplicate names leave the map as it was", () => {
+  assert.equal(JSON.stringify(Model.callAppsAdd({ zoom: "Zoom" }, "")), JSON.stringify({ zoom: "Zoom" }));
+  assert.equal(JSON.stringify(Model.callAppsAdd({ zoom: "Zoom" }, "ZOOM")), JSON.stringify({ zoom: "Zoom" }));
+  assert.equal(JSON.stringify(Model.callAppsAdd(null, "zoom")), JSON.stringify({ zoom: "Zoom" }));
+});
+
+test("callAppsRemove: drops one key, tolerates a missing one", () => {
+  assert.equal(JSON.stringify(Model.callAppsRemove({ zoom: "Zoom", slack: "Slack" }, "zoom")),
+    JSON.stringify({ slack: "Slack" }));
+  assert.equal(JSON.stringify(Model.callAppsRemove({ zoom: "Zoom" }, "nope")), JSON.stringify({ zoom: "Zoom" }));
+  assert.equal(JSON.stringify(Model.callAppsRemove(null, "zoom")), "{}");
+});
+
+test("callAppsSerialize: compact JSON the CLI parses back as an object", () => {
+  const text = Model.callAppsSerialize({ zoom: "Zoom", brave: "Brave" });
+  assert.equal(text, '{"brave":"Brave","zoom":"Zoom"}');
+  assert.equal(JSON.stringify(JSON.parse(text)), text);
+  assert.equal(Model.callAppsSerialize(null), "{}");
+});
+
+// ---------------------------------------------------------------- settings overlay: misc helpers
+
+test("opusBitrateOptions: the standard ladder, default marked, current kept even when nonstandard", () => {
+  const std = Model.opusBitrateOptions("32k");
+  assert.equal(JSON.stringify(std.map(o => o.value)), JSON.stringify(["16k", "24k", "32k", "48k", "64k", "96k", "128k"]));
+  assert.equal(std[2].label, "32k (default)");
+  const odd = Model.opusBitrateOptions("40k");
+  assert.equal(odd.length, 8);
+  assert.equal(odd[7].value, "40k");
+  assert.equal(Model.opusBitrateOptions("").length, 7);
+  assert.equal(Model.opusBitrateOptions(undefined).length, 7);
+});
+
+test("liveEngineStatusLine: mirrors the CLI's three wordings; null reads blank", () => {
+  assert.equal(Model.liveEngineStatusLine({ installed: true, model: "parakeet-unified-en-0.6b", fast: true }),
+    "Fast engine: on (parakeet-unified-en-0.6b)");
+  assert.equal(Model.liveEngineStatusLine({ installed: true, model: "", fast: true }), "Fast engine: on");
+  assert.equal(Model.liveEngineStatusLine({ installed: false, model: "", fast: false }), "Fast engine: not installed");
+  assert.equal(Model.liveEngineStatusLine({ installed: true, model: "", fast: false }),
+    "Fast engine: installed, but voxtype isn't on a Parakeet model");
+  assert.equal(Model.liveEngineStatusLine(null), "");
+  assert.equal(Model.liveEngineStatusLine("x"), "");
+});
+
+test("daemonStateLabel: one line per state, with the app/message when present", () => {
+  assert.equal(Model.daemonStateLabel({ state: "offline" }), "Daemon: not running");
+  assert.equal(Model.daemonStateLabel(null), "Daemon: not running");
+  assert.equal(Model.daemonStateLabel({ state: "idle" }), "Daemon: idle");
+  assert.equal(Model.daemonStateLabel({ state: "detected", app: "Zoom" }), "Daemon: call detected in Zoom");
+  assert.equal(Model.daemonStateLabel({ state: "recording", app: "Slack" }), "Daemon: recording Slack");
+  assert.equal(Model.daemonStateLabel({ state: "recording", app: "" }), "Daemon: recording");
+  assert.equal(Model.daemonStateLabel({ state: "processing" }), "Daemon: processing");
+  assert.equal(Model.daemonStateLabel({ state: "error", message: "boom" }), "Daemon: error — boom");
+});
+
+test("presentAppsLine: lists the apps on the mic, or says none", () => {
+  assert.equal(Model.presentAppsLine(["Zoom", "Chrome"]), "Using the microphone now: Zoom, Chrome");
+  assert.equal(Model.presentAppsLine([]), "No call app is using the microphone right now.");
+  assert.equal(Model.presentAppsLine(null), "No call app is using the microphone right now.");
+  assert.equal(Model.presentAppsLine([""]), "No call app is using the microphone right now.");
+});
+
+// ---------------------------------------------------------------- settings overlay: calendar
+
+test("calendarSourceOptions: ics then command, fresh objects each call", () => {
+  const a = Model.calendarSourceOptions();
+  assert.equal(JSON.stringify(a.map(o => o.value)), JSON.stringify(["ics", "command"]));
+  for (const o of a) assert.equal(typeof o.label, "string");
+  a[0].label = "Mutated";
+  assert.notEqual(Model.calendarSourceOptions()[0].label, "Mutated");
+});
+
+test("calendarSourceChoice: only 'command' is command; everything else is ics", () => {
+  assert.equal(Model.calendarSourceChoice("command"), "command");
+  assert.equal(Model.calendarSourceChoice("ics"), "ics");
+  assert.equal(Model.calendarSourceChoice(""), "ics");
+  assert.equal(Model.calendarSourceChoice(undefined), "ics");
+  assert.equal(Model.calendarSourceChoice("caldav"), "ics");
+});
+
+test("calendarTestText: CLI failure, source failure, match, and no-match lines", () => {
+  assert.equal(Model.calendarTestText(false, null), "✗ Couldn't reach spitball");
+  assert.equal(Model.calendarTestText(true, null), "✗ Couldn't reach spitball");
+  assert.equal(Model.calendarTestText(true, { ok: false, message: "calendar feed: HTTP 404" }),
+    "✗ calendar feed: HTTP 404");
+  assert.equal(Model.calendarTestText(true, { ok: false, error: "no feed address set" }),
+    "✗ no feed address set");
+  assert.equal(Model.calendarTestText(true, { ok: true, source: "ics", match: { title: "Weekly sync" }, confidence: 75 }),
+    "✓ Matched \u201cWeekly sync\u201d (score 75)");
+  assert.equal(Model.calendarTestText(true, { ok: true, source: "ics", match: null, events_nearby: 2,
+    summary: "no confident match (2 candidates, best score 30)" }),
+    "✓ Feed OK; no confident match (2 candidates, best score 30)");
+  assert.equal(Model.calendarTestText(true, { ok: true, source: "command", cached: false, match: null, events_nearby: 0 }),
+    "✓ Command OK; no events at that time");
+  assert.equal(Model.calendarTestText(true, { ok: true, source: "ics", cached: true, match: null, events_nearby: 1 }),
+    "✓ Feed OK (cached); 1 event(s) nearby, no confident match");
+});
+
+// Codex review 2, P2: the store used to drop stdout on any nonzero exit, so
+// `calendar test` (and `check …`, `status`) failures always read "Couldn't
+// reach spitball" instead of the JSON's own explanation.
+test("cliJsonResult: nonzero exit with JSON on stdout is still an answer", () => {
+  const r = Model.cliJsonResult(1, JSON.stringify({ ok: false, message: "calendar feed: HTTP 403 (reset)" }), "");
+  assert.equal(r.ok, true);
+  assert.equal(r.data.ok, false);
+  assert.equal(r.data.message, "calendar feed: HTTP 403 (reset)");
+  assert.equal(r.error, "");
+  assert.equal(Model.calendarTestText(r.ok, r.data), "✗ calendar feed: HTTP 403 (reset)");
+  // Zero exit + JSON: as before.
+  const ok = Model.cliJsonResult(0, JSON.stringify({ ok: true, source: "ics", match: null, events_nearby: 0 }), "");
+  assert.equal(ok.ok, true);
+  assert.equal(Model.calendarTestText(ok.ok, ok.data), "✓ Feed OK; no events at that time");
+  // Arrays are JSON answers too (`local models --json`).
+  assert.equal(JSON.stringify(Model.cliJsonResult(0, "[1,2]", "").data), "[1,2]");
+});
+
+test("cliJsonResult: no JSON at all is a real failure, with stderr or the exit code", () => {
+  assert.equal(JSON.stringify(Model.cliJsonResult(1, "", "Traceback: boom")), JSON.stringify({ ok: false, data: null, error: "Traceback: boom" }));
+  assert.equal(JSON.stringify(Model.cliJsonResult(2, "", "")), JSON.stringify({ ok: false, data: null, error: "exit 2" }));
+  assert.equal(JSON.stringify(Model.cliJsonResult(0, "not json", "")), JSON.stringify({ ok: false, data: null, error: "bad JSON from CLI" }));
+  assert.equal(JSON.stringify(Model.cliJsonResult(0, "", "")), JSON.stringify({ ok: false, data: null, error: "bad JSON from CLI" }));
+  assert.equal(JSON.stringify(Model.cliJsonResult(0, "null", "")), JSON.stringify({ ok: false, data: null, error: "bad JSON from CLI" }));
+  assert.equal(JSON.stringify(Model.cliJsonResult(1, "42", "")), JSON.stringify({ ok: false, data: null, error: "exit 1" }));
+  assert.equal(Model.calendarTestText(false, null), "✗ Couldn't reach spitball");
+});
+
+test("calendarTestText: skipped recurring series are mentioned", () => {
+  assert.equal(Model.calendarTestText(true, { ok: true, source: "ics", match: { title: "Weekly sync" }, confidence: 75, rules_skipped: 2 }),
+    "✓ Matched “Weekly sync” (score 75); 2 recurring series skipped (unsupported repeat rule)");
+  assert.equal(Model.calendarTestText(true, { ok: true, source: "ics", match: null, events_nearby: 0, rules_skipped: 1 }),
+    "✓ Feed OK; no events at that time; 1 recurring series skipped (unsupported repeat rule)");
+  assert.equal(Model.calendarTestText(true, { ok: true, source: "ics", match: null, events_nearby: 0, rules_skipped: 0 }),
+    "✓ Feed OK; no events at that time");
+});
+
+test("calendarOwnerUnknown: only a healthy feed whose owner couldn't be told", () => {
+  assert.equal(Model.calendarOwnerUnknown(true, { ok: true, source: "ics", my_email_known: false }), true);
+  assert.equal(Model.calendarOwnerUnknown(true, { ok: true, source: "ics", my_email_known: true }), false);
+  assert.equal(Model.calendarOwnerUnknown(true, { ok: true, source: "ics" }), false);            // older CLI, no field
+  assert.equal(Model.calendarOwnerUnknown(true, { ok: true, source: "command", my_email_known: false }), false);
+  assert.equal(Model.calendarOwnerUnknown(true, { ok: false, source: "ics", my_email_known: false }), false);
+  assert.equal(Model.calendarOwnerUnknown(false, null), false);
+  assert.equal(Model.calendarOwnerUnknown(true, "x"), false);
+});
+
+// ---------------------------------------------------------------- audio page: mic_denoise
+
+test("micDenoiseOptions: off / auto / on, in that order, with labels", () => {
+  const o = Model.micDenoiseOptions();
+  assert.equal(JSON.stringify(o.map(x => x.value)), JSON.stringify(["off", "auto", "on"]));
+  assert.equal(JSON.stringify(o.map(x => x.label)), JSON.stringify(["Off", "Auto", "On"]));
+});
+
+test("micDenoiseChoice: unknown, missing, or odd-cased values read as auto", () => {
+  assert.equal(Model.micDenoiseChoice("off"), "off");
+  assert.equal(Model.micDenoiseChoice(" ON "), "on");
+  assert.equal(Model.micDenoiseChoice("auto"), "auto");
+  assert.equal(Model.micDenoiseChoice("loud"), "auto");
+  assert.equal(Model.micDenoiseChoice(""), "auto");
+  assert.equal(Model.micDenoiseChoice(undefined), "auto");
+  assert.equal(Model.micDenoiseChoice(null), "auto");
+});
+
+test("micDenoiseNote: one line per mode, never empty", () => {
+  for (const v of ["off", "auto", "on"]) {
+    const note = Model.micDenoiseNote(v);
+    assert.ok(note.length > 20, v);
+    assert.equal(note.indexOf("\n"), -1, v);
+  }
+  assert.equal(Model.micDenoiseNote("garbage"), Model.micDenoiseNote("auto"));
+});
+
+test("micDenoiseNotes: all three rows, exactly one selected", () => {
+  const rows = Model.micDenoiseNotes("on");
+  assert.equal(rows.length, 3);
+  assert.equal(JSON.stringify(rows.map(r => r.selected)), JSON.stringify([false, false, true]));
+  assert.equal(rows[2].label, "On");
+  assert.equal(rows[2].note, Model.micDenoiseNote("on"));
+  assert.equal(JSON.stringify(Model.micDenoiseNotes(undefined).map(r => r.selected)),
+    JSON.stringify([false, true, false]));
+});
+
+test("micNoiseFloorDb: integer dBFS clamped to -80..-20, default -45", () => {
+  assert.equal(Model.micNoiseFloorDb(-45), -45);
+  assert.equal(Model.micNoiseFloorDb("-52"), -52);
+  assert.equal(Model.micNoiseFloorDb(-38.6), -39);
+  assert.equal(Model.micNoiseFloorDb(-200), -80);
+  assert.equal(Model.micNoiseFloorDb(5), -20);
+  assert.equal(Model.micNoiseFloorDb("abc"), -45);
+  assert.equal(Model.micNoiseFloorDb(undefined), -45);
+});
+
+test("settingsSections: Audio is no longer a placeholder", () => {
+  const audio = Model.settingsSections().find(x => x.id === "audio");
+  assert.equal(audio.placeholder, false);
+  assert.equal(audio.page, "AudioPage.qml");
+});
+
+test("settingsSections: Speakers is no longer a placeholder", () => {
+  const speakers = Model.settingsSections().find(x => x.id === "speakers");
+  assert.equal(speakers.placeholder, false);
+  assert.equal(speakers.page, "SpeakersPage.qml");
+});
+
+test("diarizeStatusLine: installed / package-only / missing / garbage", () => {
+  assert.equal(Model.diarizeStatusLine({ installed: true, package: true, models: true, engine: "sherpa-onnx" }),
+    "Speaker split: installed (sherpa-onnx)");
+  assert.equal(Model.diarizeStatusLine({ installed: true, package: true, models: true }), "Speaker split: installed");
+  assert.equal(Model.diarizeStatusLine({ installed: false, package: true, models: false }),
+    "Speaker split: sherpa-onnx is installed, but the models are missing");
+  assert.equal(Model.diarizeStatusLine({ installed: false, package: false, models: false }), "Speaker split: not installed");
+  assert.equal(Model.diarizeStatusLine(null), "");
+  assert.equal(Model.diarizeStatusLine("x"), "");
+});
+
+test("speakerMax: clamps to 1-12, defaults to 6", () => {
+  assert.equal(Model.speakerMax(6), 6);
+  assert.equal(Model.speakerMax("4"), 4);
+  assert.equal(Model.speakerMax(3.6), 4);
+  assert.equal(Model.speakerMax(0), 1);
+  assert.equal(Model.speakerMax(-3), 1);
+  assert.equal(Model.speakerMax(40), 12);
+  assert.equal(Model.speakerMax("abc"), 6);
+  assert.equal(Model.speakerMax(undefined), 6);
+  assert.equal(Model.speakerMax(null), 1);  // Number(null) is 0, the same clamp every NumberRow gets
+});

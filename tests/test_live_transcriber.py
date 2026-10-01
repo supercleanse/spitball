@@ -322,6 +322,158 @@ class TestStopAndFinish(LiveTestCase):
         self.assertFalse(first_thread.is_alive())
 
 
+# Tone bursts (near -9 dBFS RMS; ffmpeg's sine is 1/8 full scale, hence
+# +12 dB) over steady pink noise near -30 dBFS on channel 0: the case the
+# `auto` gate exists for. The noise sits above silencedetect's -35 dB gate,
+# so the 1.2 s pause is invisible until the noise is taken down.
+_CH0_NOISY = ("sine=frequency=440:duration=2,volume=12dB[a1];"
+              "anullsrc=r=48000:cl=mono,atrim=duration=1.2[s1];"
+              "sine=frequency=440:duration=2,volume=12dB[a2];"
+              "[a1][s1][a2]concat=n=3:v=0:a=1[tone];"
+              "anoisesrc=color=pink:sample_rate=48000:amplitude=0.2:seed=5,atrim=duration=5.2[n];"
+              "[tone][n]amix=inputs=2:duration=first:normalize=0[out]")
+
+
+class TestMicDenoiseOnLivePath(LiveTestCase):
+    """docs/SPEC-v2.md section 3 on the live path: channel 0's tail clip is
+    denoised (a temp copy; the recording is untouched) when `mic_denoise`
+    says so, the `auto` gate learns the floor from the tails, and
+    `.live.json` records what ran."""
+
+    def _fake_apply(self, seen):
+        def apply(src, dst, model_path=None):
+            seen.append((Path(src).name, Path(dst).name))
+            shutil.copy(src, dst)
+            return "arnndn"
+        return apply
+
+    def _run_all_ticks(self, lt):
+        with tempfile.TemporaryDirectory() as scratch:
+            lt._tick(Path(scratch), final=True)
+        lt._write_call_folder_live_json()
+        return json.loads((self.call_dir / live.CALL_LIVE_FILENAME).read_text())
+
+    def test_on_denoises_every_mic_tail_and_records_it(self):
+        final = _build_two_channel(self.tmp, _CH0_TSTS, _CH1_SILENT, 5.2)
+        shutil.copy(final, self.audio_path)
+        seen = []
+        patches = self.patched()
+        with patches[0], patches[1], patches[2], \
+             mock.patch("spitball.live.denoise.apply", side_effect=self._fake_apply(seen)):
+            lt = live.LiveTranscriber(self.call_dir, self.audio_path, time.time(),
+                                       self.cfg(mic_denoise="on"))
+            data = self._run_all_ticks(lt)
+        self.assertEqual(seen, [("live-tail-ch0.wav", "live-tail-ch0-denoised.wav")])
+        utts = [u for u in data["utterances"] if u["channel"] == 0]
+        self.assertEqual(len(utts), 2, utts)  # segmentation ran on the denoised copy
+        self.assertEqual(data["mic_denoise"]["mode"], "on")
+        self.assertTrue(data["mic_denoise"]["applied"])
+        self.assertEqual(data["mic_denoise"]["filter"], "arnndn")
+        self.assertIsNone(data["mic_denoise"]["noise_floor_db"])
+        # Temp copies are cleaned up; the recording is what it was.
+        self.assertEqual(self.audio_path.read_bytes(), final.read_bytes())
+
+    def test_off_neither_measures_nor_applies(self):
+        shutil.copy(_build_two_channel(self.tmp, _CH0_TSTS, _CH1_SILENT, 5.2), self.audio_path)
+        patches = self.patched()
+        with patches[0], patches[1], patches[2], \
+             mock.patch("spitball.live.denoise.apply") as apply, \
+             mock.patch("spitball.live.audio_mod.measure_levels") as measure:
+            lt = live.LiveTranscriber(self.call_dir, self.audio_path, time.time(),
+                                       self.cfg(mic_denoise="off"))
+            data = self._run_all_ticks(lt)
+        apply.assert_not_called()
+        measure.assert_not_called()
+        self.assertEqual(len([u for u in data["utterances"] if u["channel"] == 0]), 2)
+        self.assertEqual(data["mic_denoise"], {"mode": "off", "applied": False, "filter": None,
+                                               "noise_floor_db": None, "threshold_db": -45.0})
+
+    def test_auto_leaves_a_quiet_mic_alone(self):
+        shutil.copy(_build_two_channel(self.tmp, _CH0_TSTS, _CH1_SILENT, 5.2), self.audio_path)
+        patches = self.patched()
+        with patches[0], patches[1], patches[2], \
+             mock.patch("spitball.live.denoise.apply") as apply:
+            lt = live.LiveTranscriber(self.call_dir, self.audio_path, time.time(), self.cfg())
+            data = self._run_all_ticks(lt)
+        apply.assert_not_called()
+        rec = data["mic_denoise"]
+        self.assertEqual(rec["mode"], "auto")
+        self.assertFalse(rec["applied"])
+        self.assertLessEqual(rec["noise_floor_db"], -45.0)  # digital-silence gaps
+
+    def test_auto_turns_on_for_a_noisy_mic(self):
+        shutil.copy(_build_two_channel(self.tmp, _CH0_NOISY, _CH1_SILENT, 5.2), self.audio_path)
+        seen = []
+        patches = self.patched()
+        with patches[0], patches[1], patches[2], \
+             mock.patch("spitball.live.denoise.apply", side_effect=self._fake_apply(seen)):
+            lt = live.LiveTranscriber(self.call_dir, self.audio_path, time.time(), self.cfg())
+            data = self._run_all_ticks(lt)
+        self.assertEqual(len(seen), 1, seen)
+        rec = data["mic_denoise"]
+        self.assertTrue(rec["applied"])
+        self.assertGreater(rec["noise_floor_db"], -45.0)
+        self.assertLess(rec["noise_floor_db"], -20.0)
+
+    def test_gate_learns_across_ticks_on_a_growing_file(self):
+        final = _build_two_channel(self.tmp, _CH0_NOISY, _CH1_SILENT, 5.2)
+        data = final.read_bytes()
+        seen = []
+        patches = self.patched()
+        with patches[0], patches[1], patches[2], \
+             mock.patch("spitball.live.denoise.apply", side_effect=self._fake_apply(seen)):
+            lt = live.LiveTranscriber(self.call_dir, self.audio_path, time.time(), self.cfg())
+            with tempfile.TemporaryDirectory() as scratch:
+                tmp = Path(scratch)
+                for frac in (0.2, 0.5, 0.8, 1.0):
+                    self.audio_path.write_bytes(data[:max(1, int(len(data) * frac))])
+                    lt._tick(tmp, final=(frac >= 1.0))
+        # The first tail (about 1 s) is too short to judge; later ones trip
+        # the gate, and every later mic tail is denoised.
+        self.assertGreaterEqual(len(seen), 1)
+        self.assertTrue(lt._gate.active)
+        self.assertTrue(all(src == "live-tail-ch0.wav" for src, _ in seen))
+        # (The fake "denoiser" is a plain copy, so the noise still hides the
+        # pause: one run, but transcribed, and resolved to the end.)
+        self.assertGreaterEqual(len([u for u in lt._utterances if u["channel"] == 0]), 1)
+        self.assertAlmostEqual(lt._resolved[0], lt._last_duration, delta=0.05)
+
+    def test_filter_failure_keeps_the_raw_tail_and_the_transcript(self):
+        shutil.copy(_build_two_channel(self.tmp, _CH0_TSTS, _CH1_SILENT, 5.2), self.audio_path)
+        patches = self.patched()
+        with patches[0], patches[1], patches[2], \
+             mock.patch("spitball.live.denoise.apply",
+                        side_effect=RuntimeError("arnndn failed (x); afftdn failed (y)")):
+            lt = live.LiveTranscriber(self.call_dir, self.audio_path, time.time(),
+                                       self.cfg(mic_denoise="on"))
+            data = self._run_all_ticks(lt)
+        self.assertEqual(len([u for u in data["utterances"] if u["channel"] == 0]), 2)
+        self.assertFalse(data["mic_denoise"]["applied"])
+        self.assertIn("afftdn failed", data["mic_denoise"]["error"])
+
+    def test_real_rnnoise_on_the_live_tail(self):
+        # No mocks on the filter: RNNoise really runs on each mic tail, the
+        # whole stretch still gets transcribed and resolved, and the far
+        # channel (never denoised) is unaffected. (Whether the pause becomes
+        # visible again depends on the noise: pink noise keeps sample peaks
+        # above silencedetect's gate even at 30% residual, so no claim is
+        # made about the run count here.)
+        shutil.copy(_build_two_channel(self.tmp, _CH0_NOISY, _CH1_SILENT, 5.2), self.audio_path)
+        patches = self.patched()
+        with patches[0], patches[1], patches[2]:
+            lt = live.LiveTranscriber(self.call_dir, self.audio_path, time.time(),
+                                       self.cfg(mic_denoise="on"))
+            data = self._run_all_ticks(lt)
+        self.assertTrue(data["mic_denoise"]["applied"])
+        self.assertEqual(data["mic_denoise"]["filter"], "arnndn")
+        utts = sorted((u for u in data["utterances"] if u["channel"] == 0), key=lambda u: u["start"])
+        self.assertGreaterEqual(len(utts), 1, utts)
+        self.assertAlmostEqual(utts[0]["start"], 0.0, delta=0.2)
+        self.assertAlmostEqual(utts[-1]["end"], 5.2, delta=0.3)
+        self.assertFalse([u for u in data["utterances"] if u["channel"] == 1])
+        self.assertAlmostEqual(lt._resolved[0], lt._last_duration, delta=0.05)
+
+
 if __name__ == "__main__":
     unittest.main()
 

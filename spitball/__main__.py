@@ -19,20 +19,36 @@ USAGE = """usage: spitball <command>
   open-last                 open the last call's summary
   open-folder               open the calls folder
   status [--json]           show the current state
-  reprocess <call-dir> [--retranscribe]
-                             redo transcription + summary for one call
+  reprocess <call-dir> [--retranscribe] [--event <id> | --no-event]
+                             redo transcription + summary for one call; --event/--no-event
+                             pin or clear its calendar match by hand
   config get [--json]       show effective settings (secrets masked)
   config set <key> <value>  set one setting (JSON-typed)
-  config set-secret <key>   set a secret from stdin (deepgram_api_key, summary_api_key)
+  config set-secret <key>   set a secret from stdin (deepgram_api_key, summary_api_key,
+                             calendar_ics_url)
   config unset <key>        remove a setting override, back to its default
   check transcription [--provider P] [--json]
                              test the configured (or given) transcription provider
   check summary [--json]    test the summary endpoint
+  calendar test [--at TIME] [--app APP] [--meet CODE] [--refresh] [--json]
+                             which calendar event a call starting now (or at TIME:
+                             "14:30", "2026-09-30 14:30", ISO 8601, or epoch) would match
+  calendar upcoming [--hours N] [--refresh] [--json]
+                             the meeting reminders due in the next N hours (24): each
+                             event with a video link, its link host, and when it fires
   local info [--json]       what voxtype is currently configured with
   local models [--json]     every whisper/parakeet model voxtype knows about
   local set-model <name>    switch voxtype to that model in the background (progress in model.json)
   live setup                install the live transcript's fast engine (a small venv with onnx-asr)
   live status [--json]      whether the fast engine is installed and which model it would load
+  speakers <call-dir> [--json]
+                             list the far-side speakers of one call and who they resolved to
+  speakers <call-dir> <n> "Name" | --clear
+                             name speaker n by hand (or go back to automatic) and re-render
+                             transcript.md, summary.md, and the export copy
+  diarize setup             install the on-device speaker split (sherpa-onnx + two small
+                             models, into the live-engine venv)
+  diarize status [--json]   whether the speaker split is installed
   pick-folder [--title T]   native folder chooser; prints the chosen path
   daemon                    run the service (systemd does this)"""
 
@@ -55,8 +71,21 @@ def send(cmd: str, arg: str = "") -> dict:
 
 
 def _open(path: str) -> None:
-    subprocess.Popen(["xdg-open", path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                     start_new_session=True)
+    """Opens a file or folder in the desktop's handler for it. `gio open`
+    first: it types files by extension (summary.md is text/markdown, so a
+    Markdown app opens it) and runs a Terminal=true handler inside a
+    terminal. Bare xdg-open on Hyprland sniffs .md as text/plain, picks
+    nvim.desktop, and runs nvim with no terminal at all -- an invisible
+    editor holding a swap file, which made "Open last summary" do nothing.
+    xdg-open stays as the fallback for systems without gio."""
+    quiet = {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL,
+             "stderr": subprocess.DEVNULL, "start_new_session": True}
+    try:
+        if subprocess.run(["gio", "open", path], timeout=15, **quiet).returncode == 0:
+            return
+    except (OSError, subprocess.SubprocessError):
+        pass
+    subprocess.Popen(["xdg-open", path], **quiet)
 
 
 def _parse_value(raw: str):
@@ -113,7 +142,7 @@ def _config_cmd(rest: list) -> int:
             print(f"not a secret key: {key!r} (expected one of {', '.join(config.SECRET_KEYS)})",
                   file=sys.stderr)
             return 1
-        value = sys.stdin.read().strip()  # never argv -- empty stdin clears it
+        value = sys.stdin.readline().strip()  # never argv; ONE line so a caller that never closes the pipe (the QML settings UI) cannot hang us. Empty line/EOF clears it
         config.set_key(key, value)
         send("reload")
         return 0
@@ -210,6 +239,49 @@ def _local_cmd(rest: list) -> int:
     return 2
 
 
+def _calendar_cmd(rest: list) -> int:
+    sub = rest[0] if rest else ""
+    from . import calendar
+
+    if sub == "test":
+        cfg = config.load()
+        try:
+            at = calendar.parse_at(_flag_value(rest, "--at") or "now")
+        except (ValueError, TypeError) as e:
+            print(f"bad --at value ({e}); use \"14:30\", \"2026-09-30 14:30\", ISO 8601, or epoch seconds",
+                  file=sys.stderr)
+            return 2
+        meet = _flag_value(rest, "--meet")
+        rep = calendar.test_report(cfg, at, app=_flag_value(rest, "--app") or "",
+                                   meet_codes=[meet.lower()] if meet else [], refresh="--refresh" in rest)
+        if "--json" in rest:
+            print(json.dumps(rep))
+        else:
+            print(calendar.format_test_report(rep))
+        return 0 if rep.get("ok") else 1
+
+    if sub == "upcoming":
+        from . import reminders
+        cfg = config.load()
+        hours_arg = _flag_value(rest, "--hours")
+        try:
+            hours = float(hours_arg) if hours_arg is not None else 24.0
+            if not 0 < hours <= 24 * 14:
+                raise ValueError("out of range")
+        except ValueError as e:
+            print(f"bad --hours value ({e}); use a number of hours up to 336", file=sys.stderr)
+            return 2
+        rep = reminders.upcoming_report(cfg, hours=hours, refresh="--refresh" in rest)
+        if "--json" in rest:
+            print(json.dumps(rep))
+        else:
+            print(reminders.format_upcoming_report(rep))
+        return 0 if rep.get("ok") else 1
+
+    print(USAGE)
+    return 2
+
+
 def _live_cmd(rest: list) -> int:
     sub = rest[0] if rest else ""
     from . import live_engine
@@ -232,13 +304,69 @@ def _live_cmd(rest: list) -> int:
         elif status["fast"]:
             print(f"Fast live transcript: on ({status['model']})")
         elif not status["installed"]:
-            print("Fast live transcript: not installed (run `spitball live setup`)")
+            if live_engine.venv_present():
+                print(f"Fast live transcript: not installed -- the venv at {status['venv']} has no "
+                      "onnx-asr (the speaker split shares it); run `spitball live setup` to add it")
+            else:
+                print("Fast live transcript: not installed (run `spitball live setup`)")
         else:
             print("Fast live transcript: installed, but voxtype isn't on a Parakeet model")
         return 0
 
     print(USAGE)
     return 2
+
+
+def _diarize_cmd(rest: list) -> int:
+    sub = rest[0] if rest else ""
+    from . import diarize
+
+    if sub == "setup":
+        print("Installing the speaker split (sherpa-onnx into the live-engine venv, then two models)...")
+        ok, message = diarize.setup()
+        print(message, file=sys.stdout if ok else sys.stderr)
+        return 0 if ok else 1
+
+    if sub == "status":
+        status = diarize.status()
+        if "--json" in rest:
+            print(json.dumps(status))
+        elif status["installed"]:
+            print(f"Speaker split: installed ({status['engine']}, models in {status['model_dir']})")
+        elif status["package"]:
+            print("Speaker split: sherpa-onnx is installed but the models are missing (run `spitball diarize setup`)")
+        else:
+            print("Speaker split: not installed (run `spitball diarize setup`)")
+        return 0
+
+    print(USAGE)
+    return 2
+
+
+def _speakers_cmd(rest: list) -> int:
+    args = [a for a in rest if a not in ("--json", "--clear")]
+    if not args:
+        print(USAGE)
+        return 2
+    from . import process, speakers
+    call_dir = Path(args[0]).expanduser().resolve()
+    try:
+        if len(args) == 1 and "--clear" not in rest:
+            rows = process.list_speakers(call_dir)
+        else:
+            if len(args) < 2 or not args[1].isdigit() or (len(args) < 3 and "--clear" not in rest):
+                print(USAGE)
+                return 2
+            name = "" if "--clear" in rest else args[2]
+            rows = process.rename_speaker(call_dir, int(args[1]), name)
+    except (RuntimeError, ValueError, OSError) as e:
+        print(str(e), file=sys.stderr)
+        return 1
+    if "--json" in rest:
+        print(json.dumps(rows))
+    else:
+        print(speakers.format_listing(rows))
+    return 0
 
 
 def main(argv=None) -> int:
@@ -253,23 +381,34 @@ def main(argv=None) -> int:
         return 0
     if cmd == "reprocess":
         retranscribe = "--retranscribe" in rest
-        dirs = [a for a in rest if a != "--retranscribe"]
-        if not dirs:
+        event_id = _flag_value(rest, "--event")
+        no_event = "--no-event" in rest
+        skip = {"--retranscribe", "--no-event", "--event"}
+        dirs = [a for i, a in enumerate(rest) if a not in skip and (i == 0 or rest[i - 1] != "--event")]
+        if not dirs or (event_id is not None and no_event):
             print(USAGE)
             return 2
         from . import process
-        r = process.process(Path(dirs[0]).expanduser().resolve(), {}, notify=print,
-                             retranscribe=retranscribe)
+        call_dir = Path(dirs[0]).expanduser().resolve()
+        if event_id is not None or no_event:
+            process.set_calendar_override(call_dir, None if no_event else event_id)
+        r = process.process(call_dir, {}, notify=print, retranscribe=retranscribe)
         print(f"{r['title']}\n{r['summary']}")
         return 0
     if cmd == "config":
         return _config_cmd(rest)
     if cmd == "check":
         return _check_cmd(rest)
+    if cmd == "calendar":
+        return _calendar_cmd(rest)
     if cmd == "local":
         return _local_cmd(rest)
     if cmd == "live":
         return _live_cmd(rest)
+    if cmd == "diarize":
+        return _diarize_cmd(rest)
+    if cmd == "speakers":
+        return _speakers_cmd(rest)
     if cmd == "pick-folder":
         title = _flag_value(rest, "--title") or "Choose a folder"
         from . import pickfolder

@@ -6,7 +6,8 @@ hard dependency, per README) -- no extra tools needed.
 
 The `local` provider (spitball/providers/local.py) uses the segmentation
 helpers (ffprobe_duration, split_stereo_to_mono_wavs, extract_clip,
-detect_silence, speech_windows). encode_opus/chunk_ranges aren't used by any
+detect_silence, speech_windows); measure_levels feeds the mic denoise gate
+in spitball/denoise.py. encode_opus/chunk_ranges aren't used by any
 phase-1 provider -- they're kept for the phase-2 OpenAI-compatible provider
 (see docs/ROADMAP.md / docs/phase2/), which needs them for its 25 MB upload
 limit.
@@ -31,15 +32,25 @@ def ffprobe_duration(path: Path) -> float:
         return 0.0
 
 
-def split_stereo_to_mono_wavs(src: Path, dst_dir: Path) -> tuple[Path, Path]:
+# Always applied to the MIC copy the transcriber hears (never to the far
+# channel, never to the recording itself): a high-pass at 80 Hz takes out
+# desk rumble, HVAC hum, and handling thumps below the voice band. Speech
+# fundamentals start around 85 Hz, so nothing a model needs is touched.
+MIC_FILTER = "highpass=f=80"
+
+
+def split_stereo_to_mono_wavs(src: Path, dst_dir: Path, mic_filter: str = MIC_FILTER) -> tuple[Path, Path]:
     """Splits a stereo file into two mono 16 kHz WAVs: left = channel 0 (mic),
-    right = channel 1 (far side). One ffmpeg invocation, two outputs."""
+    right = channel 1 (far side). One ffmpeg invocation, two outputs. The
+    mic branch gets `mic_filter` (the rumble high-pass; "" for none)."""
     left = dst_dir / "channel-0.wav"
     right = dst_dir / "channel-1.wav"
+    graph = "[0:a]channelsplit=channel_layout=stereo[mic][right]"
+    graph += f";[mic]{mic_filter}[left]" if mic_filter else ";[mic]anull[left]"
     cmd = [
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
         "-i", str(src),
-        "-filter_complex", "[0:a]channelsplit=channel_layout=stereo[left][right]",
+        "-filter_complex", graph,
         "-map", "[left]", "-ar", "16000", str(left),
         "-map", "[right]", "-ar", "16000", str(right),
     ]
@@ -55,7 +66,8 @@ def extract_clip(src: Path, start: float, end: float, dst: Path) -> None:
     subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=120)
 
 
-def extract_channel_clip(src: Path, channel: int, start: float, end: float, dst: Path) -> None:
+def extract_channel_clip(src: Path, channel: int, start: float, end: float, dst: Path,
+                         mic_filter: str = MIC_FILTER) -> None:
     """Cuts [start, end) out of ONE channel of a stereo file straight from the
     source, in one ffmpeg call (a mono `pan` filter picks the channel, same
     invocation trims to the range). `channel` is 0 (left, mic) or 1 (right,
@@ -70,10 +82,17 @@ def extract_channel_clip(src: Path, channel: int, start: float, end: float, dst:
     ffmpeg is still writing (the recorder hasn't stopped yet) -- a torn
     trailing Ogg page just means `end` can't reach all the way to the true
     live edge yet, not a hard failure; the caller clamps `end` to what
-    ffprobe currently reports decodable."""
+    ffprobe currently reports decodable.
+
+    Channel 0 (the mic) also gets `mic_filter`, the same rumble high-pass
+    split_stereo_to_mono_wavs applies, so the live path and the post-call
+    path hear the same thing."""
+    chain = f"pan=mono|c0=c{channel}"
+    if channel == 0 and mic_filter:
+        chain += f",{mic_filter}"
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
            "-ss", f"{start:.3f}", "-to", f"{end:.3f}", "-i", str(src),
-           "-af", f"pan=mono|c0=c{channel}", "-ar", "16000", str(dst)]
+           "-af", chain, "-ar", "16000", str(dst)]
     subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=120)
 
 
@@ -84,6 +103,38 @@ def encode_opus(src_wav: Path, dst_ogg: Path, bitrate: str = "24k") -> None:
            "-i", str(src_wav), "-c:a", "libopus", "-b:a", bitrate,
            "-application", "voip", str(dst_ogg)]
     subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=600)
+
+
+LEVEL_FRAME_S = 0.05
+_RMS_LEVEL_RE = re.compile(r"RMS_level=(-?[\d.]+|-inf|inf|nan)")
+DIGITAL_SILENCE_DB = -100.0
+
+
+def measure_levels(wav: Path, frame_s: float = LEVEL_FRAME_S) -> list[float]:
+    """Per-frame RMS level (dBFS) over `wav`, one value per `frame_s` of
+    audio, from ffmpeg's `astats` -- what spitball/denoise.py's noise-floor
+    gate and the Whisper-path speech check read. Digital silence (`-inf`, a
+    muted mic) reads as DIGITAL_SILENCE_DB. Any ffmpeg trouble yields []."""
+    samples = max(1, int(round(frame_s * 16000)))
+    chain = (f"aresample=16000,asetnsamples=n={samples},"
+             "astats=metadata=1:reset=1:measure_perchannel=none:measure_overall=RMS_level,"
+             "ametadata=print:key=lavfi.astats.Overall.RMS_level:file=-")
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-i", str(wav),
+           "-af", chain, "-f", "null", "-"]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    levels = []
+    for m in _RMS_LEVEL_RE.finditer(result.stdout or ""):
+        value = m.group(1)
+        if value == "-inf":
+            levels.append(DIGITAL_SILENCE_DB)
+        elif value in ("inf", "nan"):
+            continue
+        else:
+            levels.append(float(value))
+    return levels
 
 
 _SILENCE_START_RE = re.compile(r"silence_start:\s*([\d.]+)")

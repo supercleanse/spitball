@@ -2,6 +2,8 @@ import http.server
 import io
 import json
 import os
+import re
+import stat
 import tempfile
 import threading
 import time
@@ -626,6 +628,51 @@ class TestProcessPipeline(unittest.TestCase):
         self.assertIn("Summarizing…", seen)
 
 
+class TestMicDenoiseMetadata(TestProcessPipeline):
+    """The provider's `mic_denoise` block (docs/SPEC-v2.md section 3) rides
+    into `.transcript.json`, whether it came from a fresh transcription or a
+    reused `.live.json`, and `reprocess --retranscribe` hands the provider
+    the current setting."""
+
+    BLOCK = {"mode": "auto", "applied": True, "filter": "arnndn",
+             "noise_floor_db": -38.2, "threshold_db": -45.0, "speech_level_db": -21.0}
+
+    def test_block_is_cached_in_transcript_json(self):
+        normalized = dict(self.dg_fixture, mic_denoise=self.BLOCK)
+        p_transcribe, p_summarize = self._patched(transcribe_return=normalized)
+        with p_transcribe, p_summarize:
+            result = process.process(self.call_dir, self.meta, self.cfg)
+        cached = json.loads((Path(result["dir"]) / ".transcript.json").read_text())
+        self.assertEqual(cached["mic_denoise"], self.BLOCK)
+
+    def test_retranscribe_passes_the_current_setting_to_the_provider(self):
+        p_transcribe, p_summarize = self._patched()
+        with p_transcribe, p_summarize:
+            result = process.process(self.call_dir, self.meta, self.cfg)
+        final_dir = Path(result["dir"])
+        cfg = dict(self.cfg, mic_denoise="on", mic_noise_floor_db=-52)
+        with mock.patch("spitball.process.transcribe", return_value=self.dg_fixture) as t, \
+             mock.patch("spitball.process.summarize", return_value="# T\n\n## Summary\n- x"):
+            process.process(final_dir, {}, cfg, retranscribe=True)
+        t.assert_called_once()
+        passed_cfg = t.call_args[0][1]
+        self.assertEqual(passed_cfg["mic_denoise"], "on")
+        self.assertEqual(passed_cfg["mic_noise_floor_db"], -52)
+
+    def test_live_json_block_survives_reuse(self):
+        live = {"provider": "local", "model": "m", "note": "live transcript",
+                "utterances": [{"channel": 0, "speaker": 0, "start": 0.0, "end": 5.0, "transcript": "hi"}],
+                "mic_denoise": dict(self.BLOCK, mode="on")}
+        (self.call_dir / ".live.json").write_text(json.dumps(live))
+        with mock.patch("spitball.process.transcribe") as t, \
+             mock.patch("spitball.process.summarize", return_value="# T\n\n## Summary\n- x"):
+            result = process.process(self.call_dir, self.meta, self.cfg)
+        t.assert_not_called()
+        cached = json.loads((Path(result["dir"]) / ".transcript.json").read_text())
+        self.assertEqual(cached["mic_denoise"]["mode"], "on")
+        self.assertTrue(cached["mic_denoise"]["applied"])
+
+
 if __name__ == "__main__":
     unittest.main()
 
@@ -738,3 +785,647 @@ class TestLiveTranscriptReuse(TestProcessPipeline):
         with p_transcribe as t, p_summarize:
             process.process(self.call_dir, self.meta, cfg, retranscribe=True)
         t.assert_called_once()
+
+
+class TestCalendarInPipeline(TestProcessPipeline):
+    """The calendar's hooks in process() (docs/SPEC-v2.md §2): a confident
+    match names the folder after the event, heads transcript.md/summary.md
+    with the meeting + attendees, stores `meeting` in .transcript.json, and
+    feeds the invite list to the summarizer; a weak match changes nothing
+    but a header line; off means byte-for-byte the old behavior."""
+
+    T = 1790000000  # the pipeline's started_at; events are placed relative to it
+
+    def _event(self, title="Weekly sync", offset_s=-120, minutes=30, attendees=2, **extra):
+        from datetime import datetime, timedelta, timezone
+        from spitball import calendar as cal
+        s = datetime.fromtimestamp(self.T + offset_s, tz=timezone.utc)
+        people = [{"name": f"Person {i}", "email": f"p{i}@example.com", "response": "accepted",
+                   "self": False, "optional": False} for i in range(attendees)]
+        people.append({"name": "", "email": "owner@example.com", "response": "accepted", "self": True,
+                       "optional": False})
+        ev = {"id": f"{title}@x", "uid": title, "title": title, "start": cal.to_iso(s),
+              "end": cal.to_iso(s + timedelta(minutes=minutes)), "all_day": False, "status": "confirmed",
+              "transparency": "opaque", "kind": "default", "my_response": "accepted",
+              "organizer": {"name": "Person 0", "email": "p0@example.com"}, "attendees": people,
+              "conference": {"kind": "meet", "url": "https://meet.google.com/abc-defg-hij", "code": "abc-defg-hij"},
+              "location": "", "description": "Agenda: numbers", "recurring": False, "recurrence_id": ""}
+        ev.update(extra)
+        return ev
+
+    def _meta(self, events, meet_codes=(), **over):
+        meta = dict(self.meta)
+        meta["calendar"] = {"source": "ics", "fetched_at": 1, "cached": False, "error": "", "app": "Chrome",
+                            "started_at": self.T, "meet_codes": list(meet_codes), "events": events, "match": None}
+        meta.update(over)
+        return meta
+
+    def test_confident_match_names_folder_headers_and_transcript_json(self):
+        cfg = dict(self.cfg, calendar_enabled=True)
+        p_transcribe, p_summarize = self._patched()
+        with p_transcribe, p_summarize as summ:
+            result = process.process(self.call_dir, self._meta([self._event()], ["abc-defg-hij"]), cfg)
+        final_dir = Path(result["dir"])
+        self.assertTrue(final_dir.name.endswith("-zoom-weekly-sync"), final_dir.name)
+        self.assertEqual(result["title"], "Weekly sync")
+        transcript = (final_dir / "transcript.md").read_text()
+        self.assertTrue(transcript.startswith("# Weekly sync: transcript\n"))
+        self.assertIn("**Meeting:** Weekly sync  \n**When:** ", transcript)
+        self.assertIn("**Attendees:** Person 0 (organizer), Person 1", transcript)
+        summary = (final_dir / "summary.md").read_text()
+        self.assertTrue(summary.startswith("# Weekly sync\n\n## Summary\n- talked"), summary[:80])
+        self.assertNotIn("Weekly Sync With Morgan", summary)  # the model's heading is replaced
+        self.assertIn("**Meeting:** Weekly sync", summary)
+        meta_text = summ.call_args.args[1]
+        self.assertIn("**People on the invite:** Person 0 (organizer), Person 1", meta_text)
+        self.assertNotIn("Agenda: numbers", meta_text)  # description off by default
+        cache = json.loads((final_dir / ".transcript.json").read_text())
+        self.assertEqual(cache["meeting"]["title"], "Weekly sync")
+        self.assertEqual([a["name"] for a in cache["meeting"]["attendees"]], ["Person 0", "Person 1", ""])
+        self.assertTrue(cache["meeting"]["attendees"][2]["self"])
+        saved = json.loads((final_dir / ".meta.json").read_text())
+        self.assertEqual(saved["calendar"]["match"]["title"], "Weekly sync")
+        self.assertTrue(saved["titled"])
+
+    def test_prefer_event_title_off_keeps_model_title_but_adds_header(self):
+        cfg = dict(self.cfg, calendar_enabled=True, calendar_prefer_event_title=False)
+        p_transcribe, p_summarize = self._patched()
+        with p_transcribe, p_summarize:
+            result = process.process(self.call_dir, self._meta([self._event()], ["abc-defg-hij"]), cfg)
+        final_dir = Path(result["dir"])
+        self.assertTrue(final_dir.name.endswith("-weekly-sync-with-morgan"))
+        self.assertEqual(result["title"], "Weekly Sync With Morgan")
+        self.assertIn("**Meeting:** Weekly sync", (final_dir / "transcript.md").read_text())
+        self.assertIn("meeting", json.loads((final_dir / ".transcript.json").read_text()))
+
+    def test_weak_match_never_renames_and_says_so(self):
+        cfg = dict(self.cfg, calendar_enabled=True)
+        events = [self._event("Weekly sync"), self._event("Design review")]  # a tie
+        p_transcribe, p_summarize = self._patched()
+        with p_transcribe, p_summarize as summ:
+            result = process.process(self.call_dir, self._meta(events), cfg)
+        final_dir = Path(result["dir"])
+        self.assertTrue(final_dir.name.endswith("-weekly-sync-with-morgan"))
+        transcript = (final_dir / "transcript.md").read_text()
+        self.assertIn("**Calendar:** no confident match (2 candidates)", transcript)
+        self.assertNotIn("**Meeting:**", transcript)
+        self.assertNotIn("People on the invite", summ.call_args.args[1])
+        self.assertNotIn("meeting", json.loads((final_dir / ".transcript.json").read_text()))
+        self.assertFalse(json.loads((final_dir / ".meta.json").read_text())["calendar"]["match"]["confident"])
+
+    def test_description_sent_only_when_enabled(self):
+        cfg = dict(self.cfg, calendar_enabled=True, calendar_description_to_summary=True)
+        p_transcribe, p_summarize = self._patched()
+        with p_transcribe, p_summarize as summ:
+            process.process(self.call_dir, self._meta([self._event()], ["abc-defg-hij"]), cfg)
+        self.assertIn("**Event description:**\nAgenda: numbers", summ.call_args.args[1])
+
+    def test_description_off_by_default_stays_out_of_the_summary_request(self):
+        cfg = dict(self.cfg, calendar_enabled=True)
+        p_transcribe, p_summarize = self._patched()
+        with p_transcribe, p_summarize as summ:
+            process.process(self.call_dir, self._meta([self._event()], ["abc-defg-hij"]), cfg)
+        self.assertNotIn("Agenda: numbers", summ.call_args.args[1])
+
+    def test_names_to_summary_off_keeps_attendees_local_and_out_of_the_request(self):
+        # Codex P1 regression: the local header's **Attendees:** line used to
+        # be copied into the summarizer's metadata, so the toggle changed
+        # nothing. The model-bound metadata is built on its own now.
+        cfg = dict(self.cfg, calendar_enabled=True, calendar_names_to_summary=False)
+        p_transcribe, p_summarize = self._patched()
+        with p_transcribe, p_summarize as summ:
+            result = process.process(self.call_dir, self._meta([self._event()], ["abc-defg-hij"]), cfg)
+        meta_arg = summ.call_args.args[1]
+        self.assertIn("**Meeting:** Weekly sync", meta_arg)      # title and time still go
+        self.assertIn("**When:**", meta_arg)
+        self.assertNotIn("Attendees", meta_arg)
+        self.assertNotIn("People on the invite", meta_arg)
+        self.assertNotIn("Person 0", meta_arg)
+        self.assertNotIn("Person 1", meta_arg)
+        self.assertNotIn("@", meta_arg)
+        # The local files keep the full attendee list regardless.
+        final_dir = Path(result["dir"])
+        for name in ("transcript.md", "summary.md"):
+            self.assertIn("**Attendees:** Person 0 (organizer), Person 1", (final_dir / name).read_text())
+
+    def test_names_to_summary_on_sends_the_invite_list_but_not_the_local_attendees_line(self):
+        cfg = dict(self.cfg, calendar_enabled=True)
+        p_transcribe, p_summarize = self._patched()
+        with p_transcribe, p_summarize as summ:
+            process.process(self.call_dir, self._meta([self._event()], ["abc-defg-hij"]), cfg)
+        meta_arg = summ.call_args.args[1]
+        self.assertIn("**People on the invite:** Person 0 (organizer), Person 1", meta_arg)
+        self.assertNotIn("**Attendees:**", meta_arg)
+        self.assertNotIn("@", meta_arg)
+        self.assertEqual(meta_arg.count("Person 1"), 1)
+
+    def test_no_snapshot_and_calendar_off_is_unchanged(self):
+        p_transcribe, p_summarize = self._patched()
+        with p_transcribe, p_summarize as summ:
+            result = process.process(self.call_dir, self.meta, self.cfg)
+        final_dir = Path(result["dir"])
+        self.assertNotIn("Calendar", (final_dir / "transcript.md").read_text())
+        self.assertNotIn("Meeting", summ.call_args.args[1])
+        self.assertNotIn("calendar", json.loads((final_dir / ".meta.json").read_text()))
+        self.assertNotIn("meeting", json.loads((final_dir / ".transcript.json").read_text()))
+
+    def test_no_snapshot_but_enabled_looks_up_now(self):
+        from spitball import calendar as cal
+        cfg = dict(self.cfg, calendar_enabled=True, calendar_source="command",
+                   calendar_command="echo '[]'")
+        p_transcribe, p_summarize = self._patched()
+        with p_transcribe, p_summarize, mock.patch("spitball.calendar.snapshot", wraps=cal.snapshot) as snap:
+            result = process.process(self.call_dir, self.meta, cfg)
+        snap.assert_called_once()
+        saved = json.loads((Path(result["dir"]) / ".meta.json").read_text())
+        self.assertEqual(saved["calendar"]["source"], "command")
+        self.assertEqual(saved["calendar"]["events"], [])
+
+    def test_reprocess_keeps_the_snapshot_and_override_pins_the_event(self):
+        cfg = dict(self.cfg, calendar_enabled=True)
+        events = [self._event("Weekly sync"), self._event("Design review")]
+        p_transcribe, p_summarize = self._patched()
+        with p_transcribe, p_summarize:
+            result = process.process(self.call_dir, self._meta(events), cfg)
+        final_dir = Path(result["dir"])
+        process.set_calendar_override(final_dir, "Design review@x")
+        p_transcribe2, p_summarize2 = self._patched()
+        with p_transcribe2 as t2, p_summarize2:
+            result2 = process.process(final_dir, {}, cfg)
+        t2.assert_not_called()
+        self.assertEqual(result2["dir"], str(final_dir))  # renamed once, never again
+        self.assertEqual(result2["title"], "Design review")
+        transcript = (final_dir / "transcript.md").read_text()
+        self.assertIn("**Meeting:** Design review", transcript)
+        self.assertTrue(transcript.startswith("# Design review: transcript"))
+        process.set_calendar_override(final_dir, None)
+        p_transcribe3, p_summarize3 = self._patched()
+        with p_transcribe3, p_summarize3:
+            result3 = process.process(final_dir, {}, cfg)
+        self.assertEqual(result3["title"], "Weekly Sync With Morgan")
+        self.assertNotIn("**Meeting:**", (final_dir / "transcript.md").read_text())
+
+    def test_calendar_snapshot_error_never_breaks_processing(self):
+        cfg = dict(self.cfg, calendar_enabled=True)
+        meta = self._meta([], error="calendar feed unreachable (boom)")
+        meta["calendar"]["error"] = "calendar feed unreachable (boom)"
+        p_transcribe, p_summarize = self._patched()
+        with p_transcribe, p_summarize:
+            result = process.process(self.call_dir, meta, cfg)
+        self.assertEqual(result["title"], "Weekly Sync With Morgan")
+        self.assertNotIn("Calendar", (Path(result["dir"]) / "transcript.md").read_text())
+
+    def test_summary_without_heading_still_gets_event_title(self):
+        cfg = dict(self.cfg, calendar_enabled=True)
+        p_transcribe, p_summarize = self._patched(summarize_return="## Summary\n- no heading from the model")
+        with p_transcribe, p_summarize:
+            result = process.process(self.call_dir, self._meta([self._event()], ["abc-defg-hij"]), cfg)
+        summary = (Path(result["dir"]) / "summary.md").read_text()
+        self.assertTrue(summary.startswith("# Weekly sync\n\n## Summary\n- no heading"))
+
+
+class TestSpeakersInPipeline(TestProcessPipeline):
+    """Speaker naming in process() (docs/SPEC-v2.md §4): the invite list
+    plus one fake model call name Deepgram's "Speaker N" labels; a 1:1
+    names "Them" with no model call; user renames survive a reprocess and
+    re-render the outputs without a new summary; the invite/voice count
+    mismatch and a naming failure show up as header notes."""
+
+    def _event(self, far_names):
+        from datetime import datetime, timedelta, timezone
+        s = datetime.fromtimestamp(1790000000 - 120, tz=timezone.utc)
+        attendees = [{"name": n, "email": f"{n.split()[0].lower()}@example.com", "response": "accepted",
+                      "self": False, "optional": False} for n in far_names]
+        attendees.append({"name": "", "email": "me@example.com", "response": "accepted", "self": True, "optional": False})
+        return {"id": "ev-1", "uid": "ev-1", "title": "Weekly sync", "start": s.isoformat(),
+                "end": (s + timedelta(minutes=30)).isoformat(), "all_day": False, "status": "confirmed",
+                "transparency": "opaque", "kind": "default", "my_response": "accepted", "organizer": None,
+                "attendees": attendees, "conference": None, "location": "", "description": "",
+                "recurring": False, "recurrence_id": ""}
+
+    def _decision(self, far_names):
+        ev = self._event(far_names)
+        return {"event": ev, "confident": True, "confidence": 100, "candidates": [], "match": ev}
+
+    def _run(self, far_names, chat_reply=None, transcribe_return=None, cfg=None, call_dir=None, retranscribe=False):
+        transcribe_return = transcribe_return if transcribe_return is not None else \
+            _normalized_fixture("deepgram_multi_speaker.json", self.cfg)
+        chat = mock.Mock(side_effect=AssertionError("model must not be called")) if chat_reply is None \
+            else mock.Mock(return_value=chat_reply)
+        decision = self._decision(far_names) if far_names is not None else None
+        with mock.patch("spitball.calendar.for_call", return_value=decision), \
+             mock.patch("spitball.process.transcribe", return_value=transcribe_return) as t, \
+             mock.patch("spitball.speakers._chat", chat), \
+             mock.patch("spitball.process.summarize", return_value="# Weekly sync\n\n## Summary\n- Speaker 2 will wait.") as sm:
+            result = process.process(call_dir or self.call_dir, {} if call_dir else self.meta, cfg or self.cfg,
+                                     retranscribe=retranscribe)
+        return result, t, chat, sm
+
+    def test_llm_names_deepgram_speakers_and_renders_confidence(self):
+        reply = json.dumps({"Speaker 1": {"name": "Priya Nair", "confidence": "high", "evidence": "0:00 intro"},
+                            "Speaker 2": {"name": "Alex Demo", "confidence": "medium", "evidence": "0:05 'Alex?'"}})
+        result, t, chat, sm = self._run(["Priya Nair", "Alex Demo"], chat_reply=reply)
+        final_dir = Path(result["dir"])
+        text = (final_dir / "transcript.md").read_text()
+        self.assertIn("**[00:00:00] Priya Nair:** I think we should ship Friday", text)
+        self.assertIn("**[00:00:05] Speaker 2 (probably Alex Demo):** I disagree, let's wait", text)
+        self.assertIn("**Speakers:** Speaker 1 = Priya Nair, Speaker 2 (probably Alex Demo)", text)
+        # The model saw neutral labels and the invitees' names -- never an address.
+        system, user, _, _ = chat.call_args[0]
+        self.assertIn("**[00:00:00] Speaker 1:** I think", user)
+        self.assertIn("- Priya Nair\n", user)
+        self.assertNotIn("@", user)
+        # The summarizer got the renamed transcript and the Speakers line.
+        transcript_arg, meta_arg = sm.call_args[0][0], sm.call_args[0][1]
+        self.assertIn("Priya Nair:** I think", transcript_arg)
+        self.assertIn("**Speakers:** Speaker 1 = Priya Nair", meta_arg)
+        cache = json.loads((final_dir / ".transcript.json").read_text())
+        self.assertEqual(cache["speakers"]["1"], {"id": 2, "name": "Priya Nair", "confidence": "high",
+                                                  "source": "llm", "evidence": "0:00 intro"})
+        self.assertEqual(cache["speakers"]["2"]["confidence"], "medium")
+        self.assertEqual(t.call_args[1], {"hints": {"far_speakers": 2}})
+
+    def test_one_to_one_names_them_without_the_model(self):
+        single = _normalized_fixture("deepgram_single_speaker.json", self.cfg)
+        result, _, chat, sm = self._run(["Priya Nair"], transcribe_return=single)
+        text = (Path(result["dir"]) / "transcript.md").read_text()
+        self.assertIn("**[00:00:00] Priya Nair:** Hey how's it going today", text)
+        self.assertNotIn("Them:", text)
+        self.assertIn("**Speakers:** Them = Priya Nair", text)
+        chat.assert_not_called()
+        cache = json.loads((Path(result["dir"]) / ".transcript.json").read_text())
+        self.assertEqual(cache["speakers"]["1"]["source"], "calendar")
+
+    def test_no_meeting_means_neutral_labels_and_no_model_call(self):
+        result, _, chat, _ = self._run(None)
+        text = (Path(result["dir"]) / "transcript.md").read_text()
+        self.assertIn("**[00:00:00] Speaker 1:**", text)
+        self.assertNotIn("**Speakers:**", text)
+        chat.assert_not_called()
+        cache = json.loads((Path(result["dir"]) / ".transcript.json").read_text())
+        self.assertEqual([e["name"] for e in cache["speakers"].values()], ["", ""])
+
+    def test_naming_off_skips_the_model(self):
+        cfg = dict(self.cfg, speaker_names=False)
+        result, _, chat, _ = self._run(["Priya Nair", "Alex Demo"], cfg=cfg)
+        chat.assert_not_called()
+        self.assertIn("**[00:00:00] Speaker 1:**", (Path(result["dir"]) / "transcript.md").read_text())
+
+    def test_model_failure_keeps_neutral_labels_and_notes_it(self):
+        chat = mock.Mock(side_effect=RuntimeError("summary model unreachable at http://127.0.0.1:1"))
+        with mock.patch("spitball.calendar.for_call", return_value=self._decision(["Priya Nair", "Alex Demo"])), \
+             mock.patch("spitball.process.transcribe", return_value=_normalized_fixture("deepgram_multi_speaker.json", self.cfg)), \
+             mock.patch("spitball.speakers._chat", chat), \
+             mock.patch("spitball.process.summarize", return_value="# T\n\n## Summary\n- x"):
+            result = process.process(self.call_dir, self.meta, self.cfg)
+        text = (Path(result["dir"]) / "transcript.md").read_text()
+        self.assertIn("**[00:00:00] Speaker 1:**", text)
+        self.assertIn("**Note:** speaker names unavailable: summary model unreachable", text)
+
+    def test_mismatch_between_invite_and_voices_is_noted(self):
+        reply = json.dumps({"Speaker 1": None, "Speaker 2": None})
+        result, _, _, _ = self._run(["Priya Nair", "Alex Demo", "Sam Third"], chat_reply=reply)
+        text = (Path(result["dir"]) / "transcript.md").read_text()
+        self.assertIn("**Note:** the invite lists 3 other people; 2 voices were found on the far side.", text)
+        self.assertNotIn("**Speakers:**", text)  # nothing named: the bare labels say all there is
+
+    def test_rename_by_hand_rerenders_outputs_and_survives_reprocess(self):
+        export = self.tmp_path / "Notes"
+        cfg = dict(self.cfg, export_dir=str(export))
+        reply = json.dumps({"Speaker 1": {"name": "Priya Nair", "confidence": "high", "evidence": "e"}})
+        result, _, _, _ = self._run(["Priya Nair", "Alex Demo"], chat_reply=reply, cfg=cfg)
+        final_dir = Path(result["dir"])
+        from spitball import people
+        self.addCleanup(lambda: people._book_path().unlink(missing_ok=True))
+        # A wrong automatic name and an unnamed second voice, fixed by hand.
+        with mock.patch("spitball.process.summarize", side_effect=AssertionError("no re-summarize")), \
+             mock.patch("spitball.speakers._chat", side_effect=AssertionError("no model")):
+            rows = process.rename_speaker(final_dir, 2, "Alex Demo", cfg)
+            process.rename_speaker(final_dir, 1, "Priya N.", cfg)
+        # The fix to an automatic name is remembered for Priya's address;
+        # the unnamed voice had no automatic name to tie it to anyone.
+        self.assertEqual(people.load_book(), {"priya@example.com": "Priya N."})
+        self.assertEqual(rows[1]["label"], "Alex Demo")
+        transcript = (final_dir / "transcript.md").read_text()
+        self.assertIn("**[00:00:05] Alex Demo:** I disagree", transcript)
+        self.assertIn("**[00:00:00] Priya N.:** I think", transcript)
+        self.assertIn("**Speakers:** Speaker 1 = Priya N., Speaker 2 = Alex Demo", transcript)
+        summary = (final_dir / "summary.md").read_text()
+        self.assertIn("- Alex Demo will wait.", summary)          # the summary's own wording was rewritten
+        self.assertIn("**Speakers:** Speaker 1 = Priya N.", summary)
+        exported = (export / f"{final_dir.name}.md").read_text()
+        self.assertIn("**[00:00:05] Alex Demo:** I disagree", exported)
+        self.assertIn("- Alex Demo will wait.", exported)
+        # A reprocess: the model answers something else; the user's names win.
+        reply2 = json.dumps({"Speaker 1": {"name": "Alex Demo", "confidence": "high", "evidence": "e"},
+                             "Speaker 2": {"name": "Priya Nair", "confidence": "high", "evidence": "e"}})
+        result2, _, _, _ = self._run(["Priya Nair", "Alex Demo"], chat_reply=reply2, cfg=cfg, call_dir=final_dir)
+        transcript = (Path(result2["dir"]) / "transcript.md").read_text()
+        self.assertIn("**[00:00:00] Priya N.:**", transcript)
+        self.assertIn("**[00:00:05] Alex Demo:**", transcript)
+        cache = json.loads((Path(result2["dir"]) / ".transcript.json").read_text())
+        self.assertEqual({e["source"] for e in cache["speakers"].values()}, {"user"})
+
+    def _retranscribed(self, ids):
+        """The multi-speaker fixture with its far-side ids (2, 5) remapped --
+        what a fresh provider run might hand back."""
+        fresh = json.loads(json.dumps(_normalized_fixture("deepgram_multi_speaker.json", self.cfg)))
+        remap = dict(zip([2, 5], ids))
+        for u in fresh["utterances"]:
+            if u["channel"] == 1:
+                u["speaker"] = remap[u["speaker"]]
+        return fresh
+
+    def test_retranscribe_keeps_hand_set_names_by_voice_id(self):
+        # Codex P2 regression: a fresh provider result has no `speakers`
+        # block and used to wipe the user's names on --retranscribe.
+        result, _, _, _ = self._run(None)
+        final_dir = Path(result["dir"])
+        process.rename_speaker(final_dir, 1, "Priya N.", self.cfg)
+        process.rename_speaker(final_dir, 2, "Alex D.", self.cfg)
+        notes = []
+        with mock.patch("spitball.calendar.for_call", return_value=None), \
+             mock.patch("spitball.process.transcribe", return_value=self._retranscribed([2, 5])) as t, \
+             mock.patch("spitball.speakers._chat", side_effect=AssertionError("no model")), \
+             mock.patch("spitball.process.summarize", return_value="# T\n\n## Summary\n- x"):
+            process.process(final_dir, {}, self.cfg, notify=notes.append, retranscribe=True)
+        t.assert_called_once()
+        cache = json.loads((final_dir / ".transcript.json").read_text())
+        self.assertEqual([(e["name"], e["source"]) for e in cache["speakers"].values()],
+                         [("Priya N.", "user"), ("Alex D.", "user")])
+        self.assertNotIn("speakers_dropped", cache)
+        transcript = (final_dir / "transcript.md").read_text()
+        self.assertIn("**[00:00:00] Priya N.:**", transcript)
+        self.assertIn("**[00:00:05] Alex D.:**", transcript)
+        self.assertNotIn("could not be carried over", transcript)
+        self.assertFalse([n for n in notes if "carried over" in n])
+
+    def test_retranscribe_reports_a_name_it_could_not_carry_over(self):
+        result, _, _, _ = self._run(None)
+        final_dir = Path(result["dir"])
+        process.rename_speaker(final_dir, 1, "Priya N.", self.cfg)
+        process.rename_speaker(final_dir, 2, "Alex D.", self.cfg)
+        notes = []
+        with mock.patch("spitball.calendar.for_call", return_value=None), \
+             mock.patch("spitball.process.transcribe", return_value=self._retranscribed([2, 9])), \
+             mock.patch("spitball.speakers._chat", side_effect=AssertionError("no model")), \
+             mock.patch("spitball.process.summarize", return_value="# T\n\n## Summary\n- x") as sm:
+            process.process(final_dir, {}, self.cfg, notify=notes.append, retranscribe=True)
+        cache = json.loads((final_dir / ".transcript.json").read_text())
+        self.assertEqual(cache["speakers"]["1"]["name"], "Priya N.")
+        self.assertEqual(cache["speakers"]["2"]["name"], "")
+        self.assertEqual(cache["speakers_dropped"], [{"name": "Alex D.", "id": 5, "was": "Speaker 2",
+                                                      "reason": "that voice is gone"}])
+        note = "1 hand-set name could not be carried over: Alex D. (was Speaker 2)"
+        transcript = (final_dir / "transcript.md").read_text()
+        self.assertIn("**[00:00:05] Speaker 2:**", transcript)
+        self.assertIn(f"**Note:** re-transcribing changed the far-side voices, so {note}", transcript)
+        self.assertIn(note, (final_dir / "summary.md").read_text())
+        self.assertIn(note, sm.call_args.args[1])          # the summarizer is told too
+        self.assertTrue([n for n in notes if note in n], notes)  # and the CLI (notify=print)
+        # Setting the name again clears the note; a plain reprocess keeps it otherwise.
+        with mock.patch("spitball.calendar.for_call", return_value=None), \
+             mock.patch("spitball.process.transcribe", side_effect=AssertionError("cached")), \
+             mock.patch("spitball.process.summarize", return_value="# T\n\n## Summary\n- x"):
+            process.process(final_dir, {}, self.cfg)
+        self.assertIn(note, (final_dir / "transcript.md").read_text())
+        process.rename_speaker(final_dir, 2, "Alex D.", self.cfg)
+        self.assertNotIn("carried over", (final_dir / "transcript.md").read_text())
+        self.assertNotIn("speakers_dropped", json.loads((final_dir / ".transcript.json").read_text()))
+
+    def test_retranscribe_gets_past_a_corrupt_cache_and_says_so(self):
+        # Codex review 4: a truncated .transcript.json made --retranscribe
+        # fail before it could rebuild the very file that was broken.
+        result, _, _, _ = self._run(None)
+        final_dir = Path(result["dir"])
+        process.rename_speaker(final_dir, 1, "Alice", self.cfg)
+        tpath = final_dir / ".transcript.json"
+        tpath.write_text(tpath.read_text()[:40])  # truncated mid-write
+        os.chmod(tpath, 0o600)
+        # A plain reprocess (and the speakers CLI) refuse with the way out.
+        with self.assertRaises(RuntimeError) as ctx:
+            process.process(final_dir, {}, self.cfg)
+        self.assertIn("--retranscribe", str(ctx.exception))
+        self.assertIn("unreadable", str(ctx.exception))
+        with self.assertRaises(RuntimeError):
+            process.list_speakers(final_dir, self.cfg)
+        notes = []
+        with mock.patch("spitball.calendar.for_call", return_value=None), \
+             mock.patch("spitball.process.transcribe", return_value=self._retranscribed([2, 5])) as t, \
+             mock.patch("spitball.speakers._chat", side_effect=AssertionError("no model")), \
+             mock.patch("spitball.process.summarize", return_value="# T\n\n## Summary\n- x"):
+            process.process(final_dir, {}, self.cfg, notify=notes.append, retranscribe=True)
+        t.assert_called_once()
+        cache = json.loads(tpath.read_text())
+        self.assertEqual(cache["speakers"]["1"]["name"], "")  # nothing to carry from a cache we couldn't read
+        self.assertIn("JSONDecodeError", cache["previous_cache_error"])
+        self.assertTrue([n for n in notes if "unreadable" in n and "re-transcribing without it" in n], notes)
+        self.assertIn("**Note:** the earlier transcript cache was unreadable (.transcript.json is unreadable (JSONDecodeError))",
+                      (final_dir / "transcript.md").read_text())
+        # The rewrite was atomic and kept the file's mode; no temp file is left behind.
+        self.assertEqual(stat.S_IMODE(tpath.stat().st_mode), 0o600)
+        self.assertEqual([p.name for p in final_dir.iterdir() if p.name.endswith(".tmp")], [])
+        self.assertEqual(stat.S_IMODE((final_dir / ".meta.json").stat().st_mode) & 0o777, stat.S_IMODE((final_dir / ".meta.json").stat().st_mode))
+        # A cache that is JSON but not a transcript is refused the same way.
+        tpath.write_text('{"not": "a transcript"}')
+        with self.assertRaises(RuntimeError):
+            process.process(final_dir, {}, self.cfg)
+
+    def test_plain_reprocess_never_reports_dropped_names(self):
+        result, _, _, _ = self._run(None)
+        final_dir = Path(result["dir"])
+        process.rename_speaker(final_dir, 2, "Alex D.", self.cfg)
+        notes = []
+        with mock.patch("spitball.calendar.for_call", return_value=None), \
+             mock.patch("spitball.process.transcribe", side_effect=AssertionError("cached")), \
+             mock.patch("spitball.process.summarize", return_value="# T\n\n## Summary\n- x"):
+            process.process(final_dir, {}, self.cfg, notify=notes.append)
+        cache = json.loads((final_dir / ".transcript.json").read_text())
+        self.assertEqual(cache["speakers"]["2"]["name"], "Alex D.")
+        self.assertNotIn("speakers_dropped", cache)
+        self.assertEqual(notes, ["Summarizing…"])
+
+    def test_retranscribe_with_a_different_provider_drops_names_rather_than_misplacing_them(self):
+        # Codex review 3: Deepgram speaker ids and the local provider's
+        # unsplit id 0 are not the same voices; a hand-set name must not
+        # land on "everyone on the far side".
+        result, _, _, _ = self._run(None)
+        final_dir = Path(result["dir"])
+        process.rename_speaker(final_dir, 1, "Alice", self.cfg)
+        local = {"provider": "local", "model": "parakeet", "utterances": [
+            {"channel": 0, "speaker": 0, "start": 0.0, "end": 2.0, "transcript": "hello there everyone"},
+            {"channel": 1, "speaker": 0, "start": 3.0, "end": 9.0, "transcript": "hi this is both of us talking now"}],
+            "diarization": {"ran": False, "engine": "sherpa-onnx", "expected": None, "reason": "not installed"}}
+        notes = []
+        with mock.patch("spitball.calendar.for_call", return_value=None), \
+             mock.patch("spitball.process.transcribe", return_value=local), \
+             mock.patch("spitball.speakers._chat", side_effect=AssertionError("no model")), \
+             mock.patch("spitball.process.summarize", return_value="# T\n\n## Summary\n- x"):
+            process.process(final_dir, {}, dict(self.cfg, transcription_provider="local"),
+                            notify=notes.append, retranscribe=True)
+        cache = json.loads((final_dir / ".transcript.json").read_text())
+        self.assertEqual(cache["speakers"]["1"]["name"], "")
+        self.assertEqual(cache["speakers_dropped"][0]["name"], "Alice")
+        self.assertEqual(cache["speakers_dropped"][0]["reason"], "provider changed (deepgram → local)")
+        transcript = (final_dir / "transcript.md").read_text()
+        self.assertIn("**[00:00:03] Them:** hi this is both", transcript)
+        self.assertNotIn("Alice:**", transcript)
+        self.assertIn("(provider changed (deepgram → local))", transcript)
+        self.assertTrue([n for n in notes if "provider changed" in n], notes)
+
+    def test_clear_goes_back_to_automatic(self):
+        result, _, _, _ = self._run(None)
+        final_dir = Path(result["dir"])
+        process.rename_speaker(final_dir, 1, "Someone", self.cfg)
+        self.assertIn("Someone:**", (final_dir / "transcript.md").read_text())
+        rows = process.rename_speaker(final_dir, 1, "", self.cfg)
+        self.assertEqual(rows[0]["label"], "Speaker 1")
+        self.assertEqual(rows[0]["source"], "")
+        self.assertIn("**[00:00:00] Speaker 1:**", (final_dir / "transcript.md").read_text())
+
+    def test_list_and_bad_number(self):
+        result, _, _, _ = self._run(None)
+        rows = process.list_speakers(Path(result["dir"]), self.cfg)
+        self.assertEqual([(r["n"], r["label"], r["id"]) for r in rows], [(1, "Speaker 1", 2), (2, "Speaker 2", 5)])
+        with self.assertRaises(ValueError):
+            process.rename_speaker(Path(result["dir"]), 3, "X", self.cfg)
+        with self.assertRaises(RuntimeError):
+            process.list_speakers(self.tmp_path / "nowhere", self.cfg)
+
+    def test_reused_live_transcript_is_offered_to_the_split(self):
+        live = {"provider": "local", "model": "m", "note": "live transcript", "utterances": [
+            {"channel": 0, "speaker": 0, "start": 0.0, "end": 3.0, "transcript": "hey"},
+            {"channel": 1, "speaker": 0, "start": 4.0, "end": 9.0, "transcript": "of course glad to help " * 3}]}
+        (self.call_dir / ".live.json").write_text(json.dumps(live))
+        cfg = dict(self.cfg, transcription_provider="local")
+
+        def fake_split(audio, normalized, cfg_, expected, transcribe_piece=None):
+            normalized["diarization"] = {"ran": False, "engine": "sherpa-onnx", "expected": expected, "reason": "test"}
+            return normalized
+
+        with mock.patch("spitball.calendar.for_call", return_value=self._decision(["A One", "B Two", "C Three"])), \
+             mock.patch("spitball.process.transcribe") as t, \
+             mock.patch("spitball.diarize.split_transcript", side_effect=fake_split) as split, \
+             mock.patch("spitball.speakers._chat", return_value="{}"), \
+             mock.patch("spitball.process.summarize", return_value="# T\n\n## Summary\n- x"):
+            result = process.process(self.call_dir, self.meta, cfg)
+        t.assert_not_called()
+        split.assert_called_once()
+        self.assertEqual(split.call_args[0][3], 3)
+        self.assertIsNotNone(split.call_args[1]["transcribe_piece"])
+        cache = json.loads((Path(result["dir"]) / ".transcript.json").read_text())
+        self.assertEqual(cache["diarization"]["reason"], "test")
+
+    def test_cached_transcript_is_not_split_again(self):
+        result, _, _, _ = self._run(None)
+        with mock.patch("spitball.diarize.split_transcript", side_effect=AssertionError("cached: no split")), \
+             mock.patch("spitball.calendar.for_call", return_value=None), \
+             mock.patch("spitball.process.summarize", return_value="# T\n\n## Summary\n- x"):
+            process.process(Path(result["dir"]), {}, self.cfg)
+
+    def test_tiny_far_voice_folds_into_its_neighbor(self):
+        normalized = {"provider": "deepgram", "model": "nova-3", "utterances": [
+            {"channel": 1, "speaker": 0, "start": 0.0, "end": 12.0, "transcript": "a long first stretch of talk " * 3},
+            {"channel": 1, "speaker": 3, "start": 12.5, "end": 13.2, "transcript": "mm-hm"},
+            {"channel": 1, "speaker": 1, "start": 14.0, "end": 30.0, "transcript": "the second person at length " * 3},
+            {"channel": 0, "speaker": 0, "start": 31.0, "end": 32.0, "transcript": "thanks"}]}
+        result, _, _, _ = self._run(None, transcribe_return=normalized)
+        text = (Path(result["dir"]) / "transcript.md").read_text()
+        self.assertNotIn("Speaker 3", text)
+        self.assertIn("a long first stretch of talk a long first stretch of talk a long first stretch of talk mm-hm", text)
+        cache = json.loads((Path(result["dir"]) / ".transcript.json").read_text())
+        self.assertEqual(sorted(cache["speakers"]), ["1", "2"])
+        self.assertEqual(cache["utterances"][1]["speaker"], 3)  # the provider's ids are never rewritten
+
+
+class TestModelPayloadsNeverCarryAddresses(TestProcessPipeline):
+    """Codex review 3 class sweep: every string that leaves for a model --
+    the summary request's metadata and transcript (process.summarize) and
+    the speaker-naming request (speakers.name_with_llm), the only two
+    model entry points -- is built from a fixture stuffed with addresses
+    and the secret feed URL in every slot that could carry one, under
+    every combination of the switches that shape those payloads, and must
+    come out with no address and no feed URL in it."""
+
+    SECRET_URL = "https://calendar.google.com/calendar/ical/private-SECRET-TOKEN/basic.ics"
+
+    def _decision(self):
+        from datetime import datetime, timedelta, timezone
+        s = datetime.fromtimestamp(1790000000 - 120, tz=timezone.utc)
+        attendees = [
+            {"name": "Priya Nair", "email": "priya@example.com", "response": "accepted", "self": False, "optional": False},
+            {"name": "", "email": "x1@example.com", "response": "accepted", "self": False, "optional": True},
+            {"name": "info@example.com", "email": "info@example.com", "response": "tentative", "self": False, "optional": False},
+            {"name": "Alex Demo", "email": "alex@example.com", "response": "declined", "self": False, "optional": False},
+            {"name": "", "email": "me@example.com", "response": "accepted", "self": True, "optional": False},
+        ]
+        ev = {"id": "ev-1", "uid": "ev-1", "title": "Sync with priya@example.com about the feed",
+              "start": s.isoformat(), "end": (s + timedelta(minutes=30)).isoformat(), "all_day": False,
+              "status": "confirmed", "transparency": "opaque", "kind": "default", "my_response": "accepted",
+              "organizer": {"name": "", "email": "organizer@example.com"}, "attendees": attendees,
+              "conference": {"kind": "meet", "url": "https://meet.google.com/abc-defg-hij", "code": "abc-defg-hij"},
+              "location": "mailto:room@example.com",
+              "description": ("Agenda from ops@example.com\nFeed: " + self.SECRET_URL + "\n"
+                              "webcal://calendar.google.com/calendar/ical/private-SECRET-TOKEN/basic.ics\n"
+                              "Reply to <Dana Lee> dana.lee+x@sub.example.co.uk"),
+              "recurring": False, "recurrence_id": ""}
+        return {"event": ev, "confident": True, "confidence": 100, "candidates": [], "match": ev}
+
+    def test_no_address_or_feed_url_reaches_any_model_under_any_config(self):
+        import itertools
+        email = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
+        reply = json.dumps({"Speaker 1": {"name": "Priya Nair", "confidence": "high", "evidence": "0:00 intro"},
+                            "Speaker 2": {"name": "info@example.com", "confidence": "high", "evidence": "0:05"}})
+        for names, desc, naming, title_pref in itertools.product((True, False), repeat=4):
+            with self.subTest(names=names, description=desc, speaker_names=naming, event_title=title_pref):
+                call_dir = self.tmp_path / "Calls" / f"2026-09-28-1400-zoom-{int(names)}{int(desc)}{int(naming)}{int(title_pref)}"
+                call_dir.mkdir(parents=True)
+                (call_dir / "audio.opus").write_bytes(b"fake")
+                cfg = dict(self.cfg, calendar_enabled=True, calendar_ics_url=self.SECRET_URL,
+                           calendar_names_to_summary=names, calendar_description_to_summary=desc,
+                           speaker_names=naming, calendar_prefer_event_title=title_pref)
+                chat = mock.Mock(return_value=reply)
+                with mock.patch("spitball.calendar.for_call", return_value=self._decision()), \
+                     mock.patch("spitball.process.transcribe",
+                                return_value=_normalized_fixture("deepgram_multi_speaker.json", cfg)), \
+                     mock.patch("spitball.speakers._chat", chat), \
+                     mock.patch("spitball.process.summarize", return_value="# T\n\n## Summary\n- x") as sm:
+                    result = process.process(call_dir, dict(self.meta), cfg)
+                    final_dir = Path(result["dir"])
+                    # A hand-set name that IS an address, then a reprocess: the
+                    # local files may show it; no model copy may.
+                    process.rename_speaker(final_dir, 2, "hand@example.com", cfg)
+                    process.process(final_dir, {}, cfg)
+                payloads = []
+                for c in sm.call_args_list:
+                    payloads.append(("summary transcript", c.args[0]))
+                    payloads.append(("summary metadata", c.args[1]))
+                for c in chat.call_args_list:
+                    payloads.append(("naming system", c.args[0]))
+                    payloads.append(("naming user", c.args[1]))
+                self.assertTrue(sm.call_args_list)
+                if naming:
+                    self.assertTrue(chat.call_args_list)
+                for what, text in payloads:
+                    self.assertIsNone(email.search(text), f"{what}: {email.search(text) and email.search(text).group(0)!r}")
+                    self.assertNotIn("SECRET-TOKEN", text, what)
+                    self.assertNotIn("private-", text, what)
+                # What the model DID get, when allowed: names, a count for the nameless, never a label that is an address.
+                meta_arg = sm.call_args_list[-1].args[1]
+                if names:
+                    self.assertIn("**People on the invite:** Priya Nair, Alex Demo (declined), and 2 more with no name on the invite", meta_arg)
+                else:
+                    self.assertNotIn("People on the invite", meta_arg)
+                    self.assertNotIn("Alex Demo", meta_arg)  # only the invite list would carry the declined invitee
+                if desc:
+                    self.assertIn("Agenda from [address]", meta_arg)
+                    self.assertIn("Feed: <feed address>", meta_arg)
+                else:
+                    self.assertNotIn("Agenda", meta_arg)
+                self.assertIn("**Meeting:** Sync with [address] about the feed", meta_arg)
+                model_transcript = sm.call_args_list[-1].args[0]
+                self.assertIn("**[00:00:05] Speaker 2:**", model_transcript)   # the hand-set address renders bare for the model
+                self.assertIn("hand@example.com:**", (final_dir / "transcript.md").read_text())  # but stays in the local file
+                if naming:
+                    user = chat.call_args_list[0].args[1]
+                    self.assertIn("- Priya Nair\n(and 2 more invitees with no name on the invite)", user)

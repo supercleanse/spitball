@@ -7,6 +7,69 @@ Recording, detection, the two transcription providers `local` (voxtype) and
 `pick-folder`. See `docs/SPEC-settings-and-providers.md` §§1-3, 7 (local),
 and 8 (the phase cut itself).
 
+## v2 (in progress on `spitball-v2`)
+
+Four features, in order, per `docs/SPEC-v2.md`:
+
+1. **Settings overlay** (done) -- the centered layer-shell settings window with a
+   section nav, replacing the bar dropdown; every config key has a control.
+2. **Calendar** (done) -- match calls to events from a secret ICS feed or a
+   `calendar_command` (`spitball/calendar.py`: stdlib ICS parser + bounded
+   RRULE expander, cached feed, deterministic matcher keyed on the Meet code
+   from window titles); names the folder, heads the transcript, feeds the
+   summarizer, stores `meeting.attendees` in `.transcript.json` for phase 4;
+   `spitball calendar test`; fills the Calendar page. Not done, by design:
+   Google OAuth (no shipped client ID), CalDAV, an `event_title` field in
+   `state.json` for the bar/Live popup.
+3. **Noise** (done) -- `highpass=f=80` on the mic copy (split and live tails),
+   `mic_denoise: off|auto|on` (`spitball/denoise.py`: RNNoise via ffmpeg `arnndn`
+   with the model vendored in `models/rnnoise/`, `mix=0.7`, `afftdn` fallback, a
+   temp copy of the mic channel only, on both the post-call and live paths, `auto`
+   gated on the measured noise floor), the `mic_denoise` block in
+   `.transcript.json`/`.live.json`, a stricter speech check on the Whisper path
+   (adaptive `silencedetect` gate + noise-only windows skipped), the README's
+   PipeWire echo-cancel / EasyEffects notes; fills the Audio page. Not done, by
+   design: Silero VAD (needs onnxruntime + a 2 MB model, i.e. the optional venv),
+   GTCRN/DeepFilterNet (research option C), a Spitball-owned PipeWire filter
+   (option D), denoising for the Deepgram upload.
+4. **Speakers** (done) -- `spitball/speakers.py`: far-side ids folded into
+   labels (tiny voices and voices beyond `speaker_max` fold into their
+   neighbors), a `speakers` map in `.transcript.json` (label → name, confidence,
+   source, evidence, provider id), a 1:1 named from the invite with no model
+   call, otherwise one naming call to the summary endpoint with the neutral
+   transcript and the invite list (strict JSON, names off the invite rejected,
+   duplicates made unsure), rendered as the name / `Speaker 2 (probably X)` /
+   the bare label; `**Speakers:**` and invite-vs-voices mismatch header lines;
+   `spitball speakers <dir> [n "Name" | --clear]` with a re-render (summary
+   wording rewritten, no new model call; `reprocess` keeps user names).
+   `spitball/diarize.py` + `diarize_worker.py`: sherpa-onnx offline diarization
+   of the far channel only (pyannote segmentation-3.0 int8 + 3D-Speaker ERes2Net,
+   from the k2-fsa GitHub releases, SHA-256 pinned, no Hugging Face token),
+   installed by `spitball diarize setup` into the live-engine venv; skipped for
+   a 1:1, `num_clusters` from the invite count capped at `speaker_max`, else
+   threshold clustering; voxtype windows cut at speaker changes before
+   transcription; a reused live transcript is labeled by overlap and its
+   straddling lines re-transcribed as pieces; any failure keeps one "Them" with
+   a `diarization` block saying why. Fills the Speakers page. Not done, by
+   design: pitch/gender inference (never), voiceprint memory across calls
+   (biometric; would need opt-in + a delete command), a rename UI in the popup
+   (the CLI is enough for now), a user-facing clustering-threshold knob
+   (constant 0.7), a speaker-count hint for Deepgram (its API takes none), live
+   (mid-call) speaker splitting in the popup.
+5. **Meeting reminders** (done) -- `spitball/reminders.py`: a minute before
+   (`calendar_remind_before_s`) any non-declined event with a Zoom / Meet /
+   Teams / Webex link, a Spitball notification with **Join & record** (opens
+   the link, starts a recording pinned to that event via
+   `calendar.override` + `calendar.pinned`, follows the call once an app takes
+   the mic) and **Dismiss**; a strict https + host allowlist for the link,
+   `xdg-open` without a shell; once per occurrence across restarts
+   (`reminded.json`), nothing for meetings more than two minutes old or while
+   recording; plain-toast fallback when the server has no action support;
+   `spitball calendar upcoming`; the two controls on the Calendar page. Not
+   done, by design: `zoommtg://` / native-client links (the browser link is
+   the one every invite carries), a sticky (critical-urgency) toast, a
+   per-event snooze, `event_title` in `state.json`.
+
 ## Phase 2: more transcription providers
 
 Parked per spec amendment §8 so each can get a real API key and a live test

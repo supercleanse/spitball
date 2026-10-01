@@ -164,6 +164,33 @@ class TestConfigSetSecret(ConfigCliTestCase):
         raw = json.loads(self.config.CONFIG_FILE.read_text())
         self.assertEqual(raw["deepgram_api_key"], "")
 
+    def test_does_not_wait_for_eof(self):
+        # The QML settings UI writes one line and leaves the pipe open; the CLI
+        # must finish on the newline instead of blocking until EOF.
+        import os, subprocess, sys, tempfile
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with tempfile.TemporaryDirectory() as home:
+            # Its own config/state/runtime paths: the inherited SPITBALL_CONFIG
+            # is the suite-wide "can never exist" file from tests/__init__.py,
+            # and this subprocess would otherwise create it (with this fake
+            # address in it) for every later test's config.load() to read.
+            env = dict(os.environ, HOME=home, XDG_CONFIG_HOME=home + "/c", XDG_RUNTIME_DIR=home,
+                       SPITBALL_CONFIG=home + "/c/spitball/config.json",
+                       SPITBALL_STATE_DIR=home + "/state", SPITBALL_RUNTIME_DIR=home + "/runtime")
+            p = subprocess.Popen([sys.executable, "-I", os.path.join(root, "bin", "spitball"),
+                                  "config", "set-secret", "calendar_ics_url"],
+                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                 stderr=subprocess.PIPE, env=env)
+            p.stdin.write(b"https://calendar.google.com/calendar/ical/a%40b.com/private-abc123/basic.ics\n")
+            p.stdin.flush()  # stdin deliberately left open
+            try:
+                p.wait(timeout=10)
+            finally:
+                if p.poll() is None:
+                    p.kill()
+                    self.fail("set-secret blocked waiting for EOF")
+            self.assertEqual(p.returncode, 0, p.stderr.read())
+
     def test_only_a_secret_key_allowed(self):
         code, _, err = self.run_main(["config", "set-secret", "my_name"], stdin_text="x")
         self.assertEqual(code, 1)
@@ -244,5 +271,80 @@ class TestConfigReloadReachesDaemon(unittest.TestCase):
         self.assertEqual(d.cfg["my_name"], "Morgan")
 
 
+class TestMicDenoiseKeys(ConfigCliTestCase):
+    """docs/SPEC-v2.md section 3's two keys: plain settings (no secret), a
+    string mode and an integer threshold, round-tripped through the CLI."""
+
+    def test_defaults(self):
+        code, out, _ = self.run_main(["config", "get", "--json"])
+        self.assertEqual(code, 0)
+        parsed = json.loads(out)
+        self.assertEqual(parsed["mic_denoise"], "auto")
+        self.assertEqual(parsed["mic_noise_floor_db"], -45)
+
+    def test_set_and_unset_round_trip(self):
+        self.assertEqual(self.run_main(["config", "set", "mic_denoise", "on"])[0], 0)
+        self.assertEqual(self.run_main(["config", "set", "mic_noise_floor_db", "-52"])[0], 0)
+        parsed = json.loads(self.run_main(["config", "get", "--json"])[1])
+        self.assertEqual(parsed["mic_denoise"], "on")
+        self.assertEqual(parsed["mic_noise_floor_db"], -52)
+        self.assertIsInstance(parsed["mic_noise_floor_db"], int)
+        self.assertEqual(self.run_main(["config", "unset", "mic_denoise"])[0], 0)
+        parsed = json.loads(self.run_main(["config", "get", "--json"])[1])
+        self.assertEqual(parsed["mic_denoise"], "auto")
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestCalendarSecret(ConfigCliTestCase):
+    def test_calendar_ics_url_is_a_secret(self):
+        code, _, err = self.run_main(["config", "set", "calendar_ics_url", "https://x/y.ics"])
+        self.assertEqual(code, 1)
+        self.assertIn("set-secret", err)
+        code, _, _ = self.run_main(["config", "set-secret", "calendar_ics_url"], stdin_text="https://x/private-abc/basic.ics\n")
+        self.assertEqual(code, 0)
+        code, out, _ = self.run_main(["config", "get", "--json"])
+        data = json.loads(out)
+        self.assertEqual(data["calendar_ics_url"], {"set": True, "source": "config"})
+        self.assertNotIn("private-abc", out)
+        self.assertEqual(stat.S_IMODE(self.config.CONFIG_FILE.stat().st_mode), 0o600)
+
+    def test_calendar_keys_have_defaults_and_set_round_trips(self):
+        code, out, _ = self.run_main(["config", "get", "--json"])
+        data = json.loads(out)
+        self.assertFalse(data["calendar_enabled"])
+        self.assertEqual(data["calendar_source"], "ics")
+        self.assertEqual(data["calendar_cache_ttl_s"], 900)
+        self.assertTrue(data["calendar_prefer_event_title"])
+        self.assertTrue(data["calendar_names_to_summary"])
+        self.assertFalse(data["calendar_description_to_summary"])
+        for key, raw, want in (("calendar_enabled", "true", True), ("calendar_source", "command", "command"),
+                               ("calendar_command", "khal-json", "khal-json"), ("calendar_cache_ttl_s", "60", 60),
+                               ("calendar_my_email", "me@example.com", "me@example.com")):
+            self.assertEqual(self.run_main(["config", "set", key, raw])[0], 0)
+            self.assertEqual(json.loads(self.run_main(["config", "get", "--json"])[1])[key], want)
+
+
+class TestSpeakerKeys(ConfigCliTestCase):
+    """docs/SPEC-v2.md section 4's three keys: two toggles and an integer
+    cap, plain settings, round-tripped through the CLI."""
+
+    def test_defaults(self):
+        parsed = json.loads(self.run_main(["config", "get", "--json"])[1])
+        self.assertTrue(parsed["speaker_names"])
+        self.assertTrue(parsed["speaker_split"])
+        self.assertEqual(parsed["speaker_max"], 6)
+
+    def test_set_and_unset_round_trip(self):
+        self.assertEqual(self.run_main(["config", "set", "speaker_names", "false"])[0], 0)
+        self.assertEqual(self.run_main(["config", "set", "speaker_split", "false"])[0], 0)
+        self.assertEqual(self.run_main(["config", "set", "speaker_max", "3"])[0], 0)
+        parsed = json.loads(self.run_main(["config", "get", "--json"])[1])
+        self.assertFalse(parsed["speaker_names"])
+        self.assertFalse(parsed["speaker_split"])
+        self.assertEqual(parsed["speaker_max"], 3)
+        self.assertIsInstance(parsed["speaker_max"], int)
+        self.assertEqual(self.run_main(["config", "unset", "speaker_max"])[0], 0)
+        self.assertEqual(json.loads(self.run_main(["config", "get", "--json"])[1])["speaker_max"], 6)
