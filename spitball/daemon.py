@@ -14,7 +14,7 @@ import time
 import traceback
 from pathlib import Path
 
-from . import calendar, config, detect, live, process, providers
+from . import calendar, config, detect, live, process, providers, reminders
 from .recorder import Recording
 
 
@@ -49,6 +49,11 @@ class Daemon:
         self.last_call = persist.get("last_call")
         self.setup_needed = providers.setup_needed(self.cfg)
         self.rescan = threading.Event()
+        # Meeting reminders (spitball/reminders.py): ticked from run(), fires
+        # on its own threads, joins through join_event(). Reads self.cfg live
+        # so `reload` applies.
+        self.reminders = reminders.Scheduler(cfg=lambda: self.cfg, recording=lambda: self.rec is not None,
+                                             join=self.join_event)
 
     # ---------------------------------------------------------------- state I/O
 
@@ -113,12 +118,16 @@ class Daemon:
 
     # ---------------------------------------------------------------- recording
 
-    def start(self, origin: str = "manual") -> dict:
+    def start(self, origin: str = "manual", event: dict | None = None) -> dict:
+        """origin: "manual" (the bar/CLI), "detected" (auto-record), or
+        "reminder" (Join & record on a meeting reminder: behaves like manual
+        until a call app takes the mic, then follows that call to its end).
+        `event` pins the calendar match to that event."""
         with self.lock:
             if self.rec:
                 return {"ok": True, "note": "already recording"}
             self.error = ""
-            if origin == "manual" and self.present:
+            if origin in ("manual", "reminder") and self.present:
                 origin = "detected"  # clicking Record on a detected call = follow that call
             self.app = sorted(self.present)[0] if origin == "detected" and self.present else ""
             self.rec_origin = origin
@@ -139,8 +148,13 @@ class Daemon:
             # The facts known at start, so a crash mid-call still leaves a
             # .meta.json (recover() fills in the duration) and the calendar
             # snapshot below has something to merge into.
-            (self.rec_dir / ".meta.json").write_text(json.dumps({"app": self.app,
-                                                                 "started_at": self.rec.started_at}))
+            meta = {"app": self.app, "started_at": self.rec.started_at}
+            if isinstance(event, dict) and event.get("id"):
+                # A confirmed match: the matcher honors `override` outright,
+                # and `pinned` keeps the event itself so the pin survives a
+                # feed that has since changed (calendar.decide).
+                meta["calendar"] = {"override": {"event": event["id"]}, "pinned": event}
+            (self.rec_dir / ".meta.json").write_text(json.dumps(meta))
             self._set("recording", f"Recording {self.app or 'audio'}")
             if self.cfg.get("calendar_enabled"):
                 threading.Thread(target=self._calendar_snapshot,
@@ -169,11 +183,27 @@ class Daemon:
                 meta = json.loads(meta_path.read_text())
             except (OSError, ValueError):
                 meta = {"app": app, "started_at": started_at}
+            existing = meta.get("calendar") if isinstance(meta.get("calendar"), dict) else {}
+            for key in ("override", "pinned"):  # a reminder's pin is written before this lookup
+                if key in existing:
+                    snap[key] = existing[key]
             meta["calendar"] = snap
             try:
                 meta_path.write_text(json.dumps(meta))
             except OSError:
                 pass
+
+    def join_event(self, event: dict, link: str = "") -> dict:
+        """Join & record on a reminder: start a recording pinned to `event`
+        (the link itself is opened by the scheduler, never here). Already
+        recording: leave it alone."""
+        with self.lock:
+            if self.rec:
+                return {"ok": True, "note": "already recording"}
+            r = self.start("reminder", event=event)
+            if r.get("ok"):
+                notify(f"Recording {event.get('title') or 'meeting'}", "Started from the reminder.")
+            return r
 
     def stop(self) -> dict:
         with self.lock:
@@ -269,6 +299,12 @@ class Daemon:
                 elif self.rec_origin == "detected" and not present:
                     self.stop()  # the call ended
                     notify("Call ended", "Recording stopped. Transcribing now.")
+                elif self.rec_origin == "reminder" and present:
+                    # The meeting app has taken the mic: follow that call
+                    # from here on, so its end stops the recording.
+                    self.rec_origin = "detected"
+                    self.app = sorted(present)[0]
+                    self._set("recording", f"Recording {self.app}")
                 else:
                     self.publish()  # keep updated_at fresh for the widget
                 return
@@ -396,6 +432,7 @@ class Daemon:
                     self.tick()
                 except Exception:
                     traceback.print_exc()
+                self.reminders.tick()  # never raises; its work runs on its own threads
                 self.rescan.wait(1)
                 self.rescan.clear()
         finally:

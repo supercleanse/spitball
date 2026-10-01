@@ -50,6 +50,8 @@ SETTINGS = {
     "calendar_names_to_summary": True,
     "calendar_description_to_summary": False,
     "calendar_my_email": "",
+    "calendar_reminders": True,
+    "calendar_remind_before_s": 60,
     "speaker_names": True,
     "speaker_split": True,
     "speaker_max": 6,
@@ -132,6 +134,9 @@ def main(argv):
         sub = rest[0] if rest else ""
         if sub == "test":
             print(json.dumps(CALENDAR_TEST)); return 0
+        if sub == "upcoming":
+            print(json.dumps({"ok": True, "enabled": True, "reminders": True, "active": True, "lead_s": 60,
+                              "source": "ics", "error": "", "upcoming": [], "skipped": 0})); return 0
         return 2
     if cmd == "diarize":
         sub = rest[0] if rest else ""

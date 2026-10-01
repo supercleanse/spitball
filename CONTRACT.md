@@ -92,6 +92,7 @@ occupies (idle/offline, nothing more important going on). See Widget.qml's
 | `~/.config/spitball/config.json` | User settings (optional; see README's Configuration section for every key). |
 | `~/.local/share/spitball/live-engine/venv/`, `models/diarization/` | The optional venv (`spitball live setup` / `spitball diarize setup`) and the speaker split's two models (`pyannote-segmentation-3.0.int8.onnx`, `3dspeaker-eres2net-en-voxceleb.onnx`), downloaded from the k2-fsa GitHub releases and verified by SHA-256 (`models/diarization/README.md`). |
 | `~/.local/state/spitball/calendar/feed.ics`, `feed.json` | The cached calendar feed (mode `0600`, directory `0700`) and its metadata (`fetched_at`, `etag`, `last_modified`, `bytes`, and `key`, a SHA-256 prefix of the feed URL -- never the URL itself). See "Calendar events" below. |
+| `~/.local/state/spitball/calendar/reminded.json` | The meeting reminders already fired, `{"<event id>@<start>": <epoch fired>}` (mode `0600`; entries older than three days are pruned), so a daemon restart never repeats one. See "Meeting reminders" below. |
 
 All three env vars `SPITBALL_RUNTIME_DIR`, `SPITBALL_STATE_DIR`, `SPITBALL_CONFIG`
 override the corresponding path — used by the test suite so it never touches a live
@@ -132,6 +133,7 @@ from a checkout.
 | `spitball check transcription [--provider P] [--json]` | `{"ok": bool, "message": "…"}` -- tests the configured (or given) transcription provider for real: deepgram does an authenticated `GET /v1/projects`; local checks voxtype is on PATH. |
 | `spitball check summary [--json]` | `{"ok": bool, "message": "…", "models": [...]}` from `GET {summary_base_url}/models`. |
 | `spitball calendar test [--at TIME] [--app APP] [--meet CODE] [--refresh] [--json]` | the calendar source's health plus the match for a call starting now (or at `TIME`: `"14:30"`, `"2026-09-30 14:30"`, ISO 8601, or epoch seconds). `--app` / `--meet` supply what a real call would have (the app on the mic, a Meet code from a window title); `--refresh` re-downloads the feed regardless of its age. Works whether or not `calendar_enabled` is on. `--json`: `{"ok", "enabled", "source": "ics"\|"command"\|"off", "message", "error", "events_nearby", "match": <event>\|null, "confident", "confidence", "candidates": [{"id", "title", "start", "end", "score", "filtered", "reasons"}], "summary", "at", "fetched_at", "cached", "my_email", "my_email_known", "rules_skipped"}`. `ok` is about the source (fetched, or served from the cache); no match is still `ok`. `my_email_known` is false when the feed's owner couldn't be told (see "Owner" under Calendar events); `rules_skipped` counts recurring series the expander refused (see "Recurrence"). Exit 1 when the source fails or nothing is configured -- **the JSON is still printed**, and the settings overlay reads it (a nonzero exit with JSON on stdout is an answer, not a crash). `message`/`error` never contain the feed address: a malformed one is reported as `feed address must start with https:// or webcal://` and every fetch error is scrubbed of it. |
+| `spitball calendar upcoming [--hours N] [--refresh] [--json]` | the meeting reminders due from now until `N` hours out (24; up to 336), from the same cached source, plus the ones fired in the last two minutes. `--json`: `{"ok", "enabled", "reminders", "active", "lead_s", "source", "error", "at", "hours", "upcoming": [{"id", "title", "start", "end", "host", "link", "fire_at", "reminded", "attendees"}], "skipped", "fetched_at", "cached"}`. `active` is whether the daemon would actually fire them (`calendar_enabled` and `calendar_reminders` both on, a source configured); `reminded` is whether that occurrence already fired; `skipped` counts events in the window with no reminder (no video link, all-day, declined, marked free, canceled, focus/out-of-office). `link` is the allowlisted `https` link exactly as it will be opened. Exit 1 when the source fails or nothing is configured, JSON still printed. |
 | `spitball local info [--json]` | what voxtype is actually configured with right now: `{"installed": bool, "engine": "whisper"\|"parakeet"\|"", "model": "...", "onnx": bool, "can_upgrade_parakeet": bool, "message": "..."}`. Spitball never manages this itself -- it's read straight from `voxtype config get`. |
 | `spitball local models [--json]` | every whisper/parakeet model voxtype knows how to download (from `voxtype info models --json`), each `{"name", "engine", "installed", "size_mb", "languages", "recommended", "active"}`. Spitball never downloads any of these -- see `set-model`. |
 | `spitball local set-model <name>` | starts switching voxtype to `name` **in the background** and returns immediately -- see "Model switch file" above. Normally: a detached child re-execs `spitball local _set-model-worker <name>` after a graphical `pkexec voxtype setup onnx --enable/--disable` prompt (only if the engine is actually changing) and `voxtype setup --download --model <name> --activate --progress-format json`, whose NDJSON events feed model.json directly, then, for a parakeet model, `voxtype config set parakeet.streaming true|false` (true only for a streaming-capable model, which also gets the three `streaming_*_secs` window sizes written into voxtype's `[parakeet]` table if missing). Falls back to opening a floating terminal running `bin/spitball-upgrade-parakeet` (the original interactive approach) when `pkexec` is missing or Omarchy's shell doesn't answer `shell ping` (no way to draw a graphical prompt) -- model.json then gets `state: "terminal"` and no further progress. Exit 1 only if neither path could be started at all (no pkexec/agent AND no terminal launcher). Spitball's own process never runs `sudo` or `pkexec` itself, or edits voxtype's config directly. |
@@ -220,8 +222,13 @@ before `started_at` to 10 minutes after it, captured once so `reprocess` and off
 runs see the same picture; `meet_codes` are the Google Meet codes visible in window
 titles at that moment (`hyprctl clients -j`, read-only; titles themselves are never
 stored); `error` is a short reason when the source failed (the recording is never
-affected); `match` is the decision the last `process()` made; `override` exists only
-after `reprocess --event/--no-event`.
+affected); `match` is the decision the last `process()` made; `override` exists after
+`reprocess --event/--no-event`, and also when the recording was started by a meeting
+reminder's Join & record, which writes `override` for that event together with
+`pinned` (the event itself, as a normalized event) before the lookup runs. The
+matcher honors `override` outright, taking the event from `events` or, if the feed
+has since dropped or moved that occurrence, from `pinned`; its summary then reads
+`(joined from the reminder)` rather than `(set by hand)`.
 
 ## Transcript cache
 
@@ -505,6 +512,51 @@ start is more than 5 minutes from the event's start (capped at −30), and, once
 duration is known, up to +20 for the share of the recording that fell inside the
 event. The best candidate must score at least 40 and beat the runner-up by 15 or
 there is no match (`confident: false`); `confidence` is the best score either way.
+
+## Meeting reminders
+
+`spitball/reminders.py`, run by the daemon when `calendar_enabled`,
+`calendar_reminders`, and a calendar source are all on. Every `REFRESH_S` (300 s) a
+background thread reloads the next six hours of events from the configured source
+(the feed is served from the cache while it is younger than `calendar_cache_ttl_s`,
+so this costs a download at most once per TTL); once a second the daemon loop checks
+that in-memory list, with no I/O, for reminders that are due.
+
+An event gets a reminder when it passes the matcher's hard filters (not all-day,
+canceled, marked free, focus/out-of-office/working-location/birthday, or declined)
+**and** has a joinable link: an `https` URL whose host is exactly `meet.google.com`,
+`teams.microsoft.com`, or `teams.live.com`, or is `zoom.us` / `webex.com` or a
+subdomain of either. The link is taken from the event's `conference.url`, else the
+first such URL in `location`, `url`, or `description`. Anything else (another
+scheme, userinfo in the authority, a lookalike host, a non-ASCII host, a port other
+than 443, whitespace or control characters) is not a link, and the event is skipped.
+
+A reminder is due at `start - calendar_remind_before_s` and stays due until
+`start + 120 s`; after that the occurrence is stale and is never reminded (so a resume
+from suspend, or a daemon started late, fires only for meetings starting now). Each
+occurrence (`<event id>@<start>`, so a rescheduled meeting reminds again) fires once,
+recorded in `reminded.json` (see "Runtime and state paths"). If a recording is running
+when a reminder comes due, it is marked fired without a toast.
+
+The toast is one `notify-send --app-name Spitball -u normal -i x-office-calendar
+-t <ms> -A default="Join & record" -A dismiss=Dismiss "<summary>" "<body>"` run on a
+thread of its own (never on the daemon loop), waiting up to the lead time plus ten
+minutes for an answer. The summary is `Spitball reminder: <title> in N min` (`now`,
+or `started N min ago`); the body is the time span, the link's host, and `Click to
+join and record.` The action named `default` is what a plain click on the toast fires
+on every server (Omarchy's shell, mako, dunst); servers that draw buttons show both.
+Before the first toast the daemon asks the server for its capabilities
+(`org.freedesktop.Notifications.GetCapabilities`, read-only); without `actions`, or
+when `notify-send` reports on stderr that actions are unsupported, the reminder is
+a plain toast whose body says to click the record button in the bar, and nothing is
+opened. `default` opens the link with `xdg-open <link>` (one argv element, no shell),
+then, unless a recording has started meanwhile, calls `Daemon.join_event(event)`:
+`start("reminder", event=event)` writes `.meta.json` with `calendar.override` and
+`calendar.pinned` for that event. A `reminder` recording behaves like a manual one
+until a call app holds the mic, at which point it becomes `detected` (the state
+message turns into `Recording <app>`) and the call's end stops it as usual;
+`min_manual_s` applies if nothing ever takes the mic. `dismiss`, a close, or an
+expiry does nothing.
 
 ## Settings overlay
 

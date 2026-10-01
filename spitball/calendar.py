@@ -1420,10 +1420,20 @@ def decide(snap: dict, duration: float | None = None) -> dict:
         if wanted is None:
             result.update(event=None, confident=False, summary="no event (set by hand)")
         else:
-            for ev in snap.get("events") or []:
+            # A reminder's Join & record pins the event it fired for and
+            # keeps a copy under `pinned`, so the pin holds even if the feed
+            # has since dropped or moved that occurrence.
+            pool = list(snap.get("events") or [])
+            pinned = snap.get("pinned")
+            if isinstance(pinned, dict) and pinned.get("id") == wanted and \
+                    not any(ev.get("id") == wanted for ev in pool):
+                pool.append(pinned)
+            how = "set by hand" if not (isinstance(pinned, dict) and pinned.get("id") == wanted) \
+                else "joined from the reminder"
+            for ev in pool:
                 if ev.get("id") == wanted:
                     result.update(event=ev, confident=True, confidence=max(result["confidence"], 100),
-                                  summary=f"matched “{ev['title']}” (set by hand)")
+                                  summary=f"matched “{ev['title']}” ({how})")
                     break
             else:
                 result["summary"] += f"; override {wanted!r} is not among the candidates"
@@ -1442,8 +1452,10 @@ def for_call(meta: dict, cfg: dict, duration: float | None) -> dict | None:
             if not cfg.get("calendar_enabled") or source_kind(cfg) == "off":
                 return None
             snap = snapshot(cfg, float(meta.get("started_at") or 0), meta.get("app") or "", meet_codes=[])
-            if isinstance(meta.get("calendar"), dict) and "override" in meta["calendar"]:
-                snap["override"] = meta["calendar"]["override"]
+            if isinstance(meta.get("calendar"), dict):
+                for key in ("override", "pinned"):
+                    if key in meta["calendar"]:
+                        snap[key] = meta["calendar"][key]
             meta["calendar"] = snap
         decision = decide(snap, duration)
         ev = decision["event"]

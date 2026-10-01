@@ -48,8 +48,10 @@ stops on its own when the call ends, and leaves you a transcript and a summary i
 7. **Knows which meeting it was** (optional). Paste your calendar's secret iCal
    address and Spitball matches each call to the event it belongs to: the folder
    takes the event's title, the transcript starts with the meeting and its
-   attendees, and the summarizer is told who was invited. See
-   [Calendar](#calendar).
+   attendees, and the summarizer is told who was invited. A minute before a
+   meeting with a Zoom, Meet, Teams, or Webex link, a notification offers
+   **Join & record**: one click opens the link and starts recording, pinned to
+   that event. See [Calendar](#calendar).
 
 8. **Knows who said what.** With a matched meeting, one short model call puts the
    invitees' names on the far-side speakers from what people say ("thanks, Priya";
@@ -89,7 +91,7 @@ inside a text field, Esc hands focus back to the section list first.
 | **Audio** | Mic noise reduction for the transcriber (Off / Auto / On, with a line on each), the mic and speakers Spitball would record today, and under Advanced the background level Auto trips at. See [Audio and noise](#audio-and-noise). |
 | **Speakers** | Naming the far side from the calendar invite, the on-device split of the far channel into separate voices (with an Install button), the most far-side voices to show, and which providers split speakers. See [Speakers](#speakers). |
 | **Summary** | Summaries on/off, the endpoint, the model (a dropdown when the endpoint lists any), API key, Test, and the key command under Advanced. |
-| **Calendar** | Matching on/off, the source (a secret iCal/ICS address stored like an API key, or your own command), a Test button that shows what a call starting now would match, whether the event title becomes the call title, what goes to the summarizer (attendee names on by default, the description off), and under Advanced the address command, your calendar email, and the feed refresh interval. See [Calendar](#calendar). |
+| **Calendar** | Matching on/off, the source (a secret iCal/ICS address stored like an API key, or your own command), a Test button that shows what a call starting now would match, whether the event title becomes the call title, what goes to the summarizer (attendee names on by default, the description off), meeting reminders on/off and how long before the start they fire, and under Advanced the address command, your calendar email, and the feed refresh interval. See [Calendar](#calendar). |
 | **Storage** | The notes-copy folder (`export_dir`) and a way into the calls folder. |
 | **About** | Version, install path, a status snapshot, and the docs. |
 
@@ -443,6 +445,34 @@ picture. Got it wrong? `spitball reprocess <dir> --event <id>` pins one of the
 snapshot's candidates (ids are in `.meta.json` and the `--json` output) and
 `--no-event` clears the match; both re-render the transcript and summary.
 
+**Meeting reminders.** With the calendar on, Spitball also reminds you before a
+meeting starts (**Remind me before meetings with a video link**, on by default, one
+minute ahead; change the lead time next to it). A minute before any event you haven't
+declined that carries a Zoom, Google Meet, Microsoft Teams, or Webex link, a desktop
+notification from Spitball ("Spitball reminder: Weekly sync in 1 min", with the time
+and the link's host) offers **Join & record**: it opens the meeting link in your
+browser and starts recording right away, pinned to that event, so the folder,
+transcript header, and summary are certain to carry the right meeting. Once the call
+app takes the mic the recording follows it and stops when the call ends, like any
+detected call; if nothing ever takes the mic it stays a manual recording you stop
+from the bar. **Dismiss** does nothing. Clicking the notification body is the same as
+Join & record; on Omarchy's own shell that click is the only button it draws, and
+right-click dismisses. If a recording is already running when a reminder is due, no
+reminder fires. All-day events, canceled ones, ones marked free, focus time,
+out-of-office, and invites without a video link never remind. Each occurrence fires
+once (the daemon keeps a list in `~/.local/state/spitball/calendar/reminded.json`, so
+a restart doesn't repeat it), and a meeting that started more than two minutes ago is
+never reminded, so waking a laptop doesn't bring a pile of stale toasts.
+`spitball calendar upcoming` lists what is due in the next day and when each fires.
+
+Invites can come from anyone, so the link is the one thing the reminder is strict
+about: only an `https` link whose host is exactly `meet.google.com`,
+`teams.microsoft.com`, or `teams.live.com`, or `zoom.us` / `webex.com` or a subdomain
+of them, is ever opened, it is handed to `xdg-open` directly (never through a shell),
+and lookalikes (`meet.google.com.evil.example`, `zoom.us@evil.example`, `http://`,
+`javascript:`) are refused. If a notification server has no action support, the
+reminder is a plain toast that tells you to click the record button in the bar.
+
 **Your own source.** Set **Source** to *Your own command* (`calendar_source:
 "command"`) and `calendar_command` to any shell command that prints a JSON array of
 events — the shape is in [CONTRACT.md](CONTRACT.md#calendar-events); only `title`,
@@ -566,6 +596,8 @@ default, and you only need to set the ones you want to change.
 | `calendar_names_to_summary` | `true` | Put the invite list (names only, never addresses) in the summary request. `false`: the summarizer gets the meeting's title and time and nothing about the people; `transcript.md` and `summary.md` keep their own `**Attendees:**` line either way. Speaker naming has its own switch, `speaker_names`. |
 | `calendar_description_to_summary` | `false` | Also send the event description in the summary request. Off by default: it can carry private text. |
 | `calendar_my_email` | `""` | Your address on the calendar, so your own response is read (declined invites are skipped). Empty: the address on nearly every invite in the feed is taken as yours, unless another address ties it, in which case nobody is (set this). |
+| `calendar_reminders` | `true` | With the calendar on, remind before each meeting that has a Zoom / Meet / Teams / Webex link, with a Join & record action. See [Calendar](#calendar). |
+| `calendar_remind_before_s` | `60` | How many seconds before the start the reminder fires (0–3600). |
 | `speaker_names` | `true` | Put invitees' names on the far-side speakers, from what people say, when the call matched a meeting. One short call to the summary endpoint carrying the transcript and the invitees' names (never their addresses); a 1:1 needs none. This switch alone governs that call: `calendar_names_to_summary` does not. See [Speakers](#speakers). |
 | `speaker_split` | `true` | Tell far-side voices apart on the local provider, once `spitball diarize setup` has installed the add-on. Never runs for a 1:1; any failure keeps one "Them". |
 | `speaker_max` | `6` | The most far-side voices a transcript shows (1–12). The invite's headcount is used when known, capped here; extra or tiny voices fold into their neighbors. |
@@ -629,7 +661,9 @@ time; the `**Attendees:**` line in `transcript.md` and `summary.md` is local and
 never what the model sees); the event description goes only if you turn
 `calendar_description_to_summary` on. Attendee email addresses stay in the dot-files,
 never go to any model, and never appear in `transcript.md` or `summary.md` unless an
-attendee has no name on the invite.
+attendee has no name on the invite. A meeting reminder shows the event's title and
+the link's host on your own desktop, nowhere else; the one thing it ever opens is an
+`https` link to the meeting services listed under [Calendar](#calendar).
 
 Speaker naming sends the transcript and the invitees' names (never their addresses)
 to that same endpoint once more, before the summary; `speaker_names: false` turns it
@@ -703,6 +737,7 @@ ln -s ~/.config/omarchy/plugins/supercleanse.spitball/bin/spitball ~/.local/bin/
 | `spitball config get\|set\|set-secret\|unset` | Read/edit settings. See [Configuration](#configuration). |
 | `spitball check transcription\|summary [--json]` | Test the configured transcription provider or summary endpoint for real. |
 | `spitball calendar test [--at TIME] [--app APP] [--meet CODE] [--refresh] [--json]` | Which calendar event a call starting now (or at `TIME`) would match, with every candidate and its score. See [Calendar](#calendar). |
+| `spitball calendar upcoming [--hours N] [--refresh] [--json]` | The meeting reminders due in the next `N` hours (24): each event with a video link, its link host, when the reminder fires, and whether it already has. See [Calendar](#calendar). |
 | `spitball local info\|models\|set-model` | What voxtype is configured with, every model it can download, or switch it to one. See [Transcription providers](#transcription-providers). |
 | `spitball live setup\|status [--json]` | Install the fast live-transcript engine (into the shared venv, even one the speaker split already made), or show whether it's on and which model it loads. "Installed" means onnx-asr is actually in the venv. See [Live transcript](#live-transcript). |
 | `spitball speakers <call-dir> [--json]` | List a call's far-side speakers: label, resolved name, confidence, source, evidence, talk time. See [Speakers](#speakers). |

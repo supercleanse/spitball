@@ -414,3 +414,64 @@ class TestSpeakersAndDiarizeCommands(CliTestCase):
         code, out, _ = self.run_main(["diarize", "frobnicate"])
         self.assertEqual(code, 2)
         self.assertIn("usage: spitball", out)
+
+
+class TestCalendarUpcomingCommand(CliTestCase):
+    """`spitball calendar upcoming`: the reminders due from now, from the
+    configured source (a `calendar_command` here, whose one event starts
+    sixty seconds from the moment it runs -- no network)."""
+
+    CMD = ("python3 -c \"import json,time; from datetime import datetime, timezone; "
+           "s=datetime.fromtimestamp(time.time()+60, tz=timezone.utc); e=datetime.fromtimestamp(time.time()+1860, tz=timezone.utc); "
+           "print(json.dumps([{'title': 'Weekly sync', 'start': s.isoformat(), 'end': e.isoformat(), "
+           "'location': 'https://zoom.us/j/555'}, {'title': 'Lunch', 'start': s.isoformat(), 'end': e.isoformat()}]))\"")
+
+    def _write_config(self, **keys):
+        self.config.CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        self.config.CONFIG_FILE.write_text(json.dumps(keys))
+
+    def test_nothing_configured_exits_1_with_json(self):
+        code, out, _ = self.run_main(["calendar", "upcoming", "--json"])
+        self.assertEqual(code, 1)
+        data = json.loads(out)
+        self.assertFalse(data["ok"])
+        self.assertEqual(data["source"], "off")
+
+    def test_lists_the_reminder_json_and_text(self):
+        self._write_config(calendar_enabled=True, calendar_source="command", calendar_command=self.CMD)
+        code, out, _ = self.run_main(["calendar", "upcoming", "--json", "--hours", "2"])
+        self.assertEqual(code, 0, out)
+        data = json.loads(out)
+        self.assertTrue(data["active"])
+        self.assertEqual(data["lead_s"], 60)
+        self.assertEqual([u["title"] for u in data["upcoming"]], ["Weekly sync"])
+        self.assertEqual(data["upcoming"][0]["host"], "zoom.us")
+        self.assertEqual(data["skipped"], 1)
+        code, out, _ = self.run_main(["calendar", "upcoming"])
+        self.assertEqual(code, 0)
+        self.assertIn("Reminders: on; 60 s before; source: command", out)
+        self.assertIn("Weekly sync  (zoom.us)", out)
+        self.assertIn("Skipped: 1 event ", out)
+
+    def test_reminders_off_still_lists(self):
+        self._write_config(calendar_enabled=True, calendar_source="command", calendar_command=self.CMD,
+                           calendar_reminders=False, calendar_remind_before_s=120)
+        code, out, _ = self.run_main(["calendar", "upcoming", "--json"])
+        self.assertEqual(code, 0)
+        data = json.loads(out)
+        self.assertFalse(data["active"])
+        self.assertEqual(data["lead_s"], 120)
+        self.assertEqual(len(data["upcoming"]), 1)
+
+    def test_bad_hours(self):
+        code, _, err = self.run_main(["calendar", "upcoming", "--hours", "lots"])
+        self.assertEqual(code, 2)
+        self.assertIn("bad --hours", err)
+        code, _, err = self.run_main(["calendar", "upcoming", "--hours", "0"])
+        self.assertEqual(code, 2)
+
+    def test_broken_command_exits_1(self):
+        self._write_config(calendar_enabled=True, calendar_source="command", calendar_command="exit 7")
+        code, out, _ = self.run_main(["calendar", "upcoming", "--json"])
+        self.assertEqual(code, 1)
+        self.assertIn("exited 7", json.loads(out)["error"])

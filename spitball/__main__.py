@@ -33,6 +33,9 @@ USAGE = """usage: spitball <command>
   calendar test [--at TIME] [--app APP] [--meet CODE] [--refresh] [--json]
                              which calendar event a call starting now (or at TIME:
                              "14:30", "2026-09-30 14:30", ISO 8601, or epoch) would match
+  calendar upcoming [--hours N] [--refresh] [--json]
+                             the meeting reminders due in the next N hours (24): each
+                             event with a video link, its link host, and when it fires
   local info [--json]       what voxtype is currently configured with
   local models [--json]     every whisper/parakeet model voxtype knows about
   local set-model <name>    switch voxtype to that model in the background (progress in model.json)
@@ -242,6 +245,24 @@ def _calendar_cmd(rest: list) -> int:
             print(json.dumps(rep))
         else:
             print(calendar.format_test_report(rep))
+        return 0 if rep.get("ok") else 1
+
+    if sub == "upcoming":
+        from . import reminders
+        cfg = config.load()
+        hours_arg = _flag_value(rest, "--hours")
+        try:
+            hours = float(hours_arg) if hours_arg is not None else 24.0
+            if not 0 < hours <= 24 * 14:
+                raise ValueError("out of range")
+        except ValueError as e:
+            print(f"bad --hours value ({e}); use a number of hours up to 336", file=sys.stderr)
+            return 2
+        rep = reminders.upcoming_report(cfg, hours=hours, refresh="--refresh" in rest)
+        if "--json" in rest:
+            print(json.dumps(rep))
+        else:
+            print(reminders.format_upcoming_report(rep))
         return 0 if rep.get("ok") else 1
 
     print(USAGE)

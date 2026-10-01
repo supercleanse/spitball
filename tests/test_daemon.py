@@ -736,3 +736,127 @@ class TestCalendarSnapshotWiring(DaemonTestCase):
         self.assertEqual(meta["app"], "Zoom")
         self.assertEqual(meta["calendar"]["source"], "ics")
         self.assertEqual(json.loads((call_dir / ".meta.json").read_text())["duration"], 42.0)
+
+
+class TestReminderJoin(DaemonTestCase):
+    """Join & record on a meeting reminder (spitball/reminders.py ->
+    Daemon.join_event): the recording starts as origin "reminder", pinned
+    to the event in .meta.json (`calendar.override` + `calendar.pinned`),
+    the background calendar lookup keeps that pin when it merges its
+    snapshot, a call app taking the mic turns the recording into a
+    detected one so the call's end stops it, and an already-running
+    recording is left alone."""
+
+    EVENT = {"id": "ev-1/2026-09-30T14:00:00-06:00", "title": "Weekly sync", "start": "2026-09-30T14:00:00-06:00",
+             "end": "2026-09-30T14:30:00-06:00", "conference": {"kind": "meet", "url": "https://meet.google.com/abc-defg-hij",
+                                                                 "code": "abc-defg-hij"}, "attendees": []}
+    SNAP = {"source": "ics", "fetched_at": 1, "cached": True, "error": "", "app": "", "started_at": 1790000000.0,
+            "meet_codes": [], "events": [], "match": None}
+
+    def test_join_starts_a_pinned_reminder_recording(self):
+        d = new_daemon(self.tmp, calendar_enabled=False)
+        rec = make_fake_recording(alive=True, started_at=1790000000.0)
+        with mock.patch("spitball.daemon.Recording", return_value=rec):
+            r = d.join_event(self.EVENT, "https://meet.google.com/abc-defg-hij")
+        self.assertTrue(r["ok"])
+        self.assertEqual(d.rec_origin, "reminder")
+        self.assertEqual(d.state, "recording")
+        self.assertEqual(d.app, "")
+        meta = json.loads((d.rec_dir / ".meta.json").read_text())
+        self.assertEqual(meta["calendar"]["override"], {"event": self.EVENT["id"]})
+        self.assertEqual(meta["calendar"]["pinned"]["title"], "Weekly sync")
+        self.notify.assert_called_with("Recording Weekly sync", "Started from the reminder.")
+
+    def test_snapshot_merge_keeps_the_pin(self):
+        d = new_daemon(self.tmp, calendar_enabled=True, min_manual_s=1)
+        rec = make_fake_recording(alive=True, stop_duration=100.0, started_at=1790000000.0)
+        with track_threads() as threads, \
+             mock.patch("spitball.daemon.Recording", return_value=rec), \
+             mock.patch("spitball.daemon.calendar.snapshot", return_value=dict(self.SNAP)):
+            d.join_event(self.EVENT)
+            [t for t in threads if t.name == "calendar"][0].join(5)
+            meta = json.loads((d.rec_dir / ".meta.json").read_text())
+            self.assertEqual(meta["calendar"]["source"], "ics")
+            self.assertEqual(meta["calendar"]["override"], {"event": self.EVENT["id"]})
+            self.assertEqual(meta["calendar"]["pinned"]["id"], self.EVENT["id"])
+            # And the matcher resolves the pin even though the snapshot's
+            # candidate list is empty.
+            from spitball import calendar
+            decision = calendar.decide(meta["calendar"], 100.0)
+            self.assertTrue(decision["confident"])
+            self.assertEqual(decision["event"]["title"], "Weekly sync")
+            self.assertIn("joined from the reminder", decision["summary"])
+
+    def test_call_app_taking_the_mic_adopts_the_recording_and_its_end_stops_it(self):
+        clock = FakeClock()
+        d = new_daemon(self.tmp, detect_after_s=0, end_after_s=1, min_manual_s=1)
+        rec = make_fake_recording(alive=True, stop_duration=100.0, started_at=clock.now)
+        with mock.patch("spitball.daemon.time.time", side_effect=clock), \
+             mock.patch("spitball.daemon.Recording", return_value=rec):
+            d.join_event(self.EVENT)
+            with mock.patch("spitball.daemon.detect.call_apps", return_value=set()):
+                d.tick()   # nothing on the mic yet: keep recording (unlike a detected call)
+            self.assertIsNotNone(d.rec)
+            self.assertEqual(d.rec_origin, "reminder")
+            with mock.patch("spitball.daemon.detect.call_apps", return_value={"Chrome"}):
+                d.tick()
+            self.assertEqual(d.rec_origin, "detected")
+            self.assertEqual(d.app, "Chrome")
+            self.assertEqual(d.message, "Recording Chrome")
+            clock.advance(2)
+            with mock.patch("spitball.daemon.detect.call_apps", return_value=set()), \
+                 mock.patch("spitball.process.process", return_value={"dir": str(d.rec_dir), "title": "T",
+                                                                       "summary": "s", "ended_at": 1}), \
+                 track_threads() as threads:
+                call_dir = d.rec_dir
+                d.tick()   # the call ended
+                for t in threads:
+                    t.join(5)
+            self.assertIsNone(d.rec)
+            meta = json.loads((call_dir / ".meta.json").read_text())
+            self.assertEqual(meta["app"], "Chrome")
+            self.assertEqual(meta["calendar"]["override"], {"event": self.EVENT["id"]})
+
+    def test_join_with_a_call_already_on_the_mic_follows_it(self):
+        d = new_daemon(self.tmp, detect_after_s=0, end_after_s=5)
+        rec = make_fake_recording(alive=True)
+        with mock.patch("spitball.daemon.detect.call_apps", return_value={"Zoom"}):
+            d.tick()
+        with mock.patch("spitball.daemon.Recording", return_value=rec):
+            d.join_event(self.EVENT)
+        self.assertEqual(d.rec_origin, "detected")
+        self.assertEqual(d.app, "Zoom")
+        meta = json.loads((d.rec_dir / ".meta.json").read_text())
+        self.assertEqual(meta["calendar"]["override"], {"event": self.EVENT["id"]})
+
+    def test_already_recording_is_left_alone(self):
+        d = new_daemon(self.tmp)
+        rec = make_fake_recording(alive=True)
+        with mock.patch("spitball.daemon.Recording", return_value=rec):
+            d.handle("start")
+            first = d.rec_dir
+            r = d.join_event(self.EVENT)
+        self.assertEqual(r, {"ok": True, "note": "already recording"})
+        self.assertEqual(d.rec_dir, first)
+        self.assertEqual(d.rec_origin, "manual")
+        self.assertNotIn("calendar", json.loads((first / ".meta.json").read_text()))
+
+    def test_scheduler_is_wired_to_the_daemon(self):
+        d = new_daemon(self.tmp, calendar_enabled=True, calendar_source="command", calendar_command="true")
+        self.assertEqual(d.reminders._join, d.join_event)
+        self.assertTrue(d.reminders._cfg() is d.cfg)
+        self.assertFalse(d.reminders._recording())
+        self.assertEqual(d.reminders.log.path, self.config.STATE_DIR / "calendar" / "reminded.json")
+        # Off: a tick does nothing at all (no refresh thread, no toast).
+        d.cfg["calendar_reminders"] = False
+        with mock.patch("spitball.reminders.threading.Thread") as thread:
+            d.reminders.tick()
+        thread.assert_not_called()
+
+    def test_manual_start_is_unchanged(self):
+        d = new_daemon(self.tmp)
+        rec = make_fake_recording(alive=True, started_at=1790000000.0)
+        with mock.patch("spitball.daemon.Recording", return_value=rec):
+            d.handle("start")
+        self.assertEqual(d.rec_origin, "manual")
+        self.assertEqual(json.loads((d.rec_dir / ".meta.json").read_text()), {"app": "", "started_at": 1790000000.0})

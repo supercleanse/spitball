@@ -133,6 +133,32 @@ SettingsPage {
   NoteText { store: page.store; text: "On: the event's description goes into the summary request as well. Off by default: descriptions can carry private text and add little." }
   ErrorNote { store: page.store; key: "calendar_description_to_summary" }
 
+  PanelSeparator { foreground: page.store.foreground }
+
+  // ---- meeting reminders (spitball/reminders.py) ----
+  ToggleRow {
+    store: page.store
+    label: "Remind me before meetings with a video link"
+    checked: !!page.store.value("calendar_reminders", true)
+    disabledLook: page.store.loadFailed || !page.calendarOn
+    onToggled: page.store.setKey("calendar_reminders", !checked)
+  }
+  NoteText {
+    store: page.store
+    text: "Just before an event with a Zoom, Google Meet, Teams, or Webex link starts, a Spitball notification offers Join & record: it opens the link and starts recording, pinned to that event, and stops when the call ends. Dismiss does nothing. Only https links on those services are ever opened. Nothing fires while a recording is already running, and `spitball calendar upcoming` lists what is due."
+  }
+  ErrorNote { store: page.store; key: "calendar_reminders" }
+
+  NumberRow {
+    store: page.store
+    label: "Remind this long before the start"
+    value: Number(page.store.value("calendar_remind_before_s", 60))
+    from: 0; to: 900; stepSize: 15; unit: "s"
+    disabledLook: page.store.loadFailed || !page.calendarOn
+    onCommitted: function(v) { page.store.setKey("calendar_remind_before_s", v) }
+  }
+  ErrorNote { store: page.store; key: "calendar_remind_before_s" }
+
   RevealRow {
     store: page.store
 

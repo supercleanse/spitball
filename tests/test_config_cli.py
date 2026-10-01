@@ -170,7 +170,13 @@ class TestConfigSetSecret(ConfigCliTestCase):
         import os, subprocess, sys, tempfile
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         with tempfile.TemporaryDirectory() as home:
-            env = dict(os.environ, HOME=home, XDG_CONFIG_HOME=home + "/c", XDG_RUNTIME_DIR=home)
+            # Its own config/state/runtime paths: the inherited SPITBALL_CONFIG
+            # is the suite-wide "can never exist" file from tests/__init__.py,
+            # and this subprocess would otherwise create it (with this fake
+            # address in it) for every later test's config.load() to read.
+            env = dict(os.environ, HOME=home, XDG_CONFIG_HOME=home + "/c", XDG_RUNTIME_DIR=home,
+                       SPITBALL_CONFIG=home + "/c/spitball/config.json",
+                       SPITBALL_STATE_DIR=home + "/state", SPITBALL_RUNTIME_DIR=home + "/runtime")
             p = subprocess.Popen([sys.executable, "-I", os.path.join(root, "bin", "spitball"),
                                   "config", "set-secret", "calendar_ics_url"],
                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE,

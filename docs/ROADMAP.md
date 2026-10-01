@@ -56,6 +56,19 @@ Four features, in order, per `docs/SPEC-v2.md`:
    (the CLI is enough for now), a user-facing clustering-threshold knob
    (constant 0.7), a speaker-count hint for Deepgram (its API takes none), live
    (mid-call) speaker splitting in the popup.
+5. **Meeting reminders** (done) -- `spitball/reminders.py`: a minute before
+   (`calendar_remind_before_s`) any non-declined event with a Zoom / Meet /
+   Teams / Webex link, a Spitball notification with **Join & record** (opens
+   the link, starts a recording pinned to that event via
+   `calendar.override` + `calendar.pinned`, follows the call once an app takes
+   the mic) and **Dismiss**; a strict https + host allowlist for the link,
+   `xdg-open` without a shell; once per occurrence across restarts
+   (`reminded.json`), nothing for meetings more than two minutes old or while
+   recording; plain-toast fallback when the server has no action support;
+   `spitball calendar upcoming`; the two controls on the Calendar page. Not
+   done, by design: `zoommtg://` / native-client links (the browser link is
+   the one every invite carries), a sticky (critical-urgency) toast, a
+   per-event snooze, `event_title` in `state.json`.
 
 ## Phase 2: more transcription providers
 

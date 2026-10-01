@@ -154,6 +154,15 @@ DEFAULTS = {
     # invites are skipped). Empty = detect it: the address on nearly every
     # invite in the feed is the owner's.
     "calendar_my_email": "",
+    # Meeting reminders (spitball/reminders.py): shortly before a non-declined
+    # event with a Zoom / Google Meet / Teams / Webex link starts, a desktop
+    # notification from Spitball offers "Join & record" (opens the link --
+    # https on those hosts only -- and starts a recording pinned to that
+    # event) or "Dismiss". Needs calendar_enabled; fires once per occurrence;
+    # never while a recording is already running.
+    "calendar_reminders": True,
+    # How long before the start the reminder fires (seconds, 0-3600).
+    "calendar_remind_before_s": 60,
     # Speakers (spitball/speakers.py, spitball/diarize.py, docs/SPEC-v2.md
     # §4). `speaker_names`: after transcription, when the call matched a
     # calendar event with attendees, one short call to the summary endpoint
