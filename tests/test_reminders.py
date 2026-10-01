@@ -137,9 +137,88 @@ class TestJoinLink(unittest.TestCase):
         self.assertEqual(rem.join_link({}), "")
         self.assertEqual(rem.join_link(None), "")
 
+    def test_bare_conference_link_is_upgraded_to_the_full_one_from_the_text(self):
+        # A calendar_command source handing over the id link, with the
+        # invitation link (passcode included) in the location.
+        ev = _ev(link=None, conference={"kind": "zoom", "url": "https://zoom.us/j/123", "code": "123"},
+                 location="Join: https://zoom.us/j/123?pwd=S3cret.1 (passcode in link)")
+        self.assertEqual(rem.join_link(ev), "https://zoom.us/j/123?pwd=S3cret.1")
+        # A different link in the text does not replace a good conference link.
+        ev = _ev(link=None, conference={"kind": "zoom", "url": "https://zoom.us/j/123", "code": "123"},
+                 location="https://zoom.us/j/999?pwd=other")
+        self.assertEqual(rem.join_link(ev), "https://zoom.us/j/123")
+
     def test_link_host(self):
         self.assertEqual(rem.link_host("https://us04web.zoom.us/j/1"), "us04web.zoom.us")
         self.assertEqual(rem.link_host(""), "")
+
+
+class TestJoinLinkFromIcs(unittest.TestCase):
+    """ICS text -> events_from_ics() -> join_link(): the link a reminder
+    opens is the invitation link as written, query string included, and
+    the matcher's normalized id is untouched."""
+
+    HEAD = "BEGIN:VCALENDAR\nVERSION:2.0\nPRODID:-//test//EN\n"
+    TAIL = "END:VCALENDAR\n"
+
+    def _event(self, uid, **props):
+        lines = [f"UID:{uid}", "DTSTART:20260930T200100Z", "DTEND:20260930T203000Z", f"SUMMARY:{uid}"]
+        lines += [f"{k}:{v}" for k, v in props.items()]
+        return "BEGIN:VEVENT\n" + "\n".join(lines) + "\nEND:VEVENT\n"
+
+    def _events(self, body):
+        ws = datetime(2026, 9, 30, 0, 0, tzinfo=DENVER)
+        return {e["title"]: e for e in cal.events_from_ics(self.HEAD + body + self.TAIL, ws, ws + timedelta(days=1))}
+
+    def test_zoom_passcode_survives_normalization(self):
+        evs = self._events(
+            self._event("loc", LOCATION="https://us02web.zoom.us/j/123456789?pwd=AbC123.1")
+            + self._event("desc", DESCRIPTION="Join Zoom Meeting\\nhttps://zoom.us/j/987?pwd=x9Y.2\\nMeeting ID: 987")
+            + self._event("prose", LOCATION="Zoom (https://zoom.us/j/555?pwd=p.3)."))
+        self.assertEqual(evs["loc"]["conference"], {"kind": "zoom", "url": "https://us02web.zoom.us/j/123456789?pwd=AbC123.1",
+                                                    "code": "123456789"})
+        self.assertEqual(rem.join_link(evs["loc"]), "https://us02web.zoom.us/j/123456789?pwd=AbC123.1")
+        self.assertEqual(rem.join_link(evs["desc"]), "https://zoom.us/j/987?pwd=x9Y.2")
+        self.assertEqual(evs["desc"]["conference"]["code"], "987")
+        self.assertEqual(rem.join_link(evs["prose"]), "https://zoom.us/j/555?pwd=p.3")
+
+    def test_teams_and_webex_keep_their_query_context(self):
+        teams = ("https://teams.microsoft.com/l/meetup-join/19%3ameeting_abc%40thread.v2/0"
+                 "?context=%7b%22Tid%22%3a%22t1%22%2c%22Oid%22%3a%22o1%22%7d")
+        webex = "https://acme.webex.com/acme/j.php?MTID=m0123456789abcdef"
+        evs = self._events(self._event("teams", **{"X-MICROSOFT-SKYPETEAMSMEETINGURL": teams})
+                           + self._event("webex", LOCATION=webex))
+        self.assertEqual(rem.join_link(evs["teams"]), teams)
+        self.assertEqual(evs["teams"]["conference"]["kind"], "teams")
+        self.assertEqual(rem.join_link(evs["webex"]), webex)
+
+    def test_meet_link_with_a_query_keeps_its_code(self):
+        evs = self._events(self._event("meet", **{"X-GOOGLE-CONFERENCE": "https://meet.google.com/abc-defg-hij?hs=224"}))
+        self.assertEqual(evs["meet"]["conference"]["code"], "abc-defg-hij")
+        self.assertEqual(rem.join_link(evs["meet"]), "https://meet.google.com/abc-defg-hij?hs=224")
+
+    def test_hostile_links_with_a_matching_id_are_never_opened(self):
+        evs = self._events(
+            self._event("lookalike", LOCATION="https://evilzoom.us/j/123456789?pwd=abc")
+            + self._event("userinfo", LOCATION="https://zoom.us@evil.example/j/123456789?pwd=abc")
+            + self._event("http", LOCATION="http://zoom.us/j/123456789?pwd=abc")
+            + self._event("suffix", DESCRIPTION="https://zoom.us.evil.example/j/123456789?pwd=abc")
+            + self._event("fragment", LOCATION="https://teams.microsoft.com.evil.example/l/meetup-join/x#y"))
+        for title, ev in evs.items():
+            self.assertEqual(rem.join_link(ev), "", title)
+            self.assertEqual(rem.skip_reason(ev), "no meeting link", title)
+        # The parser still records the lookalike as a zoom-shaped link (the
+        # matcher's host heuristics are not a security boundary); the
+        # allowlist is what refuses it.
+        self.assertEqual(evs["lookalike"]["conference"]["code"], "123456789")
+
+    def test_fixture_zoom_event_opens_with_its_passcode(self):
+        ws = datetime(2026, 9, 30, 0, 0, tzinfo=DENVER)
+        evs = cal.events_from_ics((cal.Path(__file__).resolve().parent / "fixtures" / "ics" / "basic.ics").read_text(),
+                                  ws, ws + timedelta(days=1), "owner@example.com")
+        zoom = [e for e in evs if (e.get("conference") or {}).get("kind") == "zoom"]
+        self.assertTrue(zoom)
+        self.assertEqual(rem.join_link(zoom[0]), "https://us02web.zoom.us/j/123456789?pwd=abc")
 
 
 # ---------------------------------------------------------------- eligibility and timing

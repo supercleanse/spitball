@@ -446,7 +446,7 @@ all speak:
 | `kind` | `default`, or one of the kinds that are never matched: `focus`, `out_of_office`, `working_location`, `birthday` -- from the title (Google's feed has no event-type field) and Outlook's busy status |
 | `my_response` | your own reply: `accepted` \| `declined` \| `tentative` \| `needs_action` \| `""` (unknown). Declined is never matched. From the ATTENDEE line whose address is `calendar_my_email`, or, when that's empty, the address that clearly dominates the feed with no tie (see "Owner" below); the organizer counts as accepted. |
 | `attendees` | every human invitee (rooms/resources dropped), each with `self` |
-| `conference` | the meeting link, or `null`: `kind` `meet` \| `zoom` \| `teams` \| `webex`, and `code` -- the Meet code (`abc-defg-hij`) or Zoom meeting id -- from `X-GOOGLE-CONFERENCE`, LOCATION, URL, Teams' `X-MICROSOFT-SKYPETEAMSMEETINGURL`, or the description |
+| `conference` | the meeting link, or `null`: `kind` `meet` \| `zoom` \| `teams` \| `webex`, `url` (the complete link as written, query string included, so a Zoom `?pwd=` passcode or Teams/Webex context survives), and `code` -- the Meet code (`abc-defg-hij`) or Zoom meeting id -- from `X-GOOGLE-CONFERENCE`, LOCATION, URL, Teams' `X-MICROSOFT-SKYPETEAMSMEETINGURL`, or the description |
 | `description` | capped at 4,000 characters |
 
 **`calendar_command` contract.** With `calendar_source: "command"`, Spitball runs

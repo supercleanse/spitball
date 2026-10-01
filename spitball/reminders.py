@@ -94,22 +94,30 @@ def safe_join_url(url) -> str:
 
 def join_link(ev: dict) -> str:
     """The event's meeting link if it is safe to open, else ""."""
-    conf = ev.get("conference") if isinstance(ev, dict) else None
-    if isinstance(conf, dict):
-        link = safe_join_url(conf.get("url"))
-        if link:
-            return link
-    # The conference finder may have picked a non-https or odd link first;
-    # look once more through the text fields for any allowlisted https link.
+    if not isinstance(ev, dict):
+        return ""
+    conf = ev.get("conference")
+    link = safe_join_url(conf.get("url")) if isinstance(conf, dict) else ""
+    if link and "?" in link:
+        return link
+    # Either no usable conference link, or one without a query string (a
+    # `calendar_command` source may hand over the bare id link while the
+    # location carries the invitation link with its passcode): look through
+    # the text fields for an allowlisted https link, preferring one that is
+    # the same link with its query string attached.
+    found = ""
     for field in ("location", "url", "description"):
-        text = ev.get(field) if isinstance(ev, dict) else ""
+        text = ev.get(field)
         if not isinstance(text, str) or not text:
             continue
         for m in calendar._URL_RE.finditer(text):
-            link = safe_join_url(m.group(0).rstrip(".,;)>'\""))
-            if link:
-                return link
-    return ""
+            cand = safe_join_url(m.group(0).rstrip(".,;:)>'\""))
+            if not cand:
+                continue
+            if link and cand.startswith(link + "?"):
+                return cand
+            found = found or cand
+    return link or found
 
 
 def link_host(link: str) -> str:

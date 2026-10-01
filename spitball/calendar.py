@@ -370,33 +370,43 @@ def _organizer(props: dict):
     return {"name": (params.get("CN") or [""])[0].strip(), "email": _mailto(value)}
 
 
+def _full_url(text: str, start: int) -> str:
+    """The whole URL token beginning at `start` in `text` -- query string
+    and all, so a Zoom `?pwd=` passcode or Teams/Webex context survives --
+    minus any trailing punctuation the surrounding prose supplied."""
+    m = _URL_RE.match(text, start)
+    return m.group(0).rstrip(".,;:)>'\"") if m else ""
+
+
 def conference_from_text(*texts) -> dict | None:
     """{"kind", "url", "code"} for the first meeting link found in the given
-    strings (X-GOOGLE-CONFERENCE, LOCATION, DESCRIPTION, URL...)."""
+    strings (X-GOOGLE-CONFERENCE, LOCATION, DESCRIPTION, URL...). `code` is
+    the normalized id the matcher keys on; `url` is the complete link as
+    written (query string included), which is what a join must open."""
     for t in texts:
         if not t:
             continue
         m = _MEET_URL_RE.search(t)
         if m:
-            return {"kind": "meet", "url": m.group(0), "code": m.group(1).lower()}
+            return {"kind": "meet", "url": _full_url(t, m.start()) or m.group(0), "code": m.group(1).lower()}
     for t in texts:
         if not t:
             continue
         m = _ZOOM_URL_RE.search(t)
         if m:
-            return {"kind": "zoom", "url": m.group(0), "code": m.group(1)}
+            return {"kind": "zoom", "url": _full_url(t, m.start()) or m.group(0), "code": m.group(1)}
     for t in texts:
         if not t:
             continue
         m = _TEAMS_URL_RE.search(t)
         if m:
-            return {"kind": "teams", "url": m.group(0), "code": ""}
+            return {"kind": "teams", "url": _full_url(t, m.start()) or m.group(0), "code": ""}
     for t in texts:
         if not t:
             continue
         m = _WEBEX_URL_RE.search(t)
         if m:
-            return {"kind": "webex", "url": m.group(0), "code": ""}
+            return {"kind": "webex", "url": _full_url(t, m.start()) or m.group(0), "code": ""}
     return None
 
 
