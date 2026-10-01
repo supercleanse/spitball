@@ -559,7 +559,9 @@ def rename_speaker(call_dir: Path, n: int, name: str, cfg: dict | None = None) -
     if normalized is None:
         raise RuntimeError(f"no cached transcript in {call_dir} (run `spitball reprocess` first)")
     old = _label_map(normalized, cfg)
+    before = dict((normalized.get("speakers") or {}).get(str(n)) or {})
     speakers.set_name(normalized, cfg, n, name)
+    speakers.learn_name(normalized, cfg, n, name, before)
     new = _label_map(normalized, cfg)
     _write_json(call_dir / ".transcript.json", normalized)
     rerender(call_dir, cfg, label_change=(old, new))

@@ -1499,14 +1499,24 @@ def format_when(ev: dict) -> str:
 
 
 def attendee_names(ev: dict, include_self: bool = False) -> list:
-    """Display names for the header and the summarizer: the name on the
-    invite, else the address; organizer and declined/tentative marked."""
+    """Display names for the local header (never a model): the name on the
+    invite, else a name spitball/people.py found with the address beside
+    it ("Rob <robert@example.com>"), else the address; organizer and
+    declined/tentative marked."""
+    from . import people
     org = (ev.get("organizer") or {}).get("email", "")
     out = []
+    peers = [(a.get("email") or "").strip() for a in ev.get("attendees") or []
+             if not a.get("self") and a.get("response") != "declined"]
+    book = people.load_book()
     for a in ev.get("attendees") or []:
         if a.get("self") and not include_self:
             continue
         label = a.get("name") or a.get("email") or ""
+        if not a.get("name") and a.get("email") and not a.get("self"):
+            found = people.display_name(a, str(ev.get("title") or ""), peers, book)[0]
+            if found:
+                label = f"{found} <{a['email']}>"
         if not label:
             continue
         tags = []
@@ -1576,18 +1586,24 @@ def summary_context(decision: dict | None, cfg: dict) -> str:
 
 def invite_names(ev: dict) -> list:
     """The invite list as the summarizer may see it: names only. An invitee
-    with no name on the invite is never shown as their address (what
-    attendee_names() does for the local header); they are counted instead
+    with no name on the invite gets one from spitball/people.py when it can
+    (a name you gave that address, the meeting title, the address's own
+    parts); otherwise they're never shown as their address (what
+    attendee_names() does for the local header) but counted instead
     ("and 2 more with no name on the invite")."""
+    from . import people
     org = (ev.get("organizer") or {}).get("email", "")
     out = []
     nameless = 0
-    for a in ev.get("attendees") or []:
-        if a.get("self"):
-            continue
-        name = (a.get("name") or "").strip()
+    far = [a for a in ev.get("attendees") or [] if not a.get("self")]
+    peers = [(a.get("email") or "").strip() for a in far if a.get("response") != "declined"]
+    book = people.load_book()
+    for a in far:
+        # A name for an address-only invitee (spitball/people.py) is still
+        # a name, never the address.
+        name = people.display_name(a, str(ev.get("title") or ""), peers, book)[0]
         if not name or _EMAIL_RE.search(name):
-            if a.get("email") or name:
+            if a.get("email") or (a.get("name") or "").strip():
                 nameless += 1
             continue
         tags = []

@@ -71,8 +71,21 @@ def send(cmd: str, arg: str = "") -> dict:
 
 
 def _open(path: str) -> None:
-    subprocess.Popen(["xdg-open", path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                     start_new_session=True)
+    """Opens a file or folder in the desktop's handler for it. `gio open`
+    first: it types files by extension (summary.md is text/markdown, so a
+    Markdown app opens it) and runs a Terminal=true handler inside a
+    terminal. Bare xdg-open on Hyprland sniffs .md as text/plain, picks
+    nvim.desktop, and runs nvim with no terminal at all -- an invisible
+    editor holding a swap file, which made "Open last summary" do nothing.
+    xdg-open stays as the fallback for systems without gio."""
+    quiet = {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL,
+             "stderr": subprocess.DEVNULL, "start_new_session": True}
+    try:
+        if subprocess.run(["gio", "open", path], timeout=15, **quiet).returncode == 0:
+            return
+    except (OSError, subprocess.SubprocessError):
+        pass
+    subprocess.Popen(["xdg-open", path], **quiet)
 
 
 def _parse_value(raw: str):

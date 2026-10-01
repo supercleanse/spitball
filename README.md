@@ -493,9 +493,14 @@ the invitees' names to the summary endpoint once, before the summary, and asks w
 "Speaker N" is which invitee and why. Names only: an email address never goes along
 in any request Spitball makes (invite lists, titles, descriptions, and speaker
 labels are scrubbed of addresses before they leave, and the secret feed address is
-stripped too); an invitee with no name on the invite is only counted ("and 1 more
-with no name on the invite") and can never be named, since a speaker name would
-otherwise end up being an address inside the transcript the summarizer reads. This
+stripped too). Work calendars often list a colleague by address only, so an
+invitee with no name on the invite gets one when Spitball can find it: a name you
+gave that address before (see the hand fix below), a word in the meeting title the
+address starts with ("Q3 Review: Rob" for `robert@`), or the address itself
+(`priya.nair@` reads as Priya Nair; a bare `jordan@` reads as "probably Jordan"
+until you confirm it once). Role addresses like `support@` and initial-plus-surname
+ones like `jsmith@` give nothing; those invitees are only counted ("and 1 more with
+no name on the invite"), and a speaker name is never an address. This
 switch alone decides whether that request happens
 (naming can't work without the names), so the Calendar page's "Send attendee names to
 the summarizer" does not gate it: turn `speaker_names` off if the summary endpoint
@@ -511,8 +516,10 @@ and no voiceprints: nothing about anyone's voice is remembered between calls.
 Got a name wrong or missing? `spitball speakers <call-dir>` lists the far-side
 speakers with what each resolved to and the evidence; `spitball speakers <call-dir>
 2 "Priya Nair"` names one by hand and re-renders `transcript.md`, `summary.md` (its
-wording included), and the export copy on the spot, without another model call. A
-hand-set name is final: a later `spitball reprocess` keeps it and only re-resolves
+wording included), and the export copy on the spot, without another model call. When
+that speaker is clearly one invitee (a 1:1, or a voice Spitball had already tied to
+one person), the name is remembered for their address, so the next call with them
+gets it right on its own. A hand-set name is final: a later `spitball reprocess` keeps it and only re-resolves
 the others. `--clear` goes back to automatic. If you want a fresh summary written
 with the corrected names, run `spitball reprocess <call-dir>` afterward.
 

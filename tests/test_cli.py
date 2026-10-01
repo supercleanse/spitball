@@ -194,6 +194,21 @@ class TestOpenLastAndFolder(CliTestCase):
         self.assertEqual(code, 0)
         open_mock.assert_called_once_with(str(summary))
 
+    def test_open_uses_gio_and_falls_back_to_xdg_open(self):
+        # gio types summary.md as Markdown; bare xdg-open on Hyprland ran
+        # nvim with no terminal, so the menu item looked dead.
+        from spitball import __main__ as cli
+        ok = mock.Mock(returncode=0)
+        with mock.patch("subprocess.run", return_value=ok) as run, mock.patch("subprocess.Popen") as popen:
+            cli._open("/x/summary.md")
+        self.assertEqual(run.call_args[0][0], ["gio", "open", "/x/summary.md"])
+        popen.assert_not_called()
+        for failure in (mock.Mock(returncode=4), OSError("no gio")):
+            kw = {"side_effect": failure} if isinstance(failure, Exception) else {"return_value": failure}
+            with mock.patch("subprocess.run", **kw), mock.patch("subprocess.Popen") as popen:
+                cli._open("/x/summary.md")
+            self.assertEqual(popen.call_args[0][0], ["xdg-open", "/x/summary.md"])
+
     def test_open_folder_creates_and_opens_calls_dir(self):
         config_file = self.tmp / "cfg" / "config.json"
         config_file.parent.mkdir(parents=True)

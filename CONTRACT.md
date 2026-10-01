@@ -275,11 +275,22 @@ invite list (`**People on the invite:**`, names only) only when
 `calendar_description_to_summary` -- then the header notes. The local
 `**Attendees:**` line is never part of it. The speaker-naming request
 (`speaker_names`, and nothing else, gates it) carries the neutral-label transcript
-and each invitee's name; never an email address -- an invitee with no name on the
-invite (or whose "name" is an address) is not a naming candidate at all, only
+and each invitee's name; never an email address. An invitee with no name on the
+invite (or whose "name" is an address) gets one from `spitball/people.py` when it
+can, in this order: the name you gave that address by hand before (the book,
+`$STATE_DIR/people.json`, mode 600, `{address: name}`), a capitalized word in the
+meeting title the address starts with and no other far invitee's does ("Q3 Review:
+Rob" + `robert@` -> `Rob`), or the address's own parts (`priya.nair@` -> `Priya
+Nair`, sure; `jordan@` -> `Jordan`, unsure, so a 1:1 renders `Them (probably
+Jordan)`). Role mailboxes, digits, and initial-plus-surname shapes (`jsmith@`) give
+nothing. A found name is a name, never an address; invitees with none are only
 counted (`and 2 more invitees with no name on the invite`), so a speaker name can
-never be an address. The same rule shapes the summary's invite list
-(`calendar.invite_names()`: names, plus a count of the nameless), and everything
+never be an address. `spitball speakers <dir> <n> "Name"` writes the book when that
+speaker is clearly one invitee: a 1:1 (one far invitee, one far voice), or a speaker
+whose automatic name before the rename was exactly one invitee's. The same rule
+shapes the summary's invite list (`calendar.invite_names()`: names, found names, plus
+a count of the nameless); the local `**Attendees:**` line shows a found name beside
+the address (`Rob <robert@example.com>`). Everything
 model-bound passes through `calendar.scrub_for_model()` last: any email address
 becomes `[address]` and the configured feed URL is stripped, from the title, the
 description, the `**Speakers:**` line, and the naming prompt alike. The transcript

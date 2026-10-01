@@ -6,7 +6,12 @@ those ids into people. Three sources, in order of authority:
 
   user      `spitball speakers <dir> <n> "Name"` -- never overwritten.
   calendar  a 1:1 call: exactly one other invitee and exactly one far
-            voice, so the far side is that person, no model needed.
+            voice, so the far side is that person, no model needed. An
+            invitee listed by address only still gets a name here, from
+            spitball/people.py (the name you gave that address before,
+            the meeting title, or the address itself); only a name taken
+            from a bare one-part address ("jordan@") renders as
+            "Them (probably Jordan)".
   llm       one short call to the summary endpoint with the transcript
             and the invitees' names -- never their email addresses; an
             invitee with no name on the invite is sent as a local
@@ -239,33 +244,47 @@ def _far_invitees(meeting: dict | None) -> list:
 
 def candidates(meeting: dict | None) -> list:
     """The far-side invitees a speaker can be named as: everyone who isn't
-    `self`, didn't decline, AND has a real name on the invite, as
-    {"name", "email"}. An invitee with only an address is never a
-    candidate -- a speaker name must never be an email address, because
-    the names go into the transcript the summary model reads. Such
-    invitees are only counted (nameless_count) so the model knows the
-    invite was bigger than the list it sees."""
+    `self` and didn't decline, AND has a name -- on the invite, or found
+    by spitball/people.py for an invitee listed by address only (the name
+    you gave that address before, a matching word in the meeting title,
+    or the address's own parts) -- as {"name", "email", "source",
+    "sure"}. A name is never an email address, because the names go into
+    the transcript the summary model reads. Invitees with no name to be
+    had are only counted (nameless_count) so the model knows the invite
+    was bigger than the list it sees."""
+    from . import people
+    far = _far_invitees(meeting)
+    title = str((meeting or {}).get("title") or "")
+    peers = [(a.get("email") or "").strip() for a in far]
+    book = people.load_book()
     out = []
     seen = set()
-    for a in _far_invitees(meeting):
-        name = (a.get("name") or "").strip()
+    for a in far:
+        name, source, sure = people.display_name(a, title, peers, book)
         if not name or "@" in name or name.lower() in seen:
             continue
         seen.add(name.lower())
-        out.append({"name": name, "email": (a.get("email") or "").strip()})
+        out.append({"name": name, "email": (a.get("email") or "").strip(),
+                    "source": source, "sure": sure})
     return out
 
 
 def nameless_count(meeting: dict | None) -> int:
-    """How many far-side invitees have no usable name on the invite."""
+    """How many far-side invitees have no usable name, on the invite or
+    from spitball/people.py."""
+    from . import people
+    far = _far_invitees(meeting)
+    title = str((meeting or {}).get("title") or "")
+    peers = [(a.get("email") or "").strip() for a in far]
+    book = people.load_book()
     named = {c["name"].lower() for c in candidates(meeting)}
     n = 0
     seen = set()
-    for a in _far_invitees(meeting):
-        name = (a.get("name") or "").strip()
+    for a in far:
+        name = people.display_name(a, title, peers, book)[0]
         if name and "@" not in name and name.lower() in named:
             continue
-        key = (a.get("email") or name).strip().lower()
+        key = (a.get("email") or a.get("name") or "").strip().lower()
         if not key or key in seen:
             continue
         seen.add(key)
@@ -315,8 +334,13 @@ def resolve(normalized: dict, cfg: dict, transcript_text: str, chat=None) -> dic
         return report
     nameless = nameless_count(normalized.get("meeting"))
     if len(cands) == 1 and nameless == 0 and len(order) == 1 and "1" in todo:
-        todo["1"].update(name=cands[0]["name"], confidence="high", source="calendar",
-                         evidence="the only other person on the invite")
+        c = cands[0]
+        how = {"book": "the name you gave this address before",
+               "title": "name from the meeting title",
+               "address": "name from their email address"}.get(c.get("source"))
+        todo["1"].update(name=c["name"], confidence="high" if c.get("sure", True) else "medium",
+                         source="calendar",
+                         evidence="the only other person on the invite" + (f" ({how})" if how else ""))
         report["method"] = "calendar"
         return report
     if not cfg.get("summary_enabled", True):
@@ -523,6 +547,36 @@ def set_name(normalized: dict, cfg: dict, n: int, name: str) -> dict:
         speakers[key].update(name="", confidence="none", source="", evidence="")
     normalized["speakers"] = speakers
     return speakers
+
+
+def learn_name(normalized: dict, cfg: dict, n: int, name: str, before: dict | None = None) -> str:
+    """After a hand rename: when far speaker `n` is clearly one invitee,
+    remember that invitee's address -> `name` (spitball/people.py's book)
+    so later calls use it. Clearly means a 1:1 (one far invitee, one far
+    voice), or the speaker's automatic name before the rename was exactly
+    one invitee's. Returns the address learned, or "". Never raises."""
+    from . import people
+    name = (name or "").strip()
+    meeting = normalized.get("meeting")
+    if not name or "@" in name or not meeting:
+        return ""
+    try:
+        far = [a for a in _far_invitees(meeting) if (a.get("email") or "").strip()]
+        order, _ = far_speaker_order(normalized.get("utterances", []), max_speakers(cfg))
+        email = ""
+        if len(far) == 1 and len(order) == 1 and len(_far_invitees(meeting)) == 1:
+            email = far[0]["email"]
+        else:
+            prior = str((before or {}).get("name") or "").strip().lower()
+            if prior and (before or {}).get("source") != "user":
+                hits = [c for c in candidates(meeting) if c["email"] and c["name"].lower() == prior]
+                if len(hits) == 1:
+                    email = hits[0]["email"]
+        if email and people.remember(email, name):
+            return email.strip().lower()
+    except Exception:
+        pass
+    return ""
 
 
 def listing(normalized: dict, cfg: dict) -> list:

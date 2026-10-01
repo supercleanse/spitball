@@ -1095,11 +1095,16 @@ class TestSpeakersInPipeline(TestProcessPipeline):
         reply = json.dumps({"Speaker 1": {"name": "Priya Nair", "confidence": "high", "evidence": "e"}})
         result, _, _, _ = self._run(["Priya Nair", "Alex Demo"], chat_reply=reply, cfg=cfg)
         final_dir = Path(result["dir"])
+        from spitball import people
+        self.addCleanup(lambda: people._book_path().unlink(missing_ok=True))
         # A wrong automatic name and an unnamed second voice, fixed by hand.
         with mock.patch("spitball.process.summarize", side_effect=AssertionError("no re-summarize")), \
              mock.patch("spitball.speakers._chat", side_effect=AssertionError("no model")):
             rows = process.rename_speaker(final_dir, 2, "Alex Demo", cfg)
             process.rename_speaker(final_dir, 1, "Priya N.", cfg)
+        # The fix to an automatic name is remembered for Priya's address;
+        # the unnamed voice had no automatic name to tie it to anyone.
+        self.assertEqual(people.load_book(), {"priya@example.com": "Priya N."})
         self.assertEqual(rows[1]["label"], "Alex Demo")
         transcript = (final_dir / "transcript.md").read_text()
         self.assertIn("**[00:00:05] Alex Demo:** I disagree", transcript)
@@ -1349,8 +1354,8 @@ class TestModelPayloadsNeverCarryAddresses(TestProcessPipeline):
         s = datetime.fromtimestamp(1790000000 - 120, tz=timezone.utc)
         attendees = [
             {"name": "Priya Nair", "email": "priya@example.com", "response": "accepted", "self": False, "optional": False},
-            {"name": "", "email": "nameless@example.com", "response": "accepted", "self": False, "optional": True},
-            {"name": "bob@example.com", "email": "bob@example.com", "response": "tentative", "self": False, "optional": False},
+            {"name": "", "email": "x1@example.com", "response": "accepted", "self": False, "optional": True},
+            {"name": "info@example.com", "email": "info@example.com", "response": "tentative", "self": False, "optional": False},
             {"name": "Alex Demo", "email": "alex@example.com", "response": "declined", "self": False, "optional": False},
             {"name": "", "email": "me@example.com", "response": "accepted", "self": True, "optional": False},
         ]
@@ -1370,7 +1375,7 @@ class TestModelPayloadsNeverCarryAddresses(TestProcessPipeline):
         import itertools
         email = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
         reply = json.dumps({"Speaker 1": {"name": "Priya Nair", "confidence": "high", "evidence": "0:00 intro"},
-                            "Speaker 2": {"name": "bob@example.com", "confidence": "high", "evidence": "0:05"}})
+                            "Speaker 2": {"name": "info@example.com", "confidence": "high", "evidence": "0:05"}})
         for names, desc, naming, title_pref in itertools.product((True, False), repeat=4):
             with self.subTest(names=names, description=desc, speaker_names=naming, event_title=title_pref):
                 call_dir = self.tmp_path / "Calls" / f"2026-09-28-1400-zoom-{int(names)}{int(desc)}{int(naming)}{int(title_pref)}"
